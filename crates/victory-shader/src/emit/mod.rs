@@ -110,7 +110,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use lower::{host_max_wave, set_host_max_wave};
+pub use lower::{host_max_wave, set_host_max_wave, set_host_pixel_wave};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
@@ -1562,6 +1562,31 @@ mod barycentric_tests {
             v.validate(&mut shader.dxil.clone()).unwrap();
         }
         let _ = shader;
+    }
+
+    /// A wave32 pixel program counting the lanes of a compare (`s_bcnt1` of VCC): on a host
+    /// that may run it in waves of 64 the count is of this lane's half (a different, valid
+    /// translation), elsewhere of the host wave as before.
+    #[test]
+    fn a_wave32_pixel_ballot_on_a_64_lane_host_is_taken_per_half() {
+        let [e0, e1] = exp_mrt0(2);
+        let words = [
+            0x7C08_00F0, // v_cmp_gt_f32 vcc, 0.5, v0
+            0xBE80_0F6A, // s_bcnt1_i32_b32 s0, vcc_lo
+            0x7E04_0200, // v_mov_b32 v2, s0
+            e0,
+            e1,
+            0xBF81_0000,
+        ];
+        let plain = pixel(&words, PERSP_CENTER).unwrap();
+        // (a global: pixel tests running meanwhile may get the per-half form, also valid)
+        lower::set_host_pixel_wave(64);
+        let halves = pixel(&words, PERSP_CENTER);
+        lower::set_host_pixel_wave(0);
+        let halves = halves.unwrap();
+        validate(&plain);
+        validate(&halves);
+        assert_ne!(plain.dxil, halves.dxil, "no per-half ballot");
     }
 
     /// Custom interpolation reads I and J (v0, v1 with PERSP_CENTER) as

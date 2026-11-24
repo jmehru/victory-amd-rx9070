@@ -271,6 +271,13 @@ struct Lower<'a> {
     half_outputs: HashMap<u8, (bool, Option<u8>)>,
     /// How lane masks become data.
     mask_data: MaskData,
+    /// A console wave32 pixel or vertex program on a host that may run it in waves of 64 (AMD):
+    /// each 32-lane half of a host wave is a console wave of its own. Ballots, lane numbers from
+    /// masks, `v_mbcnt` and lane reads are taken per half; without this the upper half saw the
+    /// lower half's mask (a scalarized loop left early, a test of "no lane" true).
+    // shortcut: whole-wave reductions (`waveActiveOp`) still span the 64 lanes; split them if a
+    // count and a sum of one section turn out to disagree.
+    half_waves: bool,
     /// The instruction being lowered may read lane masks as data.
     mask_ok: bool,
     /// Ballots of masks read as data, by low dword: (low, high).
@@ -1031,6 +1038,21 @@ thread_local! {
     pub(super) static TEST_HOST_WAVE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
+/// The widest wave the host may run pixel and vertex programs in (AMD: 64); see
+/// [`set_host_pixel_wave`].
+static HOST_PIXEL_WAVE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The host GPU's `WaveLaneCountMax` for pixel and vertex programs, whose wave size cannot be
+/// declared: over 32, console wave32 programs there take each half of a host wave as a console
+/// wave of its own (`Lower::half_waves`). `VICTORY_PS_HALVES=0` turns that off.
+pub fn set_host_pixel_wave(lanes: u32) {
+    HOST_PIXEL_WAVE.store(lanes, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn host_pixel_wave() -> u32 {
+    HOST_PIXEL_WAVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
     let ops: Vec<&Operand> = match &i.fields {
@@ -1547,6 +1569,10 @@ impl<'a> Lower<'a> {
                 HwStage::Ps | HwStage::Vs => MaskData::Host,
                 _ => MaskData::None,
             },
+            half_waves: matches!(x.native.stage, HwStage::Ps | HwStage::Vs)
+                && !x.native.wave64
+                && host_pixel_wave() > 32
+                && std::env::var_os("VICTORY_PS_HALVES").is_none_or(|v| v != "0"),
             mask_ok: false,
             ballots: HashMap::new(),
             balloting: HashSet::new(),
@@ -3135,6 +3161,10 @@ impl<'a> Lower<'a> {
                     .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
                 self.s.flags |= flags::WAVE_OPS;
                 let mut xy = (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1));
+                if self.half_waves {
+                    // this half's 32 bits
+                    xy = (self.half_word(at, xy.0, xy.1), self.s.m.i32(0));
+                }
                 if self.exchange.is_some() {
                     // a host wave's ballot is its half's 32 bits: the halves exchange them
                     let b = self.def_block.get(&lo).copied();
@@ -3875,6 +3905,21 @@ impl<'a> Lower<'a> {
         self.s.m.cmp(at, pred::NE, t, z)
     }
 
+    /// `half_waves`: of a host ballot's dwords `lo`, `hi`, the one of this lane's half.
+    fn half_word(&mut self, at: usize, lo: V, hi: V) -> V {
+        let lane = self.s.op(at, "waveGetLaneIndex", Attr::ReadOnly, self.s.t.i32, 111, &[]);
+        let k32 = self.s.m.i32(32);
+        let low = self.s.m.cmp(at, pred::IULT, lane, k32);
+        self.s.m.select(at, low, lo, hi)
+    }
+
+    /// `half_waves`: host lane 32 of this lane's half (0 or 32).
+    fn half_base(&mut self, at: usize) -> V {
+        let lane = self.s.op(at, "waveGetLaneIndex", Attr::ReadOnly, self.s.t.i32, 111, &[]);
+        let k32 = self.s.m.i32(32);
+        self.s.m.bin(at, Bin::And, lane, k32)
+    }
+
     /// The value of the high dword of the wave64 register pair whose low
     /// dword holds `lo` (none in wave32).
     fn pair_high(&self, lo: Value) -> Option<Value> {
@@ -4289,12 +4334,24 @@ impl<'a> Lower<'a> {
         let i32t = self.s.t.i32;
         self.s.flags |= flags::WAVE_OPS;
         let first = self.s.op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[x]);
+        let guard = match guard {
+            None if self.half_waves => Some(self.s.m.bool(true)),
+            g => g,
+        };
         let Some(g) = guard else {
             return (first, self.s.m.bool(true));
         };
         let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
         let r = self.s.op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[g]);
-        let (lo, hi) = (self.s.m.extract(c, r, 0), self.s.m.extract(c, r, 1));
+        let (mut lo, mut hi) = (self.s.m.extract(c, r, 0), self.s.m.extract(c, r, 1));
+        let base = if self.half_waves {
+            // the first lane of this half: its dword alone, then back to host lanes
+            lo = self.half_word(c, lo, hi);
+            hi = self.s.m.i32(0);
+            Some(self.half_base(c))
+        } else {
+            None
+        };
         let (z, k32) = (self.s.m.i32(0), self.s.m.i32(32));
         // FirstbitLo (dx.op 32): the lowest set bit
         let flo = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[lo]);
@@ -4304,6 +4361,10 @@ impl<'a> Lower<'a> {
         let in_hi = self.s.m.cmp(c, pred::NE, hi, z);
         let any = self.s.m.bin(c, Bin::Or, in_lo, in_hi);
         let lane = self.s.m.select(c, in_lo, flo, fhi);
+        let lane = match base {
+            Some(b) => self.s.m.bin(c, Bin::Add, lane, b),
+            None => lane,
+        };
         // no lane in EXEC: read this lane (one that is here); the read is not used
         let me = self.s.op(c, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
         let lane = self.s.m.select(c, any, lane, me);
@@ -7498,6 +7559,15 @@ impl<'a> Lower<'a> {
                     self.group_sync(c2);
                     return int(self, r);
                 }
+                let lane = if self.half_waves {
+                    // a console lane of this lane's half
+                    let k31 = self.s.m.i32(31);
+                    let l = self.s.m.bin(self.cur, Bin::And, lane, k31);
+                    let b = self.half_base(self.cur);
+                    self.s.m.bin(self.cur, Bin::Add, l, b)
+                } else {
+                    lane
+                };
                 let r = self.read_lane(a, lane);
                 int(self, r)
             }
@@ -8808,7 +8878,12 @@ impl<'a> Lower<'a> {
                 } else if self.s.mesh.is_none() {
                     self.cross_lane(false)?;
                 }
-                let lane = self.console_lane();
+                let mut lane = self.console_lane();
+                if self.half_waves {
+                    // the lane in its half: masks are the half's
+                    let k31 = k(self, 31);
+                    lane = self.s.m.bin(c, Bin::And, lane, k31);
+                }
                 let below = if name == "v_mbcnt_lo_u32_b32" {
                     lane
                 } else {
