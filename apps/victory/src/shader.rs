@@ -96,6 +96,13 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                     eprintln!("corrupt record {}{}", path.display(), source.label());
                     continue;
                 };
+                if let Ok(only) = std::env::var("VICTORY_TRANSLATE_ONLY") {
+                    let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
+                    if !only.split(',').map(str::trim).any(|o| !o.is_empty() && hash.starts_with(o)) {
+                        continue;
+                    }
+                    eprintln!("#{hash} {}{}", path.display(), source.label());
+                }
                 let Ok(container) = Container::parse(&bytes) else {
                     continue;
                 };

@@ -2645,6 +2645,31 @@ impl<'a> Lower<'a> {
         Some((lo, hi))
     }
 
+    fn read_anywhere(&self, v: Value) -> bool {
+        self.x.p.blocks.iter().any(|b| {
+            b.insts.iter().any(|i| i.reads.iter().any(|r| r.1 == v))
+                || b.phis.iter().any(|p| p.args.contains(&v))
+        })
+    }
+
+    fn view_records(&mut self, site: Site) -> Option<V> {
+        let src = Source::Loaded { load: site, first: 0 };
+        let h = self.handle(site, &src, false, (11, 0)).ok()?;
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+        let undef = self.s.m.undef(i32t);
+        let d = self.s.op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, undef]);
+        let n = self.s.m.extract(c, d, 0);
+        let stride = self.used_kind(&src).map_or(0, |u| u.stride);
+        Some(if stride > 1 {
+            let k = self.s.m.i32(stride);
+            self.s.m.bin(c, Bin::UDiv, n, k)
+        } else {
+            n
+        })
+    }
+
     /// `lo`, `hi` plus the instruction's byte offset `off`, with the carry.
     fn address_plus(&mut self, lo: V, hi: V, off: i32) -> (V, V) {
         if off == 0 {
@@ -5571,7 +5596,9 @@ impl<'a> Lower<'a> {
                 .find_map(|(s, _)| use_of(*s))
         };
         let use_at = use_of(site).or_else(twin);
-        let Some((at, first)) = use_at else {
+        let (at, first) = if let Some((at, first)) = use_at {
+            (Some(at), first)
+        } else {
             // A descriptor kept per lane in VGPRs (`Resources::lane_copied`): the code only
             // copies its dwords and compares them, lane against first lane, and every load
             // that reaches those lanes reads one address. Each dword stands in as its place
@@ -5604,11 +5631,16 @@ impl<'a> Lower<'a> {
             if count <= 4
                 && let Some((lo, hi)) = self.view_address(site)
             {
+                let records = inst
+                    .write(Reg::S(code + 2))
+                    .filter(|&v| count > 2 && self.read_anywhere(v))
+                    .and_then(|_| self.view_records(site));
                 for k in 0..count {
                     let reg = Reg::S(code + k as u8);
-                    match k {
-                        0 => self.write(inst, reg, lo, None),
-                        1 => self.write(inst, reg, hi, None),
+                    match (k, records) {
+                        (0, _) => self.write(inst, reg, lo, None),
+                        (1, _) => self.write(inst, reg, hi, None),
+                        (2, Some(n)) => self.write(inst, reg, n, None),
                         _ => {
                             if let Some(v) = inst.write(reg) {
                                 self.vals.insert(v, Val::Missing(OTHER));
@@ -5619,20 +5651,24 @@ impl<'a> Lower<'a> {
                 }
                 return Ok(());
             }
-            return Err("a descriptor read only as data");
+            if count != 8 || self.heap_index(site, 0, false).is_err() {
+                return Err("a descriptor read only as data");
+            }
+            (None, 0)
         };
         let src = Source::Loaded { load: site, first };
         let used = self.used_kind(&src);
-        let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
-        let un = ui.name();
+        let ui: Option<&Inst> = at.map(|at| &self.x.p.blocks[at.0].insts[at.1]);
+        let un = ui.map_or("", |ui| ui.name());
         let uav = un.contains("store")
             || un.contains("atomic")
             || used.is_some_and(|u| u.kind == ResourceType::Uav);
         let u = if uav { 0x1000 } else { 0 };
-        let (props, image) = match &ui.fields {
+        let (props, image) = match ui.map(|ui| &ui.fields) {
+            None => ((2 | u, 0x409), Some(2)),
             // A ray-tracing structure in a buffer of the host: read raw.
-            Fields::Image { .. } if un.starts_with("image_bvh") => ((11, 0), None),
-            Fields::Image { dim, .. } => {
+            Some(Fields::Image { .. }) if un.starts_with("image_bvh") => ((11, 0), None),
+            Some(Fields::Image { dim, .. }) => {
                 let kind = match dim {
                     0 => 1,
                     1 => 2,
@@ -5643,7 +5679,7 @@ impl<'a> Lower<'a> {
                 };
                 ((kind | u, 0x409), Some(kind))
             }
-            Fields::Buffer { idxen, format, .. } => {
+            Some(Fields::Buffer { idxen, format, .. }) => {
                 let stride = used.map_or(0, |u| u.stride);
                 let props = if un.starts_with("buffer_load_format")
                     || un.starts_with("buffer_store_format")
@@ -5661,11 +5697,11 @@ impl<'a> Lower<'a> {
                 (props, None)
             }
             // Read by scalar buffer loads alone: the raw view `smem` reads it through.
-            Fields::Smem { .. } if used.is_some_and(|u| u.kind == ResourceType::Srv) => {
+            Some(Fields::Smem { .. }) if used.is_some_and(|u| u.kind == ResourceType::Srv) => {
                 ((11, 0), None)
             }
             // A constant buffer: nothing of its descriptor is a number.
-            Fields::Smem { .. } => {
+            Some(Fields::Smem { .. }) => {
                 self.stale.extend(inst.writes.iter().map(|w| w.1));
                 return Err("a constant buffer's descriptor read as data");
             }
@@ -7080,6 +7116,7 @@ impl<'a> Lower<'a> {
                     return Err("a mixed-precision result");
                 };
                 let old = match inst.read(Reg::V(reg)) {
+                    Some(o) if self.stale.contains(&o) && self.i32_of(o).is_err() => self.s.m.i32(0),
                     Some(o) => self.i32_of(o)?,
                     None => self.s.m.i32(0),
                 };
@@ -8579,6 +8616,7 @@ impl<'a> Lower<'a> {
 
     fn interp(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         let Some(&interp) = self.interps.get(&site) else {
+            self.stale.extend(inst.writes.iter().map(|w| w.1));
             return Err("the first half of an interpolation");
         };
         let name = inst.name();
