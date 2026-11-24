@@ -569,9 +569,19 @@ impl Module {
             }
             w.record(3, &r);
         }
+        // 5: the entry's float mode, `"fp32-denorm-mode"="ftz"`: f32 denormals flushed, as the
+        // console's MODE and NVIDIA have them; a host left to "any" (AMD) kept them, so a
+        // `0 * x` legacy test or a reciprocal saw a tiny number instead of 0.
+        // `VICTORY_DENORM=any` leaves the mode to the host.
+        let mut r = vec![5, 0xFFFF_FFFF, 4];
+        r.extend(b"fp32-denorm-mode".iter().map(|&c| u64::from(c)));
+        r.push(0);
+        r.extend(denorm_mode().bytes().map(u64::from));
+        r.push(0);
+        w.record(3, &r);
         w.exit();
         w.enter(PARAMATTR_BLOCK, 3);
-        for id in 1..=4 {
+        for id in 1..=5 {
             w.record(2, &[id]);
         }
         w.exit();
@@ -637,7 +647,11 @@ impl Module {
         for f in &self.funcs {
             // [type, cc, isproto, linkage, paramattr, align, section,
             // visibility, gc, unnamed_addr, prologue, dllstorage, comdat, prefix]
-            let attr = f.attr.map_or(0, |a| a as u64);
+            let attr = match f.attr {
+                Some(a) => a as u64,
+                None if f.body => 5,
+                None => 0,
+            };
             w.record(
                 8,
                 &[
@@ -898,6 +912,18 @@ impl Module {
 }
 
 const MODULE_BLOCK: u64 = 8;
+/// The entry function's `fp32-denorm-mode`: `ftz` unless `VICTORY_DENORM` names another
+/// (`any`, `preserve`).
+pub fn denorm_mode() -> &'static str {
+    static MODE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    MODE.get_or_init(|| {
+        std::env::var("VICTORY_DENORM")
+            .ok()
+            .filter(|v| matches!(v.as_str(), "any" | "preserve" | "ftz"))
+            .unwrap_or_else(|| "ftz".into())
+    })
+}
+
 const PARAMATTR_BLOCK: u64 = 9;
 const PARAMATTR_GROUP_BLOCK: u64 = 10;
 const CONSTANTS_BLOCK: u64 = 11;
@@ -1205,12 +1231,12 @@ mod tests {
     }
 
     /// The written bytes are pinned to what the writer produced before the
-    /// worklist and the reused record buffers.
+    /// worklist and the reused record buffers (and the entry's denorm attribute).
     #[test]
     fn written_bytes_unchanged() {
         for ((regs, stages, read), len, hash) in [
-            ((64, 64, 64), 38_916, 0x9586_730c_f953_4a45),
-            ((128, 256, 32), 295_952, 0x89e5_de2d_64f0_8785),
+            ((64, 64, 64), 38_960, 0xd669_ad55_36e8_e9cd),
+            ((128, 256, 32), 295_996, 0x860e_6154_a6e4_b762),
         ] {
             let bytes = synthetic(regs, stages, read).write();
             assert_eq!((bytes.len(), fnv(&bytes)), (len, hash), "{regs}x{stages}");
