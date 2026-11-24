@@ -59,7 +59,7 @@ mod watch;
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
-pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
+pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view, views_in_place};
 #[cfg(windows)]
 pub use watch::{
     title_memory_reading, title_memory_remapped, title_memory_remapping, writing as kernel_will_write,

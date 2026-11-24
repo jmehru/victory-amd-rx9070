@@ -90,6 +90,84 @@ pub(crate) fn level() -> u8 {
     *LEVEL.get_or_init(|| std::env::var("VICTORY_INPLACE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
 }
 
+/// `VICTORY_INPLACE=3`: view memory (physical pages) too, and the big title
+/// buffers: the runtime then makes its sections committed and of 2 GiB at
+/// most, and each is opened once through a view of our own.
+pub fn views_in_place() -> bool {
+    level() >= 3
+}
+
+struct SectionHeap(Option<ID3D12Heap>, u64);
+
+// SAFETY: Direct3D 12 heaps are free-threaded.
+unsafe impl Send for SectionHeap {}
+
+static SECTION_HEAPS: Mutex<Option<std::collections::HashMap<usize, SectionHeap>>> = Mutex::new(None);
+
+/// The heap over all of `section`, opened on a view of our own with
+/// `OpenExistingHeapFromAddress`: never `OpenExistingHeapFromFileMapping`,
+/// which leaves the section's commit charged after the process is gone on
+/// AMD's driver 32.0.31041.1004 (measured).
+fn section_heap(device: &ID3D12Device, section: usize) -> Option<(ID3D12Heap, u64)> {
+    let mut heaps = SECTION_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = heaps.get_or_insert_with(Default::default);
+    if let Some(h) = heaps.get(&section) {
+        return h.0.clone().map(|heap| (heap, h.1));
+    }
+    let known = views().sections.iter().find(|s| s.0 == section).copied();
+    let opened = match known {
+        Some((_, bytes, true)) => {
+            // SAFETY: a section of the runtime's; the view stays for good.
+            let view = unsafe { mem::MapViewOfFile(section as *mut c_void, mem::FILE_MAP_WRITE, 0, 0, 0) };
+            if view.Value.is_null() {
+                tracing::warn!(section, bytes, "no view of a title section: its memory is copied");
+                None
+            } else {
+                match open(device, From::Region(view.Value as usize)) {
+                    Ok(heap) => {
+                        tracing::info!(section, mb = bytes >> 20, "title section opened in place");
+                        Some((heap, bytes))
+                    }
+                    Err(e) => {
+                        tracing::warn!(section, bytes, error = %e, "title section not opened in place: its memory is copied");
+                        // SAFETY: our view, with no heap on it.
+                        unsafe { mem::UnmapViewOfFile(view) };
+                        None
+                    }
+                }
+            }
+        }
+        _ => None,
+    };
+    heaps.insert(section, SectionHeap(opened.as_ref().map(|o| o.0.clone()), opened.as_ref().map_or(0, |o| o.1)));
+    opened
+}
+
+/// A buffer over `[offset, offset + len)` of `section`, which title memory
+/// shows as one run.
+fn place_run(section: usize, offset: u64, len: u64) -> Option<Placed> {
+    let host = crate::host::host()?;
+    let (heap, bytes) = section_heap(&host.device, section)?;
+    let at = offset & !(K64 as u64 - 1);
+    let size = (offset + len.max(1)).next_multiple_of(K64 as u64) - at;
+    if at + size > bytes {
+        return None;
+    }
+    match place(&host.device, &heap, at, size) {
+        Ok(buffer) => {
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (offset - at);
+            Some(Placed { buffer, heap, gpu, bias: offset - at })
+        }
+        Err(e) => {
+            if STATS[5].fetch_add(1, Ordering::Relaxed) < 8 {
+                tracing::warn!(section, offset, len, error = %e, "no buffer over a title section: a copy instead");
+            }
+            None
+        }
+    }
+}
+
 /// The most title memory in place at once, in bytes
 /// (`VICTORY_INPLACE_MB`, 4096): opening locks the pages into the PC's
 /// memory, also those the title never touched.
@@ -139,9 +217,26 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
         return None;
     }
     // View memory: known from the runtime without asking Windows.
-    if cover(start as usize, len as usize) != Cover::None {
-        STATS[4].fetch_add(1, Ordering::Relaxed);
-        return None;
+    match cover(start as usize, len as usize) {
+        Cover::None => {}
+        Cover::Run(section, offset) if views_in_place() => {
+            let placed = place_run(section, offset, len);
+            match &placed {
+                Some(_) => {
+                    let at = if window { 0 } else { 2 };
+                    STATS[at].fetch_add(1, Ordering::Relaxed);
+                    STATS[at + 1].fetch_add(len, Ordering::Relaxed);
+                }
+                None => {
+                    STATS[4].fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            return placed;
+        }
+        _ => {
+            STATS[4].fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
     }
     if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len > most() {
         STATS[6].fetch_add(1, Ordering::Relaxed);
@@ -286,9 +381,15 @@ fn views() -> std::sync::MutexGuard<'static, Views> {
 /// The runtime made a section of `bytes` for physical pages; `committed`
 /// if with `SEC_COMMIT` (only such a section can be opened as a heap).
 pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
-    let mut v = views();
-    v.sections.retain(|s| s.0 != section);
-    v.sections.push((section, bytes, committed));
+    {
+        let mut v = views();
+        v.sections.retain(|s| s.0 != section);
+        v.sections.push((section, bytes, committed));
+    }
+    // A handle's number may come back for another section.
+    if let Some(heaps) = SECTION_HEAPS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        heaps.remove(&section);
+    }
 }
 
 /// The runtime mapped `[at, at + len)` as a view of `section` from

@@ -2713,6 +2713,7 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
         }
     }
     let n = gone.len() as u64;
+    crate::memory::let_go(&gone);
     for shadow in gone {
         crate::host::retire(shadow);
     }
@@ -2785,7 +2786,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // memory. Not the big ones `cards` puts in the card's memory: those
         // are read too often to stay in the PC's.
         let big = cards() && size >= card_limits().0;
-        if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
+        if (!big || crate::inplace::views_in_place()) && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }

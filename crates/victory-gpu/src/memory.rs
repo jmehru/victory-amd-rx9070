@@ -66,11 +66,12 @@ struct Memory {
     /// Buffer, its mapping, its GPU address.
     directory: (ID3D12Resource, *mut u32, u64),
     faults: (ID3D12Resource, *mut u32, u64),
-    /// Copy `n` is `copies[n - 1]`.
-    copies: Vec<Arc<Shadow>>,
-    /// Per host view heap (by address): the first slot of its run, and how
-    /// many copies have their view there.
-    heaps: HashMap<usize, (u32, u32)>,
+    /// Copy `n` is `copies[n - 1]`; none where one in place was let go
+    /// ([`let_go`]), until another takes the number.
+    copies: Vec<Option<Arc<Shadow>>>,
+    /// Per host view heap (by address): the first slot of its run, and
+    /// which copy (`Shadow::id`) each slot's view was made for.
+    heaps: HashMap<usize, (u32, Vec<u64>)>,
     /// The frame the faults were last read in.
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
@@ -152,11 +153,26 @@ impl Memory {
         if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
             return;
         }
-        let n = match self.copies.iter().position(|c| Arc::ptr_eq(c, &shadow)) {
+        // A raw view starts on 16 bytes: a copy in place that begins off
+        // them in its buffer is left out.
+        if shadow.offset(shadow.span().0) % 16 != 0 {
+            return;
+        }
+        let known = self.copies.iter().position(|c| c.as_ref().is_some_and(|c| Arc::ptr_eq(c, &shadow)));
+        let free = self.copies.iter().position(Option::is_none);
+        let n = match known {
             Some(n) => n,
-            None if self.copies.len() < COPIES as usize => {
-                self.copies.push(shadow.clone());
-                let n = self.copies.len() - 1;
+            None if free.is_some() || self.copies.len() < COPIES as usize => {
+                let n = match free {
+                    Some(n) => {
+                        self.copies[n] = Some(shadow.clone());
+                        n
+                    }
+                    None => {
+                        self.copies.push(Some(shadow.clone()));
+                        self.copies.len() - 1
+                    }
+                };
                 // Every page the copy holds whole, not only the one asked
                 // for: a structure is more than 64 KiB.
                 // shortcut: a page of a title buffer inside this one that
@@ -233,6 +249,36 @@ impl Memory {
     }
 }
 
+/// Copies in place whose memory shows something else now
+/// (`shadow::in_place_let_go`): their pages leave the directory and their
+/// numbers are free, so the next access finds what holds the pages now. A
+/// buffer placed over a section's pages keeps showing those pages after the
+/// title maps others at the address; a store through it would land in
+/// whatever the title put there.
+pub(crate) fn let_go(gone: &[Arc<Shadow>]) {
+    let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(m) = guard.as_mut() else { return };
+    for shadow in gone {
+        let Some(n) = m.copies.iter().position(|c| c.as_ref().is_some_and(|c| Arc::ptr_eq(c, shadow))) else {
+            continue;
+        };
+        let (first, len) = shadow.span();
+        let mut at = first & !(PAGE - 1);
+        while at < first + len && at / PAGE < u64::from(MEMORY_PAGES) - 1 {
+            // SAFETY: inside the directory's mapping.
+            let entry = unsafe { m.directory.1.add((at / PAGE) as usize * 2) };
+            // SAFETY: as above.
+            unsafe {
+                if entry.read() == n as u32 + 1 {
+                    entry.write_volatile(0);
+                }
+            }
+            at += PAGE;
+        }
+        m.copies[n] = None;
+    }
+}
+
 /// Before a draw whose shader reads title memory by address: what its
 /// root arguments name gets its copies (`addresses`: its root views;
 /// `constants`: its root constants, see the module), every numbered copy
@@ -257,7 +303,7 @@ pub(crate) fn ready(
         m.refused.clear();
         m.take_faults();
     }
-    let numbered = m.copies.len();
+    let numbered: Vec<u64> = m.copies.iter().map(|c| c.as_ref().map_or(0, |c| c.id())).collect();
     for &address in addresses {
         m.name(address);
     }
@@ -276,20 +322,25 @@ pub(crate) fn ready(
         }
     }
     let key = std::ptr::from_ref(heap) as usize;
-    let (base, made) = match m.heaps.get(&key) {
-        Some(&run) => run,
+    let (base, mut made) = match m.heaps.remove(&key) {
+        Some(run) => run,
         None => {
             // Held for the heap's life: not given back with a list's slots.
             let base = heap.dynamic(COPIES + 1)?;
             heap.null_raw_uav_at(base);
-            (base, 0)
+            (base, Vec::new())
         }
     };
-    for (n, shadow) in m.copies.iter().enumerate().skip(made as usize) {
-        let (_, len) = shadow.span();
-        heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
+    made.resize(m.copies.len(), 0);
+    for (n, shadow) in m.copies.iter().enumerate() {
+        let Some(shadow) = shadow else { continue };
+        if made[n] != shadow.id() {
+            let (first, len) = shadow.span();
+            heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, shadow.offset(first), len);
+            made[n] = shadow.id();
+        }
     }
-    m.heaps.insert(key, (base, m.copies.len() as u32));
+    m.heaps.insert(key, (base, made));
     // Once per list, and for copies numbered since: the builder alone
     // dispatches hundreds of times a frame.
     // shortcut: a copy another list numbers meanwhile is brought up to date
@@ -299,11 +350,13 @@ pub(crate) fn ready(
     let first_read = list.first_use(READ);
     let first_write = writes && list.first_use(WRITE);
     for (n, shadow) in m.copies.iter().enumerate() {
+        let Some(shadow) = shadow else { continue };
+        let fresh = numbered.get(n) != Some(&shadow.id());
         let (start, len) = shadow.span();
-        if first_read || n >= numbered {
+        if first_read || fresh {
             shadow.refresh(list, start, len);
         }
-        if writes && (first_write || n >= numbered) {
+        if writes && (first_write || fresh) {
             shadow.gpu_writes(list, start, len);
         }
     }
