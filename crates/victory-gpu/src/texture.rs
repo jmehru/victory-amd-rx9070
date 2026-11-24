@@ -894,8 +894,18 @@ fn detile_wide(
 ) -> Result<(), victory_formats::texture::Error> {
     let height = layout.mips.get(mip as usize).map_or(0, |m| m.height);
     let deep = layout.subresource_depth(mip) != 1;
+    #[cfg(feature = "diagnostics")]
+    {
+        crate::copystat::add(crate::copystat::C::TexDetiled, 1);
+        crate::copystat::add(crate::copystat::C::TexDetiledBytes, linear.len() as u64);
+    }
     if deep || linear.len() < 2 * BAND_BYTES || pitch == 0 || height < 2 || height > rows {
         return layout.detile(tiled, mip, slice, linear, pitch, pitch * rows as usize);
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        crate::copystat::add(crate::copystat::C::TexBanded, 1);
+        crate::copystat::add(crate::copystat::C::TexBandedBytes, linear.len() as u64);
     }
     let band = (BAND_BYTES / pitch).clamp(1, height as usize) as u32;
     let failed = std::sync::Arc::new(Mutex::new(None));
