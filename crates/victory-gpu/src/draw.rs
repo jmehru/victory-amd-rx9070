@@ -485,6 +485,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     let gpu = shadow.gpu(address);
     if srv || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
+        list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
         return Some(gpu);
     }
     let (gpu, to) = list.scratch(len)?;
@@ -908,6 +909,8 @@ impl State {
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            // After `bind`: a shader may have written the buffer before.
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
             *view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -926,6 +929,7 @@ impl State {
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
             let view = D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -969,6 +973,7 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        list.begin_command();
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
@@ -1223,6 +1228,8 @@ impl State {
         let ready = |a: u64, s: &std::sync::Arc<crate::shadow::Shadow>| {
             let len = s.left(a).min(limit);
             s.refresh(list, a, len);
+            // Bound for unordered access, written or not.
+            list.buffer_state(&s.buffer, crate::host::BUFFER_WRITE);
             if writes {
                 s.gpu_writes(list, a, len);
             }
@@ -1369,6 +1376,7 @@ impl State {
         // past it stale (most mesh vertex streams reach further).
         if let Some((a, s)) = &shadow {
             s.refresh(list, *a, s.left(*a));
+            list.buffer_state(&s.buffer, crate::host::BUFFER_READ);
         }
         let handle = host.gpu_handle(index);
         // SAFETY: an open list; the slot is in the bound view heap.
@@ -3156,6 +3164,11 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
+        // The count is read from the title's host copy, after the command's
+        // own binding (a copy that command writes stays writable).
+        if let Some((s, _)) = &counter {
+            list.buffer_state(&s.buffer, crate::host::BUFFER_READ);
+        }
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
         unsafe {
@@ -3285,6 +3298,14 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
     // what shaders write through unordered access goes back to it after.
     if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view) {
         shadow.refresh(list, address, len);
+        list.buffer_state(
+            &shadow.buffer,
+            if kind == ResourceType::Uav {
+                crate::host::BUFFER_WRITE
+            } else {
+                crate::host::BUFFER_READ
+            },
+        );
         if kind == ResourceType::Uav {
             // A shader that cannot store to buffers leaves the range as
             // the title has it: nothing to find afterwards.

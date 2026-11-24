@@ -739,6 +739,50 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    use super::{BUFFER_READ, BUFFER_WRITE, BufferStates};
+
+    #[test]
+    fn buffer_states_transition_between_writes_and_reads() {
+        let mut s = BufferStates::default();
+        // First uses: the prelude's.
+        assert_eq!(s.update(1, 'a', BUFFER_WRITE), None);
+        assert_eq!(s.update(2, 'b', BUFFER_READ), None);
+        assert_eq!(s.update(1, 'a', BUFFER_WRITE), None);
+        s.next_command();
+        assert_eq!(s.update(1, 'a', BUFFER_READ), Some(BUFFER_WRITE));
+        assert_eq!(s.update(1, 'a', BUFFER_READ), None);
+        s.next_command();
+        assert_eq!(s.update(1, 'a', BUFFER_WRITE), Some(BUFFER_READ));
+        let sorted = |mut v: Vec<(char, u32)>| {
+            v.sort_unstable();
+            v
+        };
+        let firsts = sorted(s.firsts().map(|(r, f)| (*r, f)).collect());
+        assert_eq!(firsts, [('a', BUFFER_WRITE), ('b', BUFFER_READ)]);
+        let lasts = sorted(s.lasts().map(|(r, l)| (*r, l)).collect());
+        assert_eq!(lasts, [('a', BUFFER_WRITE), ('b', BUFFER_READ)]);
+        s.clear();
+        assert_eq!(s.firsts().count(), 0);
+    }
+
+    /// One command that writes a copy and reads it: the write state wins
+    /// whichever is bound first; the next command reads again.
+    #[test]
+    fn buffer_states_keep_a_command_writing() {
+        let mut s = BufferStates::default();
+        s.next_command();
+        assert_eq!(s.update(1, 'a', BUFFER_WRITE), None);
+        assert_eq!(s.update(1, 'a', BUFFER_READ), None);
+        s.next_command();
+        assert_eq!(s.update(1, 'a', BUFFER_READ), Some(BUFFER_WRITE));
+        assert_eq!(s.update(1, 'a', BUFFER_WRITE), Some(BUFFER_READ));
+        assert_eq!(s.update(1, 'a', BUFFER_READ), None);
+        s.next_command();
+        assert_eq!(s.update(1, 'a', BUFFER_READ), Some(BUFFER_WRITE));
+        let lasts: Vec<_> = s.lasts().map(|(r, l)| (*r, l)).collect();
+        assert_eq!(lasts, [('a', BUFFER_READ)]);
+    }
+
     #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
         use windows_sys::Win32::System::Memory::*;
@@ -818,6 +862,8 @@ pub(crate) struct HostList {
     /// list names alive until it is reset, even if the title releases the
     /// resource first.
     states: Mutex<States>,
+    /// The states of the host copies of title memory the list uses.
+    buffers: Mutex<BufferStates<ID3D12Resource>>,
     /// What the list does with depth textures that have a colour twin, by
     /// twin ([`TwinUse`]).
     twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
@@ -870,6 +916,90 @@ type States = std::collections::HashMap<
     usize,
     (u32, u32, std::sync::Arc<crate::resource::HostTexture>),
 >;
+
+/// Every read of a host copy of title memory (vertex, index, constant and
+/// shader-resource data, indirect counts, the argument clamp's sources).
+pub(crate) const BUFFER_READ: u32 = D3D12_RESOURCE_STATE_GENERIC_READ.0 as u32;
+/// Shader writes to a host copy of title memory.
+pub(crate) const BUFFER_WRITE: u32 = D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32;
+
+/// The states of the host copies of title memory (buffers) one list uses,
+/// by copy: the state it starts in and the one it is in now (upstream
+/// VIctory #334). A buffer is in the common state between lists: the
+/// list's prelude moves it to its first state and the list moves it back
+/// before it closes. A buffer a shader writes and a later command reads
+/// (the meshlet cull's arguments and counts, vertices) is transitioned in
+/// between; the implicit promotion from common it relied on allows either
+/// use in a list, not both.
+///
+/// Within one command (a draw, a dispatch, the argument clamp) the write
+/// state wins: a copy one command both writes and reads (one host copy
+/// backs most of the title's buffers) stays writable, whatever order the
+/// command's views are bound in.
+///
+/// shortcut: buffers read only through directly indexed heaps are not
+/// tracked, and a command that both writes a buffer and reads it as
+/// vertices, indices or counts reads them in the write state.
+pub(crate) struct BufferStates<R> {
+    /// First state, current state, the command that last wrote it.
+    by_copy: std::collections::HashMap<usize, (u32, u32, Option<u64>, R)>,
+    command: u64,
+}
+
+impl<R> Default for BufferStates<R> {
+    fn default() -> Self {
+        BufferStates {
+            by_copy: std::collections::HashMap::new(),
+            command: 0,
+        }
+    }
+}
+
+impl<R> BufferStates<R> {
+    /// Uses from here on belong to the next command.
+    pub(crate) fn next_command(&mut self) {
+        self.command += 1;
+    }
+
+    /// The list uses `copy` (`resource`) in `wanted`: the state it leaves,
+    /// if a transition must be recorded now. A first use records nothing:
+    /// the prelude moves the buffer there.
+    pub(crate) fn update(&mut self, copy: usize, resource: R, wanted: u32) -> Option<u32> {
+        let command = self.command;
+        let wrote = (wanted == BUFFER_WRITE).then_some(command);
+        match self.by_copy.entry(copy) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert((wanted, wanted, wrote, resource));
+                None
+            }
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                let e = o.get_mut();
+                if wrote.is_some() {
+                    e.2 = wrote;
+                } else if e.2 == Some(command) {
+                    return None;
+                }
+                let before = std::mem::replace(&mut e.1, wanted);
+                (before != wanted).then_some(before)
+            }
+        }
+    }
+
+    /// The prelude's transitions: each buffer from common to its first state.
+    pub(crate) fn firsts(&self) -> impl Iterator<Item = (&R, u32)> {
+        self.by_copy.values().map(|(first, _, _, r)| (r, *first))
+    }
+
+    /// The list's closing transitions: each buffer from its last state back
+    /// to common.
+    pub(crate) fn lasts(&self) -> impl Iterator<Item = (&R, u32)> {
+        self.by_copy.values().map(|(_, last, _, r)| (r, *last))
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.by_copy.clear();
+    }
+}
 
 /// What a list does with a depth texture that has a colour twin
 /// ([`crate::resource::Twin`]). Lists are recorded on many threads and run
@@ -3036,6 +3166,7 @@ impl Host {
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
+                buffers: Mutex::default(),
                 twins: Mutex::default(),
                 prelude,
                 pipelines: Mutex::default(),
@@ -4658,6 +4789,20 @@ impl HostList {
                 self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
             }
         }
+        // The buffers it used back to common, where the next list's prelude
+        // expects them.
+        let back: Vec<D3D12_RESOURCE_BARRIER> = self
+            .buffers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .lasts()
+            .filter(|&(_, last)| last != D3D12_RESOURCE_STATE_COMMON.0 as u32)
+            .map(|(b, last)| transition(b, D3D12_RESOURCE_STATES(last as i32), D3D12_RESOURCE_STATE_COMMON))
+            .collect();
+        if !back.is_empty() {
+            // SAFETY: an open list and buffers the list holds.
+            unsafe { self.list.ResourceBarrier(&back) };
+        }
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
             fail(format_args!(
@@ -4674,6 +4819,7 @@ impl HostList {
         self._alive.used();
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.buffers.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
@@ -4918,6 +5064,27 @@ impl HostList {
         }
     }
 
+    /// The uses of host copies that follow belong to a new command (draw,
+    /// dispatch, argument clamp): see [`BufferStates`].
+    pub(crate) fn begin_command(&self) {
+        self.buffers.lock().unwrap_or_else(|e| e.into_inner()).next_command();
+    }
+
+    /// Moves a host copy of title memory to `wanted` ([`BUFFER_READ`] or
+    /// [`BUFFER_WRITE`]) in this list: see [`BufferStates`].
+    pub(crate) fn buffer_state(&self, buffer: &ID3D12Resource, wanted: u32) {
+        let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(before) = buffers.update(buffer.as_raw() as usize, buffer.clone(), wanted) {
+            let barrier = transition(
+                buffer,
+                D3D12_RESOURCE_STATES(before as i32),
+                D3D12_RESOURCE_STATES(wanted as i32),
+            );
+            // SAFETY: an open list and a buffer the list holds.
+            unsafe { self.list.ResourceBarrier(&[barrier]) };
+        }
+    }
+
     /// At submission: the list that moves each texture this list uses from
     /// its real state to the one the list starts with; the textures' real
     /// states become those the list ends with. For depth textures with a
@@ -4984,6 +5151,14 @@ impl HostList {
             (real != *first)
                 .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
         }));
+        drop(states);
+        barriers.extend(
+            self.buffers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .firsts()
+                .map(|(b, first)| transition(b, D3D12_RESOURCE_STATE_COMMON, host_state(first))),
+        );
         if barriers.is_empty() && syncs.is_empty() {
             return None;
         }
