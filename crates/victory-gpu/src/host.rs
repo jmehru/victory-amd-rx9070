@@ -5547,6 +5547,7 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                     }
                     batch.title_written();
+                    crate::profile::copied(len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
@@ -5558,6 +5559,7 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
+                    crate::profile::copied(len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
                     len
                 }
@@ -5629,6 +5631,32 @@ impl HostList {
 /// spread over the threads kept for the snapshots (`crate::shadow::wide`).
 /// The write-watch journal and the guards are behind their own locks, as
 /// they are for the title's threads.
+/// Whether a flush asks what the title wrote for all its copies first, on
+/// the submitting thread, and only then copies, on several threads, for the
+/// copies that have something stale (on by default;
+/// `VICTORY_REFRESH_ASK_FIRST=0`: each copy asks and copies in one piece of
+/// work, as before).
+///
+/// With [`wide_refresh`] every copy of a flush was a piece of work for the
+/// kept threads, and each began by asking the write-watch journal or the
+/// guards, which are behind one lock each: a sampling profile of the first
+/// scene (run prof1b) showed the submitting thread waiting 15.5 ms a frame
+/// for the journal's lock and the three helping threads 57 ms between them,
+/// while what was done under the lock came to some 20 ms. The askings
+/// cannot run side by side; handing the lock from thread to thread a
+/// thousand times a frame only added to them. And 99% of what is asked
+/// about is unchanged, so most pieces of work had nothing to copy.
+///
+/// What changes: within a flush every asking is made before the first
+/// copy, where each copy's asking used to be followed by its copy. A page
+/// the title writes between the two is found by the next asking, as
+/// before (the guards are set by the asking, the write watch is reset by
+/// it).
+fn ask_first() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_ASK_FIRST").is_none_or(|v| v != "0"))
+}
+
 fn wide_refresh() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
@@ -5753,7 +5781,39 @@ impl Batch {
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
-        if wide_refresh() && self.refreshes.len() >= 4 {
+        if ask_first() {
+            // The askings one after the other on this thread, then the
+            // copies that have something to copy, several at a time.
+            let started = std::time::Instant::now();
+            let mut due = Vec::new();
+            for (shadow, from, to) in self.refreshes.drain(..) {
+                #[cfg(feature = "diagnostics")]
+                let asking = std::time::Instant::now();
+                if let Some(asked) = shadow.update_ask(from, to - from)
+                    && shadow.update_due(&asked)
+                {
+                    due.push((shadow, asked));
+                }
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::range(from, to - from, asking.elapsed().as_micros() as u64, 0);
+            }
+            if wide_refresh() && due.len() >= 4 {
+                let jobs: Vec<Box<dyn FnOnce() + Send>> = due
+                    .into_iter()
+                    .map(|(shadow, asked)| {
+                        Box::new(move || {
+                            PREPARING[1].fetch_add(shadow.update_copy(asked) as u64, Ordering::Relaxed);
+                        }) as Box<dyn FnOnce() + Send>
+                    })
+                    .collect();
+                crate::shadow::wide_run(jobs);
+            } else {
+                for (shadow, asked) in due {
+                    PREPARING[1].fetch_add(shadow.update_copy(asked) as u64, Ordering::Relaxed);
+                }
+            }
+            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        } else if wide_refresh() && self.refreshes.len() >= 4 {
             // Each copy on its own, several at a time: a copy's refresh
             // writes that copy and reads title memory, nothing of another's.
             // The time counted is the time it took, not the threads' sum.
@@ -5908,10 +5968,40 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // A short copy without the kernel: the call itself is most of what a
+    // short one costs (see `copy_direct_below`). Not where the two overlap:
+    // the kernel's copy reads all of a short source before it writes.
+    if len < copy_direct_below() && (src as usize).abs_diff(dst as usize) >= len {
+        // SAFETY: as the kernel's copy below, which writes the same bytes
+        // to the same place.
+        return unsafe { crate::watch::copy_guarded(dst, src, len) };
+    }
     let mut done = 0;
     // SAFETY: the destination is mapped writable memory of `len` bytes; the
     // kernel checks the source.
     unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
+}
+
+/// Copies of title memory shorter than this many bytes are made in the
+/// process, with a fault taken for "not there"
+/// (`crate::watch::copy_guarded`), and not by the kernel
+/// (`VICTORY_COPY_DIRECT_BELOW`, 16384; 0: every copy by the kernel, as
+/// before).
+///
+/// The kernel's copy is used because it reports a page that is not there
+/// where a plain copy would fault. Its price is the call: in the first
+/// scene the title's lists copy 10,156 pieces of its buffers a frame, 3.9 MB
+/// in all (384 bytes a piece), and the calls took 7.5 ms a frame of the
+/// submitting thread (run n2p), 0.74 microseconds each for some 30 ns of
+/// copying.
+fn copy_direct_below() -> usize {
+    static BELOW: OnceLock<usize> = OnceLock::new();
+    *BELOW.get_or_init(|| {
+        std::env::var("VICTORY_COPY_DIRECT_BELOW")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(16 << 10)
+    })
 }
 
 #[link(name = "ntdll", kind = "raw-dylib")]

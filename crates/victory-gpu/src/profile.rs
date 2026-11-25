@@ -133,6 +133,20 @@ pub(crate) fn helper_thread() {
     }
 }
 
+/// The title's own buffer copies done at submission: how many and their
+/// bytes, and of those the ones of 1 MiB and more.
+static COPIES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Called for each of the title's buffer copies done at submission.
+pub(crate) fn copied(len: usize) {
+    COPIES[0].fetch_add(1, Ordering::Relaxed);
+    COPIES[1].fetch_add(len as u64, Ordering::Relaxed);
+    if len >= 1 << 20 {
+        COPIES[2].fetch_add(1, Ordering::Relaxed);
+        COPIES[3].fetch_add(len as u64, Ordering::Relaxed);
+    }
+}
+
 /// Called at each present.
 pub(crate) fn presented() {
     FRAMES.fetch_add(1, Ordering::Relaxed);
@@ -175,6 +189,18 @@ fn seconds(name: &str, default: u64) -> std::time::Duration {
     std::time::Duration::from_secs(std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default))
 }
 
+/// Counts kept elsewhere, since the start: questions to Windows about
+/// absent blocks and those answered from kept answers; write-watch askings.
+fn counts() -> [u64; 17] {
+    std::array::from_fn(|i| match i {
+        0 => crate::watch::ABSENT_ASKS.load(Ordering::Relaxed),
+        1 => 0,
+        2..=5 => crate::watch::KERNEL_ASKS[i - 2].load(Ordering::Relaxed),
+        6..=9 => COPIES[i - 6].load(Ordering::Relaxed),
+        _ => crate::watch::GUARD_STATS[i - 10].load(Ordering::Relaxed),
+    })
+}
+
 fn sample(file: &str) {
     const DEPTH: usize = 64;
     let from = seconds("VICTORY_PROFILE_FROM", 150);
@@ -188,6 +214,7 @@ fn sample(file: &str) {
     let mut written = 0u32;
     // How many times each was sampled (a sample of the helpers is of all).
     let mut rounds = [0u32; 3];
+    let mut counted = [0u64; 17];
     loop {
         std::thread::sleep(std::time::Duration::from_millis(1));
         if THREADS[0].load(Ordering::Relaxed) == 0 {
@@ -196,6 +223,9 @@ fn sample(file: &str) {
         let began = *began.get_or_insert_with(std::time::Instant::now);
         if began.elapsed() < from {
             continue;
+        }
+        if since.is_none() {
+            counted = counts();
         }
         let (start, frames) = *since.get_or_insert_with(|| (std::time::Instant::now(), FRAMES.load(Ordering::Relaxed)));
         for slot in 0..2 {
@@ -253,6 +283,21 @@ fn sample(file: &str) {
                 stacks[slot].clear();
                 rounds[slot] = 0;
             }
+            // Counts kept elsewhere, per frame of the window.
+            let now = counts();
+            let per: [f64; 17] = std::array::from_fn(|i| (now[i] - counted[i]) as f64 / frames.max(1) as f64);
+            counted = now;
+            text.push_str(&format!(
+                "==== per frame: {:.0} questions to Windows about absent blocks;                  write-watch askings made ahead {:.0} answered and {:.0} failed, for one range {:.0} answered and {:.0} failed;                  the title's buffer copies {:.0} of {:.1} MB, of them {:.1} of 1 MiB and more with {:.1} MB
+",
+                per[0], per[2], per[3], per[4], per[5], per[6], per[7] / 1e6, per[8], per[9] / 1e6
+            ));
+            text.push_str(&format!(
+                "==== per frame: {:.0} checks of ranges by the guards, {:.0} of them with nothing written at once, {:.0} blocks walked by the others, \
+                 {:.0} absent blocks met, {:.0} of them in a placeholder and not asked about, {:.2} found committed by a question ({} since the start), \
+                 {:.0} runs made read-only\n",
+                per[10], per[11], per[12], per[13], per[14], per[15], now[15], per[16]
+            ));
             let _ = std::fs::write(format!("{file}.{written}"), text);
             since = None;
         }

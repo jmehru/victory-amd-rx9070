@@ -24,6 +24,12 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
+/// What [`Shadow::update_ask`] found: the stretches of the range where no
+/// shader writes (from, to), each with its asking's answer (the asking's
+/// number and the pages' last writes, as `crate::watch::writes` gives them;
+/// `None`: not watched).
+pub(crate) struct Asked(Vec<(usize, usize, Option<(u64, Vec<(usize, u64)>)>)>);
+
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
     pub(crate) buffer: ID3D12Resource,
@@ -2443,14 +2449,25 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        match self.update_ask(address, len) {
+            Some(asked) => self.update_copy(asked),
+            None => 0,
+        }
+    }
+
+    /// The first half of [`Shadow::update`]: asks what the title wrote in
+    /// `[address, address + len)` since it was last asked (the write watch,
+    /// or the guards, which are set again). Nothing is copied. `None` if
+    /// there is nothing to bring up to date.
+    pub(crate) fn update_ask(&self, address: usize, len: usize) -> Option<Asked> {
         // In place: the card reads title memory itself.
         if self.place.is_some() {
-            return 0;
+            return None;
         }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
-            return 0;
+            return None;
         }
         let mut busy: Vec<(usize, usize)> = self
             .pending
@@ -2460,43 +2477,91 @@ impl Shadow {
             .copied()
             .filter(|&(a, e)| a < to && e > from)
             .collect();
+        let mut parts = Vec::with_capacity(busy.len() + 1);
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
             // gaps whole cost ~1 s per frame).
             busy.sort_unstable();
-            let (mut at, mut bytes) = (from, 0);
+            let mut at = from;
             for (a, e) in busy {
                 if a > at {
-                    bytes += self.update_free(at, a);
+                    parts.push((at, a, self.ask_free(at, a)));
                 }
                 at = at.max(e);
             }
             if at < to {
-                bytes += self.update_free(at, to);
+                parts.push((at, to, self.ask_free(at, to)));
             }
-            return bytes;
+        } else {
+            parts.push((from, to, self.ask_free(from, to)));
         }
-        self.update_free(from, to)
+        Some(Asked(parts))
+    }
+
+    /// The asking for `[from, to)` (inside the buffer), where no shader
+    /// writes; `None` if the memory is not watched (it is copied whole).
+    fn ask_free(&self, from: usize, to: usize) -> Option<(u64, Vec<(usize, u64)>)> {
+        if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
+            if let Some(answer) = crate::watch::writes(from, to, true) {
+                self.watched.store(1, Ordering::Relaxed);
+                return Some(answer);
+            }
+            self.watched.store(NOT_WATCHED, Ordering::Relaxed);
+        }
+        None
+    }
+
+    /// Whether [`Shadow::update_copy`] of `asked` would copy anything: a
+    /// stretch that is not watched, or a page written after its last copy
+    /// (or never copied). Most refreshes of a frame find nothing (99% of
+    /// the bytes checked in the first scene), and those need no thread.
+    pub(crate) fn update_due(&self, asked: &Asked) -> bool {
+        let base = self.start as usize / PAGE;
+        let due = asked.0.iter().any(|(from, to, answer)| {
+            let Some((_, written)) = answer else {
+                return true;
+            };
+            let (first, last) = (from / PAGE, (to - 1) / PAGE);
+            let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            copied[first - base..=last - base].contains(&0)
+                || written
+                    .iter()
+                    .any(|&(page, write)| page >= first && page <= last && write > copied[page - base])
+        });
+        #[cfg(feature = "diagnostics")]
+        if !due {
+            use crate::copystat::{C, add};
+            let bytes: usize = asked.0.iter().map(|(from, to, _)| to - from).sum();
+            add(C::Checked, bytes as u64);
+            add(C::Unchanged, bytes as u64);
+        }
+        due
+    }
+
+    /// The second half of [`Shadow::update`]: copies what `asked` found
+    /// stale. Returns the bytes copied.
+    pub(crate) fn update_copy(&self, asked: Asked) -> usize {
+        asked
+            .0
+            .into_iter()
+            .map(|(from, to, answer)| self.copy_free(from, to, answer))
+            .sum()
     }
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
-    /// shader writes.
-    fn update_free(&self, from: usize, to: usize) -> usize {
-        if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
-                self.watched.store(1, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written);
-                self.refresh_check(from, to);
-                #[cfg(feature = "diagnostics")]
-                {
-                    use crate::copystat::{C, add};
-                    add(C::Checked, (to - from) as u64);
-                    add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
-                }
-                return copied;
+    /// shader writes, with the answer of its asking ([`Shadow::ask_free`]).
+    fn copy_free(&self, from: usize, to: usize, answer: Option<(u64, Vec<(usize, u64)>)>) -> usize {
+        if let Some((now, written)) = answer {
+            let copied = self.copy_stale(from, to, now, &written);
+            self.refresh_check(from, to);
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add};
+                add(C::Checked, (to - from) as u64);
+                add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
             }
-            self.watched.store(NOT_WATCHED, Ordering::Relaxed);
+            return copied;
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::WholeBytes, (to - from) as u64);
