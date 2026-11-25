@@ -2645,6 +2645,9 @@ impl State {
                             && shadow.left(address) >= u64::from(aligned_size)
                         {
                             shadow.refresh(list, address, u64::from(aligned_size));
+                            // Local: read as a constant buffer (the buffer
+                            // states of upstream #334 do not know this bind).
+                            list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
                             host.constant_at(index, shadow.gpu(address), size);
                         } else {
                             let Some((gpu, to)) = list.scratch(u64::from(size)) else {
