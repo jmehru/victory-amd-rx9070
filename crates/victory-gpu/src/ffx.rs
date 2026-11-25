@@ -461,6 +461,16 @@ pub extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *const Header) ->
                 "ffx: the host texture cannot take the upscaler's state"
             );
         }
+        // An RGB9E5 texture the host made as RGBA16F (`resource::target_format`)
+        // is announced to the SDK as what it really is.
+        const FFX_R16G16B16A16_FLOAT: u32 = 4;
+        const FFX_R9G9B9E5_SHAREDEXP: u32 = 29;
+        const DXGI_R16G16B16A16_FLOAT: i32 = 10;
+        // SAFETY: a live host texture.
+        let host_format = unsafe { texture.GetDesc() }.Format.0;
+        if r.description[1] == FFX_R9G9B9E5_SHAREDEXP && host_format == DXGI_R16G16B16A16_FLOAT {
+            r.description[1] = FFX_R16G16B16A16_FLOAT;
+        }
         r.resource = texture.as_raw();
         r.state = ffx;
     }
