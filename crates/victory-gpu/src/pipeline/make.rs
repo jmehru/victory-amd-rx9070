@@ -51,11 +51,22 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
         // RX 9070, 32.0.32029.2010): f16876929fa64f9f, 878933b499cfa14d,
         // c1eee35dbc50a9ef, a567b9ef845fb680 (fxceless #120, #145).
         Some("crashes the RDNA4 compiler, left out")
+    } else if prev_culling_out() && shaders.iter().any(|s| matches!(s.hash.as_str(), "fc5e66f8f873d3bb" | "0452fc2d2e2fc4c3")) {
+        // Local (`VICTORY_NO_PREV_CULL=1`): the two meshlet-culling programs
+        // every device loss with submissions sent ahead stopped in on RDNA4
+        // (fxceless issue #3: 15 runs on an RX 9070 XT; clean for 10 minutes
+        // with both skipped).
+        Some("meshlet culling the RDNA4 device is lost in, left out")
     } else if too_dear(shaders) {
         Some("too dear to compile, left out")
     } else {
         None
     }
+}
+
+fn prev_culling_out() -> bool {
+    static OUT: OnceLock<bool> = OnceLock::new();
+    *OUT.get_or_init(|| std::env::var_os("VICTORY_NO_PREV_CULL").is_some_and(|v| v == "1"))
 }
 
 /// Whether some compute shader of `shaders` holds `name`.
