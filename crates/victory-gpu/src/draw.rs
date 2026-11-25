@@ -1586,10 +1586,19 @@ impl State {
         // The rest waits for the next frames, as it does past the bytes.
         const SPAN: std::time::Duration = std::time::Duration::from_millis(250);
         const SPAN_CATCHING_UP: std::time::Duration = std::time::Duration::from_millis(1500);
+        // Local (`VICTORY_TEXTURE_SPAN_MS`, 250): the time per pass outside
+        // catching up. Walking about the world on the RX 9070's machine the
+        // pass took 100 to 485 ms of most frames, 60 to 340 ms of that for
+        // these textures, with 1,000 to 6,800 slots waiting all the while:
+        // 4.4 frames a second in the middle against 12.5 standing still.
+        static SPAN_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let span_ms = *SPAN_MS.get_or_init(|| {
+            std::env::var("VICTORY_TEXTURE_SPAN_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(250)
+        });
         let (per_frame, span) = if census[0] > LONG && catching_up(std::time::Duration::ZERO) {
             (PER_FRAME_CATCHING_UP, SPAN_CATCHING_UP)
         } else {
-            (PER_FRAME, SPAN)
+            (PER_FRAME, std::time::Duration::from_millis(span_ms))
         };
         let began = std::time::Instant::now();
         for (index, write) in due {

@@ -65,6 +65,19 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
 /// call that resets written pages costs 30-70 microseconds whatever the
 /// range).
 const AHEAD_GAP: usize = (8 << 20) / PAGE;
+/// Local (`VICTORY_AHEAD_GAP_KB`): [`AHEAD_GAP`] in KiB, to measure what the
+/// askings cost by call and by page walked (2,160 askings over 8.3 GB a
+/// frame took 30 ms on the RX 9070's machine).
+fn ahead_gap() -> usize {
+    static GAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *GAP.get_or_init(|| {
+        std::env::var("VICTORY_AHEAD_GAP_KB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or(AHEAD_GAP, |kb| (kb << 10) / PAGE)
+    })
+}
+
 /// The most one asking covers (its answer needs 8 bytes per 4 KiB page).
 const AHEAD_MAX: usize = (1 << 30) / PAGE;
 
@@ -100,7 +113,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         let mut last = pieces[i].1;
         let mut k = i + 1;
         while k < pieces.len()
-            && pieces[k].0 <= last + AHEAD_GAP
+            && pieces[k].0 <= last + ahead_gap()
             && last.max(pieces[k].1) - first <= AHEAD_MAX
         {
             last = last.max(pieces[k].1);
