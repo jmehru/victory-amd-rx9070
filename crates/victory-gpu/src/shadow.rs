@@ -107,9 +107,12 @@ struct Card {
     sent: Mutex<Vec<(usize, usize, u64)>>,
     /// With [`card_masks`]: pieces of the copy whose changed bytes go to
     /// the card's side in one pass each ([`Masked`]), not yet taken by
-    /// [`card_dirty`]. Their bytes are in `dirty` too, run by run, for the
-    /// merges of what the card wrote. Locked inside `dirty`'s lock.
+    /// [`card_dirty`]: beside `dirty`, of which their bytes are not part.
+    /// Locked inside `dirty`'s lock.
     masked: Mutex<Vec<Masked>>,
+    /// With [`relay`]: the pieces that went from `masked` to the card's
+    /// side, as `sent` keeps the ranges. Locked inside `sent`'s lock.
+    sent_masks: Mutex<Vec<(Masked, u64)>>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
 }
@@ -117,7 +120,7 @@ struct Card {
 /// A piece of a copy in the card's memory (offset, bytes) and which of its
 /// bytes the title changed under shader writes: a bit per byte, counted
 /// from the offset rounded down to 4 bytes, 32 to a word.
-pub(crate) type Masked = (usize, usize, Vec<u32>);
+pub(crate) type Masked = (usize, usize, Arc<Vec<u32>>);
 
 /// Whether the bytes the title changed in a piece of a copy in the card's
 /// memory, while flights' shaders may be writing the piece, go up to the
@@ -184,7 +187,7 @@ mod mask_tests {
     fn a_mask_names_the_runs_it_was_made_of() {
         for at in [0usize, 4096, 4097, 4099, 65533] {
             let runs = [(0usize, 1usize), (2, 3), (9, 30), (100, 1), (4000, 96)];
-            let masked: Masked = (at, 4096, mask_of(at, 4096, &runs));
+            let masked: Masked = (at, 4096, Arc::new(mask_of(at, 4096, &runs)));
             let named: Vec<(usize, usize)> = runs.iter().map(|&(r, m)| (at + r, at + r + m)).collect();
             assert_eq!(mask_runs(&masked), named);
             // A word's four bits are bits 4w to 4w + 3 of the mask, from
@@ -399,21 +402,15 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>,
             .as_ref()
             .map(|c| {
                 let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
-                let mut ranges = std::mem::take(&mut *dirty);
-                let mut masked = std::mem::take(&mut *c.masked.lock().unwrap_or_else(|e| e.into_inner()));
+                let ranges = std::mem::take(&mut *dirty);
+                let masked = std::mem::take(&mut *c.masked.lock().unwrap_or_else(|e| e.into_inner()));
                 if relay() {
                     let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
                     sent.retain(|s| s.2 > fetched);
                     sent.extend(ranges.iter().map(|&(a, b)| (a, b, sent_as)));
-                }
-                // What lies in a piece that goes up by its mask is not
-                // copied as well.
-                if !masked.is_empty() {
-                    masked.sort_unstable_by_key(|m| m.0);
-                    ranges.retain(|&(a, b)| {
-                        let next = masked.partition_point(|m| m.0 <= a);
-                        !(next > 0 && b <= masked[next - 1].0 + masked[next - 1].1)
-                    });
+                    let mut sent_masks = c.sent_masks.lock().unwrap_or_else(|e| e.into_inner());
+                    sent_masks.retain(|s| s.1 > fetched);
+                    sent_masks.extend(masked.iter().map(|m| (m.clone(), sent_as)));
                 }
                 (ranges, masked)
             })
@@ -2653,7 +2650,7 @@ impl Shadow {
                     // SAFETY: inside the mapping of the copy's CPU side,
                     // which only the submitting thread writes.
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                    let runs = changed_runs(title, held);
+                    let mut runs = changed_runs(title, held);
                     // Many runs: the piece goes up by its mask, one pass
                     // on the card whatever their number.
                     let masked = card_masks() && runs.len() > MASK_RUNS;
@@ -2665,8 +2662,19 @@ impl Shadow {
                     if masked && let Some(card) = &self.card {
                         MASKED[0].fetch_add(1, Ordering::Relaxed);
                         MASKED[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                        // The runs are told by the mask alone: thousands of
+                        // ranges a piece are not kept, sent and searched.
+                        let mut bytes = 0;
+                        for &(r, m) in &runs {
+                            held[r..r + m].copy_from_slice(&title[r..r + m]);
+                            bytes += m;
+                        }
+                        MERGED[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                        MERGED[2].fetch_add(bytes as u64, Ordering::Relaxed);
+                        let mask = Arc::new(mask_of(at, n, &runs));
                         let _dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
-                        card.masked.lock().unwrap_or_else(|e| e.into_inner()).push((at, n, mask_of(at, n, &runs)));
+                        card.masked.lock().unwrap_or_else(|e| e.into_inner()).push((at, n, mask));
+                        runs.clear();
                     }
                     for (r, m) in runs {
                         held[r..r + m].copy_from_slice(&title[r..r + m]);
@@ -3138,11 +3146,21 @@ impl Shadow {
         let (gpu, held) = (&gpu[first..=last], &mut held[first..=last]);
         let skip: Vec<(usize, usize)> = {
             let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+            let masked = card.masked.lock().unwrap_or_else(|e| e.into_inner());
             let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
+            let sent_masks = card.sent_masks.lock().unwrap_or_else(|e| e.into_inner());
+            // The title's bytes of pieces sent up by their mask, where
+            // such a piece overlaps this stretch.
+            let by_mask = masked
+                .iter()
+                .chain(sent_masks.iter().filter(|s| s.1 > fetched_after).map(|s| &s.0))
+                .filter(|m| m.0 < at + n && m.0 + m.1 > at)
+                .flat_map(mask_runs);
             dirty
                 .iter()
                 .copied()
                 .chain(sent.iter().filter(|s| s.2 > fetched_after).map(|s| (s.0, s.1)))
+                .chain(by_mask)
                 .filter(|&(a, b)| a < at + n && b > at)
                 .collect()
         };
@@ -3339,6 +3357,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
                     masked: Mutex::default(),
+                    sent_masks: Mutex::default(),
                     size,
                 };
                 (on_card, Some(card))
@@ -3556,6 +3575,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 masked: Mutex::default(),
+                sent_masks: Mutex::default(),
                 size: len,
             };
             (on_card, Some(card))

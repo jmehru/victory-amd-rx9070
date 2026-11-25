@@ -3692,9 +3692,11 @@ impl Host {
                             .zip(&merges)
                             .filter_map(|((shadow, ranges, _), placed)| {
                                 let hashed = sent_up(shadow, ranges) && shadow.card_sides().is_some_and(|s| s.1.is_some());
+                                let _ = placed;
                                 let state = if hashed {
                                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
-                                } else if !placed.is_empty() {
+                                } else if sent_up(shadow, ranges) {
+                                    // Copied or merged into, and not hashed.
                                     D3D12_RESOURCE_STATE_COPY_DEST
                                 } else {
                                     return None;
