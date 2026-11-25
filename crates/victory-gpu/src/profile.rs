@@ -205,14 +205,15 @@ fn seconds(name: &str, default: u64) -> std::time::Duration {
 
 /// Counts kept elsewhere, since the start: questions to Windows about
 /// absent blocks and those answered from kept answers; write-watch askings.
-fn counts() -> [u64; 21] {
+fn counts() -> [u64; 26] {
     std::array::from_fn(|i| match i {
         0 => crate::watch::ABSENT_ASKS.load(Ordering::Relaxed),
         1 => 0,
         2..=5 => crate::watch::KERNEL_ASKS[i - 2].load(Ordering::Relaxed),
         6..=9 => COPIES[i - 6].load(Ordering::Relaxed),
         10..=16 => crate::watch::GUARD_STATS[i - 10].load(Ordering::Relaxed),
-        _ => HASHED[i - 17].load(Ordering::Relaxed),
+        17..=20 => HASHED[i - 17].load(Ordering::Relaxed),
+        _ => crate::shadow::POOL_STATS[i - 21].load(Ordering::Relaxed),
     })
 }
 
@@ -229,7 +230,7 @@ fn sample(file: &str) {
     let mut written = 0u32;
     // How many times each was sampled (a sample of the helpers is of all).
     let mut rounds = [0u32; 3];
-    let mut counted = [0u64; 21];
+    let mut counted = [0u64; 26];
     loop {
         std::thread::sleep(std::time::Duration::from_millis(1));
         if THREADS[0].load(Ordering::Relaxed) == 0 {
@@ -300,7 +301,7 @@ fn sample(file: &str) {
             }
             // Counts kept elsewhere, per frame of the window.
             let now = counts();
-            let per: [f64; 21] = std::array::from_fn(|i| (now[i] - counted[i]) as f64 / frames.max(1) as f64);
+            let per: [f64; 26] = std::array::from_fn(|i| (now[i] - counted[i]) as f64 / frames.max(1) as f64);
             counted = now;
             text.push_str(&format!(
                 "==== per frame: {:.0} questions to Windows about absent blocks;                  write-watch askings made ahead {:.0} answered and {:.0} failed, for one range {:.0} answered and {:.0} failed;                  the title's buffer copies {:.0} of {:.1} MB, of them {:.1} of 1 MiB and more with {:.1} MB
@@ -316,6 +317,10 @@ fn sample(file: &str) {
             text.push_str(&format!(
                 "==== per frame: {:.1} texture hashes of {:.1} MB, of them {:.1} of 2 MiB and more with {:.1} MB\n",
                 per[17], per[18] / 1e6, per[19], per[20] / 1e6
+            ));
+            text.push_str(&format!(
+                "==== per frame: {:.1} snapshot buffers asked for, {:.1} of them made new with {:.1} MB of room; {:.1} let go by the pool with {:.1} MB\n",
+                per[21], per[22], per[23] / 1e6, per[24], per[25] / 1e6
             ));
             let _ = std::fs::write(format!("{file}.{written}"), text);
             since = None;

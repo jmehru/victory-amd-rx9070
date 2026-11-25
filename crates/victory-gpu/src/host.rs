@@ -5537,8 +5537,33 @@ impl HostList {
     fn run_deferred(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
+        // A run of fills is timed as one: a list of the first scene's has
+        // thousands of them, a few hundred bytes each (10,000 a frame),
+        // and reading the clock twice for each took a millisecond a frame.
+        let mut filling: Option<(std::time::Instant, u64)> = None;
+        let filled = |filling: &mut Option<(std::time::Instant, u64)>| {
+            if let Some((started, bytes)) = filling.take() {
+                PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                PREPARING[1].fetch_add(bytes, Ordering::Relaxed);
+            }
+        };
         for step in &self.deferred().copies {
-            let started = std::time::Instant::now();
+            if let &Step::Fill(dst, src, len) = step {
+                #[cfg(feature = "diagnostics")]
+                {
+                    add(C::Copies, 1);
+                    add(C::CopyBytes, len as u64);
+                }
+                crate::profile::copied(len);
+                filling.get_or_insert_with(|| (std::time::Instant::now(), 0)).1 += len as u64;
+                copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                continue;
+            }
+            filled(&mut filling);
+            // The clock only for the steps that are timed here (a list has
+            // thousands of refreshes, which are timed where they are done).
+            let started = matches!(step, Step::Copy(..) | Step::Run(_) | Step::Host(_)).then(std::time::Instant::now);
+            let since = || started.map_or(0, |s| s.elapsed().as_micros() as u64);
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
                     #[cfg(feature = "diagnostics")]
@@ -5553,16 +5578,8 @@ impl HostList {
                     crate::watch::wrote(dst, len);
                     len
                 }
-                &Step::Fill(dst, src, len) => {
-                    #[cfg(feature = "diagnostics")]
-                    {
-                        add(C::Copies, 1);
-                        add(C::CopyBytes, len as u64);
-                    }
-                    crate::profile::copied(len);
-                    copy_mapped(dst as *mut u8, src as *const u8, len, false);
-                    len
-                }
+                // Done above.
+                &Step::Fill(..) => continue,
                 Step::Refresh(shadow, address, len) => {
                     #[cfg(feature = "diagnostics")]
                     {
@@ -5585,7 +5602,7 @@ impl HostList {
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Runs, 1);
-                        add(C::RunUs, started.elapsed().as_micros() as u64);
+                        add(C::RunUs, since());
                     }
                     continue;
                 }
@@ -5613,9 +5630,10 @@ impl HostList {
                     continue;
                 }
             };
-            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            PREPARING[0].fetch_add(since(), Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
+        filled(&mut filling);
     }
 }
 

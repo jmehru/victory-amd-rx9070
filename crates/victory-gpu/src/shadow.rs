@@ -830,27 +830,63 @@ fn pooled(n: usize) -> Vec<u8> {
         .filter(|(_, v)| v.capacity() >= n && v.capacity() <= most)
         .min_by_key(|(_, v)| v.capacity())
         .map(|(i, _)| i);
+    POOL_STATS[0].fetch_add(1, Ordering::Relaxed);
     let mut v = match fit {
         Some(i) => pool.swap_remove(i),
-        None => Vec::with_capacity(n),
+        None => {
+            POOL_STATS[1].fetch_add(1, Ordering::Relaxed);
+            POOL_STATS[2].fetch_add(n as u64, Ordering::Relaxed);
+            Vec::with_capacity(n)
+        }
     };
     v.clear();
     v
 }
 
-/// Returns a snapshot buffer to the pool: at most 8 kept, the largest, and
-/// of those the largest one and the next ones up to `KEPT` bytes in all.
+/// Since the start: snapshot buffers asked for; of them made new (none in
+/// the pool fitted) and their bytes; buffers the pool let go and their
+/// bytes.
+pub(crate) static POOL_STATS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// How many snapshot buffers the pool keeps at most
+/// (`VICTORY_SNAPSHOT_POOL`, 32; 8: as before). Their bytes are bound as
+/// before (512 MB and the largest).
+///
+/// A snapshot buffer has room for its whole copy and is given back when
+/// the copy's shader writes have been copied back. With eight kept, a
+/// frame whose submissions declare writes into more copies than that had
+/// the smaller buffers freed and made anew every frame: memory given back
+/// to the system and taken again, each page of it faulting in under the
+/// snapshot's copy.
+fn pool_most() -> usize {
+    static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_SNAPSHOT_POOL")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(32)
+    })
+}
+
+/// Returns a snapshot buffer to the pool: at most [`pool_most`] kept, the
+/// largest, and of those the largest one and the next ones up to `KEPT`
+/// bytes in all.
 fn give_back(v: Vec<u8>) {
     const KEPT: usize = 512 << 20;
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-    pool.truncate(8);
-    let (mut seen, mut total) = (0, 0usize);
+    let (mut seen, mut total, most) = (0, 0usize, pool_most());
     pool.retain(|v| {
         seen += 1;
         total = total.saturating_add(v.capacity());
-        seen == 1 || total <= KEPT
+        let keep = seen <= most && (seen == 1 || total <= KEPT);
+        if !keep {
+            POOL_STATS[3].fetch_add(1, Ordering::Relaxed);
+            POOL_STATS[4].fetch_add(v.capacity() as u64, Ordering::Relaxed);
+        }
+        keep
     });
 }
 
