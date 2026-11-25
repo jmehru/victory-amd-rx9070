@@ -81,6 +81,11 @@ fn build() -> &'static [u8; 32] {
             "VICTORY_F16_NEAREST",
             "VICTORY_STRICT_JOINS",
             "VICTORY_MESH_OUTPUT_STRICT",
+            // Local: the switches of the half-wave pixel programs, the NaN
+            // guard and the denormal mode (klbf-lab's) change the code too.
+            "VICTORY_PS_HALVES",
+            "VICTORY_NAN_GUARD",
+            "VICTORY_DENORM",
         ] {
             hash.update(name.as_bytes());
             hash.update(b"=");
