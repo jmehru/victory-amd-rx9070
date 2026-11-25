@@ -848,6 +848,30 @@ extern "system" fn present(
         blinks(frame, resource, state, shown);
         #[cfg(not(feature = "diagnostics"))]
         let _ = shown;
+    } else {
+        // Nothing shown: said at powers of two, with what the present held.
+        static SKIPPED: AtomicU64 = AtomicU64::new(0);
+        let n = SKIPPED.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            // SAFETY: the title passes `planes` plane descriptions.
+            let first = (planes > 0)
+                .then(|| unsafe { plane_parameters.as_ref() })
+                .flatten()
+                .filter(|p| p.count > 0 && !p.resources.is_null())
+                // SAFETY: the plane lists `count` resources.
+                .map(|p| unsafe { *p.resources });
+            // SAFETY: as above.
+            let second = first.and_then(|f| unsafe { second_plane(planes, plane_parameters, f) });
+            tracing::info!(
+                n,
+                frame,
+                planes,
+                first = ?first,
+                first_on_host = first.is_some_and(|r| crate::resource::host_resource(r).is_some()),
+                second_on_host = second.is_some_and(|r| crate::resource::host_resource(r).is_some()),
+                "a present showed nothing"
+            );
+        }
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);

@@ -86,6 +86,7 @@ fn build() -> &'static [u8; 32] {
             "VICTORY_PS_HALVES",
             "VICTORY_NAN_GUARD",
             "VICTORY_DENORM",
+            "VICTORY_QUAD_HELPERS",
         ] {
             hash.update(name.as_bytes());
             hash.update(b"=");

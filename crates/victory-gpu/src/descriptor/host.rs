@@ -246,6 +246,10 @@ static SWEEP: Mutex<(u32, [u64; 10], u64)> = Mutex::new((0, [0; 10], 0));
 /// texture pass last took the ranges ([`remapped`]).
 static REMAPPED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
+/// More ranges came than [`REMAPPED`] keeps: the next texture pass looks
+/// at every placed slot once instead ([`HostHeap::texture_slots_remapped`]).
+static OVERFLOWED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// The lowest start and the highest end of any span of [`Spans`] so far
 /// (the start is `u64::MAX` until there is one): what the runtime does to
 /// memory outside is none of the texture pass's business.
@@ -276,7 +280,8 @@ fn stale_out() -> bool {
 /// locks held: this locks one mutex of its own and calls nothing.
 pub(crate) fn remapped(at: usize, len: usize) {
     use std::sync::atomic::Ordering::Relaxed;
-    /// Ranges kept until a pass takes them.
+    /// Ranges kept until a pass takes them; past this many, every placed
+    /// slot is looked at once instead ([`OVERFLOWED`]).
     /// (A world's first minutes note tens of thousands between two passes:
     /// 131,072 were dropped in one run at the 32,768 there were.)
     const MOST: usize = 1 << 18;
@@ -295,8 +300,10 @@ pub(crate) fn remapped(at: usize, len: usize) {
     }
     if ranges.len() >= MOST {
         // No pass runs (no shader that picks textures by index is bound):
-        // the slots there are looked at when they are due, as before.
+        // the ranges go, and the next pass looks at every placed slot. Lost,
+        // a texture streamed in there would stay stale or null (klbf 56bb7c3).
         STALE[2].fetch_add(ranges.len() as u64, Relaxed);
+        OVERFLOWED.store(true, Relaxed);
         ranges.clear();
     }
     ranges.push((start, end));
@@ -449,11 +456,11 @@ impl TextureQueue {
     }
 
     /// Up to `max` slots due at `frame`, each with its write number, in
-    /// the order to serve them:
-    /// - first the ones looked at before (their memory was not mapped, or
-    ///   only part of it): the look is a query, and memory that has
-    ///   arrived since is what the title streamed in last;
-    /// - then the others, the newest write first and the oldest next, in
+    /// the order to serve them, the two kinds taking turns:
+    /// - the ones looked at before (their memory was not mapped, or only
+    ///   part of it), newest write first: the look is a query, and memory
+    ///   that has arrived since is what the title streamed in last;
+    /// - the others, the newest write first and the oldest next, in
     ///   turns: slot order served the low slots of a backlog of
     ///   25,000-40,000 while the textures of the shot on screen waited
     ///   (run 52: 98% of the drawn pixels had no colour texture in the
@@ -493,12 +500,35 @@ impl TextureQueue {
         }
         let again = &mut again[first_retry..];
         again.sort_unstable_by_key(by_write);
-        let fresh_count = fresh.len().min(max - retries);
+        // Retries and first looks take turns (klbf 5f960b7, from DexNom
+        // 5f4c3df): served first, a backlog of unmapped or partial textures
+        // used a whole time-limited pass while textures written since (a
+        // cutscene's outfits) waited with nothing on the card. Even frames
+        // start with a retry, odd ones with a first look.
+        let retry_order: Vec<(u32, u64)> = again.iter().rev().map(|&(write, index)| (index, write)).collect();
+        let fresh_count = fresh.len().min(max);
         let mut order = Vec::with_capacity(retries + fresh_count);
-        order.extend(again.iter().rev().map(|&(write, index)| (index, write)));
         if fresh_count == 0 {
+            order.extend(retry_order);
             return (order, counts);
         }
+        let mut firsts = Vec::with_capacity(fresh_count);
+        Self::fresh_order(&mut fresh, fresh_count, &mut firsts);
+        let (mut r, mut f) = (retry_order.into_iter(), firsts.into_iter());
+        let mut retry_turn = frame & 1 == 0;
+        while order.len() < max {
+            let next = if retry_turn { r.next().or_else(|| f.next()) } else { f.next().or_else(|| r.next()) };
+            let Some(next) = next else { break };
+            order.push(next);
+            retry_turn = !retry_turn;
+        }
+        (order, counts)
+    }
+
+    /// The first `fresh_count` first looks of `fresh` (write number and
+    /// slot) into `order`: the newest write and the oldest in turns.
+    fn fresh_order(fresh: &mut [(u64, u32)], fresh_count: usize, order: &mut Vec<(u32, u64)>) {
+        let by_write = |&(write, _): &(u64, u32)| write;
 
         // The write number gives the order. Only sort the ends we will
         // serve, leaving the middle of a large backlog unordered.
@@ -522,7 +552,6 @@ impl TextureQueue {
                 order.push((index, write));
             }
         }
-        (order, counts)
     }
 
     /// The entry of `index` if it is still the write the pass was handed.
@@ -1111,13 +1140,22 @@ impl HostHeap {
     pub(crate) fn texture_slots_remapped(&self, frame: u64) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
         let ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
-        if ranges.is_empty() {
+        // Taken once: the flag is set again only by another overflow.
+        let all = OVERFLOWED.swap(false, Relaxed);
+        if ranges.is_empty() && !all {
             return 0;
         }
         let mut slots: Vec<u32> = {
             let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
-            ranges.iter().flat_map(|&(start, end)| placed.slots_in(start, end)).collect()
+            if all {
+                placed.by_slot.keys().copied().collect()
+            } else {
+                ranges.iter().flat_map(|&(start, end)| placed.slots_in(start, end)).collect()
+            }
         };
+        if all {
+            tracing::info!("remapped ranges overflowed: full rescan of {} slots", slots.len());
+        }
         slots.sort_unstable();
         slots.dedup();
         // A table's slot waits for its draw, as a write of it does: the
@@ -3022,14 +3060,15 @@ mod tests {
         q.partly(10, 7, 13, 4096);
         q.written(4, 11, 14, false);
 
-        // Three retries first, newest write first. The remaining seven
-        // alternate between newest and oldest, with no slot repeated.
+        // Retries (newest write first) and first looks take turns, a retry
+        // first on an even frame. First looks alternate between newest and
+        // oldest, with no slot repeated.
         let priority = [
             (6, 8),
-            (11, 5),
-            (5, 3),
             (9, 12),
+            (11, 5),
             (3, 1),
+            (5, 3),
             (1, 11),
             (12, 2),
             (7, 9),
