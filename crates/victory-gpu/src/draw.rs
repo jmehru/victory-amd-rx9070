@@ -517,6 +517,9 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
         return Some(gpu);
     }
+    if let Some(gpu) = list.card_fill(&shadow, address, len) {
+        return Some(gpu);
+    }
     let (gpu, to) = list.scratch(len)?;
     list.defer_fill(to, address as *const u8, len as usize);
     Some(gpu)
@@ -2682,6 +2685,10 @@ impl State {
                             // states of upstream #334 do not know this bind).
                             list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
                             host.constant_at(index, shadow.gpu(address), size);
+                        } else if let Some(gpu) = crate::shadow::existing(address, u64::from(size))
+                            .and_then(|shadow| list.card_fill(&shadow, address, u64::from(size)))
+                        {
+                            host.constant_at(index, gpu, size);
                         } else {
                             let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                                 host.make_null(index);

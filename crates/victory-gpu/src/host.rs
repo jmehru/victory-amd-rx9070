@@ -1869,7 +1869,68 @@ enum Step {
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
+    /// Nothing on the CPU: bytes of a host copy in the card's memory
+    /// (copy, title address, bytes) are copied by the card into memory of
+    /// the list's (buffer, offset) just before the submission's lists run
+    /// ([`card_fill`], `Host::card_before`).
+    CardFill(std::sync::Arc<crate::shadow::Shadow>, usize, usize, ID3D12Resource, u64),
 }
+
+/// Whether constant data a list reads from a host copy in the card's
+/// memory, at an address the host cannot bind in place, is copied for it
+/// by the card (`VICTORY_CARD_FILL=0`: read from title memory on the CPU
+/// at submission, as before).
+///
+/// Such data was copied from title memory into the list's upload memory
+/// when the list was submitted ([`Step::Fill`]). Title memory does not
+/// hold what flights in the air wrote ([`late`]), and the world buffer's
+/// copy is declared written, whole, by every flight: a submission with one
+/// such fill from it waited for the flights to land, once a frame in the
+/// first scene (480 bytes of constants), as the title's own buffer copy
+/// did before it (`crate::list::card_copy`). With the switch the card
+/// copies the bytes out of its own copy of the buffer, in a list of ours
+/// that runs just before the submission's: what earlier flights wrote is
+/// there by the queue's order, and what the title wrote is sent up first,
+/// as for any range a command reads.
+fn card_fill() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_FILL").is_none_or(|v| v != "0"))
+}
+
+/// Memory in the card's for [`card_fill`]: a list holds chunks of it until
+/// it is reset, and they are kept for the next list then.
+struct CardChunk {
+    buffer: ID3D12Resource,
+    gpu: u64,
+    size: u64,
+}
+
+static CARD_CHUNKS: Mutex<Vec<CardChunk>> = Mutex::new(Vec::new());
+const CARD_CHUNK: u64 = 256 << 10;
+
+/// A list's chunks for [`card_fill`] and how much of the last is used.
+#[derive(Default)]
+struct CardScratch {
+    chunks: Vec<CardChunk>,
+    used: u64,
+}
+
+impl Drop for CardScratch {
+    fn drop(&mut self) {
+        if self.chunks.is_empty() {
+            return;
+        }
+        let mut spare = CARD_CHUNKS.lock().unwrap_or_else(|e| e.into_inner());
+        for chunk in self.chunks.drain(..) {
+            if chunk.size == CARD_CHUNK && spare.len() < 256 {
+                spare.push(chunk);
+            }
+        }
+    }
+}
+
+/// Fills done by the card ([`card_fill`]), since the start.
+pub(crate) static CARD_FILLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// What a list does on the CPU when it is submitted: copies between host
 /// memory regions (title buffers, upload buffers and buffer copies), and
@@ -1905,6 +1966,8 @@ struct Deferred {
     texture_backs: Vec<crate::texback::Back>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+    /// Memory in the card's that the list's fills go to ([`card_fill`]).
+    card_scratch: CardScratch,
 }
 
 impl Deferred {
@@ -2415,7 +2478,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     }
                 }
                 Step::Run(_) => return Some(WHY_RUN),
-                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) => {}
+                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) | Step::CardFill(..) => {}
             }
         }
     }
@@ -3378,7 +3441,16 @@ impl Host {
             None => 0,
         };
         let mut dirty = crate::shadow::card_dirty(sent_as);
-        if declared.is_empty() && dirty.is_empty() {
+        // What the card copies out of its copies for the lists ([`card_fill`]).
+        let mut fills: Vec<(Arc<crate::shadow::Shadow>, u64, u64, ID3D12Resource, u64)> = Vec::new();
+        for list in runs {
+            for step in &list.deferred().copies {
+                if let Step::CardFill(shadow, address, len, to, at) = step {
+                    fills.push((shadow.clone(), shadow.offset(*address as u64), *len as u64, to.clone(), *at));
+                }
+            }
+        }
+        if declared.is_empty() && dirty.is_empty() && fills.is_empty() {
             return None;
         }
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
@@ -3399,7 +3471,7 @@ impl Host {
             }
         }
         let mut used: Vec<(bool, Prelude)> = Vec::new();
-        if !dirty.is_empty() {
+        if !dirty.is_empty() || !fills.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
             };
@@ -3481,6 +3553,28 @@ impl Host {
                             let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
                             list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                             list.Dispatch(hash_groups(run.pieces), 1, 1);
+                        }
+                    }
+                    // The fills, after what the title wrote went up. A copy
+                    // hashed above was left readable by shaders.
+                    if !fills.is_empty() {
+                        let hashed: Vec<usize> = dirty
+                            .iter()
+                            .filter(|(shadow, ranges)| !ranges.is_empty() && shadow.card_sides().is_some_and(|s| s.1.is_some()))
+                            .map(|(shadow, _)| Arc::as_ptr(shadow) as usize)
+                            .collect();
+                        let mut moved: Vec<usize> = Vec::new();
+                        for (shadow, from, len, to, at) in &fills {
+                            let key = Arc::as_ptr(shadow) as usize;
+                            if hashed.contains(&key) && !moved.contains(&key) {
+                                moved.push(key);
+                                list.ResourceBarrier(&[transition(
+                                    &shadow.buffer,
+                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                )]);
+                            }
+                            list.CopyBufferRegion(to, *at, &shadow.buffer, *from, *len);
                         }
                     }
                     list.Close()?;
@@ -5370,6 +5464,47 @@ impl HostList {
             .push(Step::Fill(dst as usize, src as usize, len));
     }
 
+    /// [`card_fill`]: `len` bytes of title memory at `address`, which
+    /// `shadow` holds in the card's memory, as the card will have them
+    /// when the list runs, at a host address on 256 bytes; `None` if the
+    /// fill is left to the CPU.
+    pub(crate) fn card_fill(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: u64, len: u64) -> Option<u64> {
+        if len == 0 || !shadow.carded() || !card_fill() || shadow.left(address) < len {
+            return None;
+        }
+        let host = host()?;
+        let room = len.next_multiple_of(256);
+        // What the title wrote there goes up to the card's side first.
+        shadow.refresh(self, address, len);
+        let mut deferred = self.deferred();
+        let scratch = &mut deferred.card_scratch;
+        if scratch.chunks.last().is_none_or(|c| scratch.used + room > c.size) {
+            let spare = if room <= CARD_CHUNK { CARD_CHUNKS.lock().unwrap_or_else(|e| e.into_inner()).pop() } else { None };
+            let chunk = match spare {
+                Some(chunk) => chunk,
+                None => {
+                    let size = room.max(CARD_CHUNK);
+                    let buffer = host.uav_buffer(size)?;
+                    name(&buffer, || "list constants copied by the card".into());
+                    // SAFETY: a live buffer.
+                    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+                    CardChunk { buffer, gpu, size }
+                }
+            };
+            scratch.chunks.push(chunk);
+            scratch.used = 0;
+        }
+        let chunk = scratch.chunks.last()?;
+        let (buffer, at, gpu) = (chunk.buffer.clone(), scratch.used, chunk.gpu + scratch.used);
+        scratch.used += room;
+        deferred.copies.push(Step::CardFill(shadow.clone(), address as usize, len as usize, buffer, at));
+        let n = CARD_FILLS.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            tracing::info!(n, len, address = format_args!("{address:#x}"), "constant data of a copy in the card's memory is copied for a list by the card (VICTORY_CARD_FILL=0: read from title memory)");
+        }
+        Some(gpu)
+    }
+
     /// Brings `[address, address + len)` of a buffer's host copy up to date
     /// when the list is submitted (once per range until a title copy
     /// intervenes), keeping the copy alive until the list is reset.
@@ -5604,8 +5739,8 @@ impl HostList {
                     crate::watch::wrote(dst, len);
                     len
                 }
-                // Done above.
-                &Step::Fill(..) => continue,
+                // Done above; and by the card.
+                &Step::Fill(..) | Step::CardFill(..) => continue,
                 Step::Refresh(shadow, address, len) => {
                     #[cfg(feature = "diagnostics")]
                     {
