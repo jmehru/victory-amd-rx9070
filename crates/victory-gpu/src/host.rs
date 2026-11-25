@@ -166,6 +166,20 @@ pub(crate) fn retire<T: 'static>(object: T) {
         .push((started, Retired(Box::new(object))));
 }
 
+/// As [`retire`], but kept for `more` submissions past the ones running
+/// now, and never dropped at once. Local (RX 9070): title memory used in
+/// place (`VICTORY_INPLACE=3`) that was let go while submissions were sent
+/// ahead (`VICTORY_RELAY`) page-faulted the card inside the heap just
+/// released, twice in two runs; with every submission waited for it did not.
+pub(crate) fn retire_after<T: 'static>(object: T, more: u64) {
+    let started = STARTED.load(Ordering::Acquire);
+    RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
+    RETIRED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((started + more, Retired(Box::new(object))));
+}
+
 /// Drops what waited for submissions up to `finished`.
 fn bury(finished: u64) {
     let done: Vec<(u64, Retired)> = {

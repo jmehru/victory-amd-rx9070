@@ -2715,7 +2715,7 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     let n = gone.len() as u64;
     crate::memory::let_go(&gone);
     for shadow in gone {
-        crate::host::retire(shadow);
+        crate::host::retire_after(shadow, 64);
     }
     n
 }
