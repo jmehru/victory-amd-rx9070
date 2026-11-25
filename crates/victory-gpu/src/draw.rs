@@ -174,6 +174,19 @@ struct Window {
 const WINDOW_MOST: u64 = 256;
 const WINDOWS: usize = 8;
 
+/// [`WINDOW_MOST`] and [`WINDOWS`], or what `VICTORY_WINDOW_MOST` (16 to
+/// 4096 records) and `VICTORY_WINDOWS` (1 to 64) say.
+fn window_limits() -> (u64, usize) {
+    static LIMITS: std::sync::OnceLock<(u64, usize)> = std::sync::OnceLock::new();
+    *LIMITS.get_or_init(|| {
+        let number = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
+        (
+            number("VICTORY_WINDOW_MOST").map_or(WINDOW_MOST, |n| n.clamp(16, 4096)),
+            number("VICTORY_WINDOWS").map_or(WINDOWS, |n| n.clamp(1, 64) as usize),
+        )
+    })
+}
+
 /// Whether indirect draws that read record after record of one argument
 /// buffer are clamped a window at a time (`VICTORY_INDIRECT_WINDOW=1`; off
 /// by default).
@@ -3125,10 +3138,10 @@ impl State {
                         // one are clamped with it at the same step.
                         let grid = w.records > 1 && offset.abs_diff(w.base) % u64::from(w.step) == 0;
                         if walks {
-                            let fit = (args.left(arguments) / step).min(WINDOW_MOST) as u32;
+                            let fit = (args.left(arguments) / step).min(window_limits().0) as u32;
                             (step as u32, (if w.records == 1 { 16 } else { w.records * 2 }).min(fit).max(1))
                         } else if grid {
-                            let fit = (args.left(arguments) / u64::from(w.step)).min(WINDOW_MOST) as u32;
+                            let fit = (args.left(arguments) / u64::from(w.step)).min(window_limits().0) as u32;
                             (w.step, fit.max(1))
                         } else {
                             (stride, max)
@@ -3140,7 +3153,7 @@ impl State {
                 // own, so the windows before it keep theirs.
                 let room = (u64::from(step) * u64::from(records)).next_multiple_of(16);
                 let at0 = if windowed {
-                    if self.window_top + room > crate::indirect::WINDOW_ROOM || self.window.len() >= WINDOWS {
+                    if self.window_top + room > crate::indirect::WINDOW_ROOM || self.window.len() >= window_limits().1 {
                         self.window.clear();
                         self.window_top = 0;
                     }
