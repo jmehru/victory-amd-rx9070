@@ -182,6 +182,35 @@ fn most() -> u64 {
 /// because of [`most`]; and what was let go because its memory changed.
 static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
+/// Local diagnostics: asks turned down, by why, as (count, bytes) pairs:
+/// views with holes, views of scattered pages, one run of a section that
+/// could not be placed, private memory of more than one region, memory not
+/// committed, memory not read-write, memory that is not private.
+static TURNED: [AtomicU64; 14] = [const { AtomicU64::new(0) }; 14];
+
+fn turned(why: usize, len: u64) {
+    TURNED[2 * why].fetch_add(1, Ordering::Relaxed);
+    TURNED[2 * why + 1].fetch_add(len, Ordering::Relaxed);
+}
+
+/// Why `[at, at + len)` is not private memory committed whole
+/// ([`private_whole`]), as an index of [`TURNED`].
+fn private_why(at: usize, len: usize) -> usize {
+    // SAFETY: plain data filled in by the query.
+    let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { mem::VirtualQuery(at as *const c_void, &mut info, size_of_val(&info)) };
+    if n == 0 || info.State != mem::MEM_COMMIT {
+        4
+    } else if info.Type != mem::MEM_PRIVATE {
+        6
+    } else if info.Protect != mem::PAGE_READWRITE {
+        5
+    } else {
+        3
+    }
+}
+
 /// A buffer placed over title memory, and its heap.
 pub(crate) struct Placed {
     pub(crate) buffer: ID3D12Resource,
@@ -217,7 +246,16 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
         return None;
     }
     // View memory: known from the runtime without asking Windows.
-    match cover(start as usize, len as usize) {
+    let covered = match cover(start as usize, len as usize) {
+        Cover::Holes | Cover::None if gaps() && views_in_place() => {
+            match linear_in(&views().views, start as usize, len as usize) {
+                Some((section, offset)) => Cover::Run(section, offset),
+                None => cover(start as usize, len as usize),
+            }
+        }
+        other => other,
+    };
+    match covered {
         Cover::None => {}
         Cover::Run(section, offset) if views_in_place() => {
             let placed = place_run(section, offset, len);
@@ -229,12 +267,14 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
                 }
                 None => {
                     STATS[4].fetch_add(1, Ordering::Relaxed);
+                    turned(2, len);
                 }
             }
             return placed;
         }
-        _ => {
+        other => {
             STATS[4].fetch_add(1, Ordering::Relaxed);
+            turned(usize::from(other != Cover::Holes), len);
             return None;
         }
     }
@@ -257,6 +297,7 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
             if len >= 16 << 20 {
                 tracing::info!(start = format_args!("{start:#x}"), len, regions = %regions_of(start as usize, len as usize), "a big title buffer is not opened in place");
             }
+            turned(private_why(start as usize & !(K64 - 1), len as usize), len);
             None
         }
         Err(Some(e)) => {
@@ -339,6 +380,11 @@ fn say() {
         s[5],
         s[6],
         s[7]
+    );
+    let t: Vec<u64> = TURNED.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+    tracing::info!(
+        "title memory turned down, since the start: {} views with holes {} MB, {} views of scattered pages {} MB, {} runs of a section not placed {} MB,          {} private of several regions {} MB, {} not committed {} MB, {} not read-write {} MB, {} not private {} MB",
+        t[0], t[1] >> 20, t[2], t[3] >> 20, t[4], t[5] >> 20, t[6], t[7] >> 20, t[8], t[9] >> 20, t[10], t[11] >> 20, t[12], t[13] >> 20
     );
 }
 
@@ -612,6 +658,43 @@ fn cover_in(views: &BTreeMap<usize, (usize, usize, u64)>, at: usize, len: usize)
 /// [`Cover`] of `[at, at + len)` by the title's views as they are now.
 pub(crate) fn cover(at: usize, len: usize) -> Cover {
     cover_in(&views().views, at, len)
+}
+
+/// Local (`VICTORY_INPLACE_GAPS=1`, off by default): whether memory with
+/// holes between its views is placed all the same where the views that are
+/// there lie along one run of one section ([`linear_in`]). On the RX 9070's
+/// machine 862 asks (3.7 GB) were turned down for holes and 165 (660 MB)
+/// for a first byte no view holds, against 360 MB of title buffers in
+/// place.
+///
+/// shortcut: the buffer then also shows the section's pages behind the
+/// holes, which the title may show somewhere else: a shader that reads an
+/// address the title has not mapped reads those bytes instead of nothing,
+/// and one that writes there writes them. A view mapped into a hole later
+/// lets the buffer go (`title_memory_remapped`), as any remapping does.
+fn gaps() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INPLACE_GAPS").is_some_and(|v| v == "1"))
+}
+
+/// If every view that touches `[at, at + len)` shows the bytes one run of
+/// one section would show there (there is at least one): that section and
+/// the offset `at` has in the run.
+fn linear_in(views: &BTreeMap<usize, (usize, usize, u64)>, at: usize, len: usize) -> Option<(usize, u64)> {
+    let end = at + len.max(1);
+    let first = views.range(..=at).next_back().filter(|(base, view)| *base + view.0 > at).map(|(base, _)| *base);
+    let mut run: Option<(usize, i128)> = None;
+    for base in first.into_iter().chain(views.range(at + 1..end).map(|(base, _)| *base)) {
+        let &(_, section, offset) = views.get(&base)?;
+        let of_at = i128::from(offset) - (base as i128 - at as i128);
+        match run {
+            None => run = Some((section, of_at)),
+            Some(known) if known != (section, of_at) => return None,
+            Some(_) => {}
+        }
+    }
+    let (section, of_at) = run?;
+    u64::try_from(of_at).ok().map(|offset| (section, offset))
 }
 
 /// Whether `[at, at + len)` is private memory, all committed and
@@ -1293,6 +1376,27 @@ mod tests {
     /// Views as the runtime tells them: a range inside one view, or over
     /// views that continue each other in one section, is one run; over
     /// views from elsewhere it is scattered; over a gap it has holes.
+    #[test]
+    fn views_along_one_run_with_holes_between_them() {
+        let mut views = BTreeMap::new();
+        // Two views of section 7, 3 pages apart in memory and in the section.
+        views.insert(0x10_0000, (K64, 7, 5 * K64 as u64));
+        views.insert(0x10_0000 + 3 * K64, (K64, 7, 8 * K64 as u64));
+        assert_eq!(cover_in(&views, 0x10_0000, 4 * K64), Cover::Holes);
+        assert_eq!(linear_in(&views, 0x10_0000, 4 * K64), Some((7, 5 * K64 as u64)));
+        // From inside the hole: the first byte has no view, the run is the same.
+        assert_eq!(cover_in(&views, 0x10_0000 + K64, 3 * K64), Cover::None);
+        assert_eq!(linear_in(&views, 0x10_0000 + K64, 3 * K64), Some((7, 6 * K64 as u64)));
+        // A view off the run, another section, a run that would begin before the section.
+        views.insert(0x10_0000 + 5 * K64, (K64, 7, 20 * K64 as u64));
+        assert_eq!(linear_in(&views, 0x10_0000, 6 * K64), None);
+        views.insert(0x10_0000 + 5 * K64, (K64, 9, 10 * K64 as u64));
+        assert_eq!(linear_in(&views, 0x10_0000, 6 * K64), None);
+        assert_eq!(linear_in(&views, 0x10_0000 - 6 * K64, 7 * K64), None);
+        // No view at all.
+        assert_eq!(linear_in(&views, 0x90_0000, K64), None);
+    }
+
     #[test]
     fn views_say_what_one_placed_buffer_could_show() {
         let mut views = BTreeMap::new();
