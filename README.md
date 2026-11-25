@@ -1,5 +1,49 @@
 # VIctory fork (work in progress)
 
+## rx9070 branch
+
+This branch is [myokex/victory-amd](https://github.com/myokex/victory-amd) at
+`070df42` with changes found while running on one machine: Windows 11, Radeon
+RX 9070 (RDNA4, driver 32.0.32029.2010), Ryzen 5 7600, 32 GB RAM. Nothing here
+has been tested on another card.
+
+State on that machine (2026-11-25, release build): the prologue is drawn with its
+walls and characters and the player moves. In the first room, standing still:
+12.7 to 12.9 frames per second in the Series S profile (about 85 ms a frame);
+about 9 in the Series X profile. Five runs of 6 to 10 minutes with the relay ended
+without a device loss. Cutscenes that bring in many textures run at 0 to 3
+frames per second. Noise and stray lines show on some textures. Ray-traced light
+does not run.
+
+How it is run here:
+
+```powershell
+$env:VICTORY_INPLACE = "3"; $env:VICTORY_RELAY = "2"
+$env:VICTORY_INDIRECT_WINDOW = "1"; $env:VICTORY_NO_PREV_CULL = "1"
+target\release\victory.exe run <game dir>\<the title's exe> --execute --console series-s
+```
+
+What it adds, each explained where it is in the code or in its commit:
+
+- Four compute programs that crash the RDNA4 driver's compiler
+  (`amdxc64.dll+0x861b9f`) are left out.
+- `VICTORY_NO_PREV_CULL=1` leaves out the two meshlet-culling programs
+  (`fc5e66f8f873d3bb`, `0452fc2d2e2fc4c3`) in which the device was lost whenever
+  submissions were sent ahead (victory-fork issue #3). With them in and the relay
+  on, the device was lost within minutes here; what leaving them out costs the
+  picture has not been looked at.
+- Title view memory and big buffers used in place (`VICTORY_INPLACE=3`), from
+  gmehru's `wip/radeon-8060s`.
+- With `VICTORY_INDIRECT_WINDOW=1`, up to eight windows of indirect records stand
+  side by side in the list's scratch buffer, of up to 256 records each.
+- JoshuuDev's fix for raw DirectStorage reads under the guard over all views.
+- From victory-fork's pull requests, as their authors wrote them: #92, #188 (with
+  #32), #253, #452, #38, #144, #239, #175, #240, #255, #670, #467, #221, #384.
+- Switches for looking into things: `VICTORY_WINDOW_WHY`, `VICTORY_SETTLE_WHY`,
+  `VICTORY_SPIN_US`, `VICTORY_INPLACE_BIG`.
+
+Developed with [Claude Code](https://claude.com/claude-code).
+
 ## victory-amd
 
 This copy is a fork of

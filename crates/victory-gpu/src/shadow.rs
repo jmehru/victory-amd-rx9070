@@ -2333,7 +2333,7 @@ impl Shadow {
             return false;
         }
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
-            return true;
+            return settle_why(0, self.start, self.len);
         }
         let base = start / PAGE;
         let mut title = vec![0u8; PAGE];
@@ -2345,7 +2345,7 @@ impl Shadow {
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
             let Some((now, written)) = crate::watch::writes(a, e, true) else {
-                return true;
+                return settle_why(1, self.start, self.len);
             };
             let stale: Vec<usize> = {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
@@ -2384,7 +2384,7 @@ impl Shadow {
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                     let runs = changed_runs(title, held);
                     if runs.len() > *runs_left {
-                        return true;
+                        return settle_why(2, self.start, self.len);
                     }
                     *runs_left -= runs.len();
                     for (r, m) in runs {
@@ -2395,7 +2395,7 @@ impl Shadow {
                     }
                 } else {
                     let Some(snapshot) = before.as_mut() else {
-                        return true;
+                        return settle_why(3, self.start, self.len);
                     };
                     // SAFETY: the snapshot's allocation holds the copy's
                     // bytes at the copy's offsets (`writing`), and these
@@ -3237,6 +3237,26 @@ mod window_tests {
             assert!(start % g == 0 && len % g == 0);
         }
     }
+}
+
+/// Local diagnostics (`VICTORY_SETTLE_WHY=1`): why the title's bytes could
+/// not be put in beside a flight's shader writes, so that the flights were
+/// settled; said every 256 times with the copy of the last one. Always true.
+fn settle_why(why: usize, start: u64, len: u64) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("VICTORY_SETTLE_WHY").is_some()) {
+        static N: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+        N[why].fetch_add(1, Ordering::Relaxed);
+        let all: u64 = N.iter().map(|n| n.load(Ordering::Relaxed)).sum();
+        if all % 256 == 0 {
+            let v: Vec<u64> = N.iter().map(|n| n.swap(0, Ordering::Relaxed)).collect();
+            tracing::info!(
+                "flights settled for title writes under shader writes, of 256: {} memory not watched, {} no answer from the write watch, {} over the run limit, {} no snapshot; the last copy {start:#x}+{len:#x}",
+                v[0], v[1], v[2], v[3]
+            );
+        }
+    }
+    true
 }
 
 /// For device-removed reports: the copy of title memory whose host range
