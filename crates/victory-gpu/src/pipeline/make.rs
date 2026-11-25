@@ -43,9 +43,9 @@ pub(crate) struct Pending {
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     if without_structures(shaders) {
         Some("shades ray-tracing hits, left out")
-    } else if named(shaders, b"CSComputeSkinningTreeAnim")
+    } else if !rdna4_crashers_made() && (named(shaders, b"CSComputeSkinningTreeAnim")
         || named(shaders, b"CS_UpdateSkinnedAttachMeshTreeParticles")
-        || shaders.iter().any(|s| s.hash == "a567b9ef845fb680")
+        || shaders.iter().any(|s| s.hash == "a567b9ef845fb680"))
     {
         // Local: these crash the RDNA4 driver's compiler (amdxc64.dll+0x861b9f,
         // RX 9070, 32.0.32029.2010): f16876929fa64f9f, 878933b499cfa14d,
@@ -62,6 +62,15 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// Local (`VICTORY_RDNA4_CRASHERS=1`): the four programs left out for the
+/// RDNA4 compiler's crash are made. With victory-fork #195 and #452 in the
+/// branch all four built offline on the RX 9070 (`victory translate
+/// --pipelines`, 2026-11-25); not yet seen in a run, so still off.
+fn rdna4_crashers_made() -> bool {
+    static MADE: OnceLock<bool> = OnceLock::new();
+    *MADE.get_or_init(|| std::env::var_os("VICTORY_RDNA4_CRASHERS").is_some_and(|v| v == "1"))
 }
 
 fn prev_culling_out() -> bool {
