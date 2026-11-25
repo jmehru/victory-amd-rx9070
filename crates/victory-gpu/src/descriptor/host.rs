@@ -2889,12 +2889,12 @@ mod tests {
         let mut q = TextureQueue::default();
         let at = (0x1000, 64);
         q.written(7, 1, 1, false);
-        let write = q.due(1, 1)[0].1;
+        let write = q.due(1, 1).0[0].1;
         q.recheck(7, 1, at, 5);
         assert!(q.rechecks_due(1000, 9).is_empty(), "it waits in the queue");
         q.done(7, write);
         q.recheck(7, 1, at, 5);
-        assert_eq!(q.census(1000)[0], 0, "no slot of the queue");
+        assert_eq!(q.due(1000, 0).1[0], 0, "no slot of the queue");
         let mut frame = 1;
         for wait in RECHECK_FRAMES {
             assert!(q.rechecks_due(frame + wait - 1, 9).is_empty());
@@ -2907,14 +2907,14 @@ mod tests {
         q.recheck(7, frame, at, 5);
         let due = q.rechecks_due(u64::MAX, 9);
         q.rechecked(7, &due[0].1, true, frame + 4);
-        assert_eq!(q.due(frame + 4, 9)[0].0, 7);
+        assert_eq!(q.due(frame + 4, 9).0[0].0, 7);
         assert!(q.rechecks_due(u64::MAX, 9).is_empty());
         // A draw makes the host slot anew: the slot is due although a look
         // at it was still to come.
         q.recheck(8, 1, at, 5);
         let seen = q.rechecks_due(u64::MAX, 9);
         q.written(8, 2, 2, true);
-        assert!(q.due(2, 9).iter().any(|d| d.0 == 8));
+        assert!(q.due(2, 9).0.iter().any(|d| d.0 == 8));
         q.rechecked(8, &seen[0].1, false, 5);
         assert!(q.rechecks_due(u64::MAX, 9).is_empty());
     }
