@@ -2220,7 +2220,11 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
         // settle is still due where that could not be done. At most this
         // many changed runs go up to copies in the card's memory, each a
         // copy of its own there.
-        let mut runs_left = 512;
+        // Local (`VICTORY_LATE_RUNS`, 512): on the RX 9070 every settle of
+        // this kind was the 174 MB world buffer over this limit, once a
+        // frame, 17 ms of waiting for the card.
+        static RUNS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let mut runs_left = *RUNS.get_or_init(|| std::env::var("VICTORY_LATE_RUNS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(512));
         return spans.iter().any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
     }
     spans.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))

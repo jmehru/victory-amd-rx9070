@@ -252,6 +252,11 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
         }
         Err(None) => {
             STATS[4].fetch_add(1, Ordering::Relaxed);
+            // Local diagnostics: why a big buffer is not private memory
+            // committed whole (its regions as Windows tells them).
+            if len >= 16 << 20 {
+                tracing::info!(start = format_args!("{start:#x}"), len, regions = %regions_of(start as usize, len as usize), "a big title buffer is not opened in place");
+            }
             None
         }
         Err(Some(e)) => {
@@ -261,6 +266,36 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
             None
         }
     }
+}
+
+/// Local diagnostics: the regions of `[at, at + len)` by state, type and
+/// protection, with their count and bytes.
+fn regions_of(at: usize, len: usize) -> String {
+    let mut kinds: Vec<((u32, u32, u32), usize, usize)> = Vec::new();
+    let (mut p, end) = (at, at.saturating_add(len));
+    while p < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        if unsafe { mem::VirtualQuery(p as *const c_void, &mut info, size_of_val(&info)) } == 0 {
+            break;
+        }
+        let next = (info.BaseAddress as usize).saturating_add(info.RegionSize).min(end);
+        let key = (info.State, info.Type, info.Protect);
+        match kinds.iter_mut().find(|k| k.0 == key) {
+            Some(k) => (k.1, k.2) = (k.1 + 1, k.2 + (next - p)),
+            None => kinds.push((key, 1, next - p)),
+        }
+        if next <= p {
+            break;
+        }
+        p = next;
+    }
+    kinds
+        .iter()
+        .map(|((state, kind, protect), n, bytes)| format!("{n} regions {} KiB state {state:#x} type {kind:#x} protect {protect:#x}", bytes >> 10))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// What [`place_for`] gave is gone.
