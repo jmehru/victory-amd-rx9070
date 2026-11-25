@@ -70,11 +70,29 @@ unsafe extern "system" {
 }
 
 /// The threads sampled: the one submitting, the one copying back.
-const NAMES: [&str; 3] = [
+const NAMES: [&str; 4] = [
     "submitting thread",
     "copy-back (relay) thread",
     "the threads that help with refreshes, snapshots and compares (summed)",
+    "the title's threads that record lists, but the submitting one (summed)",
 ];
+/// The title's threads seen recording a list.
+static RECORDERS: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// Called by a thread that records into a list (cheap after its first call).
+pub(crate) fn recorder_thread() {
+    thread_local! {
+        static KNOWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    if KNOWN.get() {
+        return;
+    }
+    KNOWN.set(true);
+    if file().is_some() {
+        // SAFETY: a plain query.
+        RECORDERS.lock().unwrap_or_else(|e| e.into_inner()).push(unsafe { GetCurrentThreadId() });
+    }
+}
 /// The helping threads (`crate::shadow::wide`'s).
 static HELPERS: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
 static THREADS: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
@@ -161,9 +179,33 @@ pub(crate) fn hashed(len: usize) {
     }
 }
 
+/// Frames presented so far.
+pub(crate) fn frames() -> u64 {
+    FRAMES.load(Ordering::Relaxed)
+}
+
 /// Called at each present.
 pub(crate) fn presented() {
     FRAMES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The registers of the last stack taken (only the sampling thread's).
+static mut KEPT: [u64; 7] = [0; 7];
+
+/// Events of the title's that we set (fence events): how often, and the
+/// microseconds from the asking to the setting.
+pub(crate) static EVENTS_SET: std::sync::Mutex<Option<HashMap<usize, (u64, u64)>>> = std::sync::Mutex::new(None);
+
+/// Called when an event the title waits for a fence with is set, `us`
+/// after it asked.
+pub(crate) fn event_set(event: usize, us: u64) {
+    if file().is_none() {
+        return;
+    }
+    let mut events = EVENTS_SET.lock().unwrap_or_else(|e| e.into_inner());
+    let e = events.get_or_insert_with(HashMap::new).entry(event).or_insert((0, 0));
+    e.0 += 1;
+    e.1 += us;
 }
 
 /// The call stack of the thread `handle`, stopped meanwhile, into `stack`
@@ -178,6 +220,11 @@ unsafe fn stack_of(handle: *mut c_void, context: &mut Context, stack: &mut Vec<u
         }
         context.0[FLAGS..FLAGS + 4].copy_from_slice(&CONTEXT_FULL.to_ne_bytes());
         if GetThreadContext(handle, context) != 0 {
+            // The registers a call keeps, as the innermost frame has them:
+            // a wait's handle is in one of them (rbx, rsi, rdi, r12-r15).
+            for (k, at) in [0x90usize, 0xA8, 0xB0, 0xD8, 0xE0, 0xE8, 0xF0].into_iter().enumerate() {
+                KEPT[k] = u64::from_ne_bytes(context.0[at..at + 8].try_into().expect("8 bytes"));
+            }
             while stack.len() + 2 < stack.capacity() {
                 let pc = u64::from_ne_bytes(context.0[RIP..RIP + 8].try_into().expect("8 bytes"));
                 if pc == 0 {
@@ -221,7 +268,7 @@ fn sample(file: &str) {
     const DEPTH: usize = 64;
     let from = seconds("VICTORY_PROFILE_FROM", 150);
     let window = seconds("VICTORY_PROFILE_SECS", 60);
-    let mut stacks: [HashMap<Vec<u64>, u32>; 3] = [HashMap::new(), HashMap::new(), HashMap::new()];
+    let mut stacks: [HashMap<Vec<u64>, u32>; 4] = [HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new()];
     let mut helpers: Vec<*mut c_void> = Vec::new();
     let mut handles: [(u32, *mut c_void); 2] = [(0, std::ptr::null_mut()); 2];
     let mut context = Box::new(Context([0; 1232]));
@@ -229,7 +276,9 @@ fn sample(file: &str) {
     let mut since: Option<(std::time::Instant, u64)> = None;
     let mut written = 0u32;
     // How many times each was sampled (a sample of the helpers is of all).
-    let mut rounds = [0u32; 3];
+    let mut rounds = [0u32; 4];
+    let mut recorders: Vec<(u32, *mut c_void)> = Vec::new();
+    let mut waits: HashMap<(u64, [u64; 7]), u32> = HashMap::new();
     let mut counted = [0u64; 26];
     loop {
         std::thread::sleep(std::time::Duration::from_millis(1));
@@ -264,6 +313,11 @@ fn sample(file: &str) {
                 let mut stack = Vec::with_capacity(DEPTH);
                 let inside = slot == 0 && INSIDE.load(Ordering::Relaxed);
                 if stack_of(handles[slot].1, &mut context, &mut stack) {
+                    if slot == 0 && !inside {
+                        // What the submitting thread holds while it waits
+                        // between submissions.
+                        *waits.entry((stack[0], KEPT)).or_insert(0u32) += 1;
+                    }
                     stack.push(u64::from(inside));
                     *stacks[slot].entry(stack).or_insert(0) += 1;
                     rounds[slot] += 1;
@@ -289,12 +343,35 @@ fn sample(file: &str) {
             }
         }
         rounds[2] += u32::from(any);
+        // The title's recording threads likewise (not the submitting one).
+        {
+            let ids = RECORDERS.lock().unwrap_or_else(|e| e.into_inner());
+            while recorders.len() < ids.len() {
+                let id = ids[recorders.len()];
+                // SAFETY: a plain call.
+                recorders.push((id, unsafe { OpenThread(0x2 | 0x8 | 0x40, 0, id) }));
+            }
+        }
+        let submitting = THREADS[0].load(Ordering::Relaxed);
+        let mut any = false;
+        for &(id, handle) in recorders.iter().filter(|r| !r.1.is_null()) {
+            if id == submitting {
+                continue;
+            }
+            let mut stack = Vec::with_capacity(DEPTH);
+            // SAFETY: a handle of ours.
+            if unsafe { stack_of(handle, &mut context, &mut stack) } {
+                *stacks[3].entry(stack).or_insert(0) += 1;
+                any = true;
+            }
+        }
+        rounds[3] += u32::from(any);
         if start.elapsed() >= window {
             written += 1;
             let secs = start.elapsed().as_secs_f64();
             let frames = FRAMES.load(Ordering::Relaxed) - frames;
             let mut text = String::new();
-            for slot in 0..3 {
+            for slot in 0..4 {
                 text.push_str(&report(NAMES[slot], &stacks[slot], secs, frames, rounds[slot]));
                 stacks[slot].clear();
                 rounds[slot] = 0;
@@ -322,6 +399,22 @@ fn sample(file: &str) {
                 "==== per frame: {:.1} snapshot buffers asked for, {:.1} of them made new with {:.1} MB of room; {:.1} let go by the pool with {:.1} MB\n",
                 per[21], per[22], per[23] / 1e6, per[24], per[25] / 1e6
             ));
+            // Between submissions: where the submitting thread stood and the
+            // registers it kept there, most seen first; and the events of
+            // the title's that we set.
+            let mut all: Vec<_> = waits.drain().collect();
+            all.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+            text.push_str("==== between submissions: samples, where, rbx rsi rdi r12 r13 r14 r15\n");
+            for ((at, kept), n) in all.into_iter().take(12) {
+                text.push_str(&format!("{n:7} {at:#x} {kept:x?}\n"));
+            }
+            let events = EVENTS_SET.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+            let mut events: Vec<_> = events.into_iter().collect();
+            events.sort_unstable_by(|a, b| b.1.1.cmp(&a.1.1));
+            text.push_str(&format!("==== events set for fences in the window, {} frames: handle, times, ms from asked to set in all\n", frames));
+            for (event, (n, us)) in events.into_iter().take(12) {
+                text.push_str(&format!("{event:#x} {n} {:.1}\n", us as f64 / 1e3));
+            }
             let _ = std::fs::write(format!("{file}.{written}"), text);
             since = None;
         }

@@ -1630,6 +1630,180 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     drop(freed);
 }
 
+/// Whether the card's time is measured by the kind of list it runs
+/// (`VICTORY_CARD_TIMES=1`; off by default): a timestamp at the start and
+/// the end of each of the title's lists and of each part of our own (the
+/// state preludes; in the list before a submission the passes by mask,
+/// the copies up, the hashes and the fills; the compare after it; the
+/// relay's fetch), read back some thousand lists later and logged with the
+/// frame line in ms a frame, with the time some list of each side was
+/// running (lists overlap on the card, so the kinds' sums can exceed it).
+fn card_times() -> Option<&'static CardTimes> {
+    static TIMES: OnceLock<Option<CardTimes>> = OnceLock::new();
+    TIMES
+        .get_or_init(|| {
+            if std::env::var_os("VICTORY_CARD_TIMES").is_none_or(|v| v != "1") {
+                return None;
+            }
+            let host = host()?;
+            // SAFETY: plain creation and mapping of objects of ours.
+            unsafe {
+                let mut heap: Option<ID3D12QueryHeap> = None;
+                host.device
+                    .CreateQueryHeap(
+                        &D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: 2 * TIME_PAIRS, NodeMask: 0 },
+                        &mut heap,
+                    )
+                    .ok()?;
+                let mut back: Option<ID3D12Resource> = None;
+                host.device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                            Width: u64::from(TIME_PAIRS) * 16,
+                            Height: 1,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                            ..Default::default()
+                        },
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        None,
+                        &mut back,
+                    )
+                    .ok()?;
+                let (heap, back) = (heap?, back?);
+                let mut data = std::ptr::null_mut();
+                back.Map(0, None, Some(&mut data)).ok()?;
+                let frequency = host.queue.GetTimestampFrequency().unwrap_or(1).max(1);
+                tracing::info!("the card's time is measured by the kind of list (VICTORY_CARD_TIMES=1)");
+                Some(CardTimes { heap, back, data: data as usize, frequency })
+            }
+        })
+        .as_ref()
+}
+
+struct CardTimes {
+    heap: ID3D12QueryHeap,
+    back: ID3D12Resource,
+    data: usize,
+    frequency: u64,
+}
+
+// SAFETY: free-threaded D3D12 objects and a persistent mapping only read.
+unsafe impl Send for CardTimes {}
+// SAFETY: as above.
+unsafe impl Sync for CardTimes {}
+
+const TIME_PAIRS: u32 = 1 << 15;
+const TIME_KINDS: [&str; 9] = [
+    "the title's lists",
+    "state preludes",
+    "passes by mask",
+    "copies up",
+    "hashes",
+    "fills",
+    "compares",
+    "the relay's fetches",
+    "other",
+];
+/// The next pair of timestamps to hand out, and the next to read.
+static TIME_NEXT: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+static TIME_KIND: [std::sync::atomic::AtomicU8; TIME_PAIRS as usize] = [const { std::sync::atomic::AtomicU8::new(0) }; TIME_PAIRS as usize];
+
+/// [`card_times`]: a timestamp where `list` stands, the start of a part of
+/// `kind` ([`TIME_KINDS`]); to be ended by [`card_time_end`].
+fn card_time_begin(list: &ID3D12GraphicsCommandList, kind: u8) -> Option<u64> {
+    let times = card_times()?;
+    let pair = TIME_NEXT[0].fetch_add(1, Ordering::Relaxed);
+    let slot = (pair % u64::from(TIME_PAIRS)) as u32;
+    TIME_KIND[slot as usize].store(kind, Ordering::Relaxed);
+    // SAFETY: an open list and our heap.
+    unsafe { list.EndQuery(&times.heap, D3D12_QUERY_TYPE_TIMESTAMP, 2 * slot) };
+    Some(pair)
+}
+
+fn card_time_end(list: &ID3D12GraphicsCommandList, pair: Option<u64>) {
+    let (Some(times), Some(pair)) = (card_times(), pair) else {
+        return;
+    };
+    let slot = (pair % u64::from(TIME_PAIRS)) as u32;
+    // SAFETY: an open list, our heap and read-back buffer.
+    unsafe {
+        list.EndQuery(&times.heap, D3D12_QUERY_TYPE_TIMESTAMP, 2 * slot + 1);
+        list.ResolveQueryData(&times.heap, D3D12_QUERY_TYPE_TIMESTAMP, 2 * slot, 2, &times.back, u64::from(slot) * 16);
+    }
+}
+
+/// Logs what [`card_times`] measured of the lists handed out up to some
+/// thousand ago (the card has run those), over `frames` frames.
+fn card_times_line(frames: f64) {
+    let Some(times) = card_times() else {
+        return;
+    };
+    const LAG: u64 = 6000;
+    let (next, mut read) = (TIME_NEXT[0].load(Ordering::Relaxed), TIME_NEXT[1].load(Ordering::Relaxed));
+    let until = next.saturating_sub(LAG);
+    read = read.max(until.saturating_sub(u64::from(TIME_PAIRS) - LAG));
+    if until <= read {
+        return;
+    }
+    // Share of the pairs since the last line that are read now: the line's
+    // frames are scaled by it (the pairs read are those of earlier frames).
+    let mut sums = [0u64; TIME_KINDS.len()];
+    let mut counts = [0u64; TIME_KINDS.len()];
+    let mut spans: [Vec<(u64, u64)>; 2] = [Vec::new(), Vec::new()];
+    for pair in read..until {
+        let slot = (pair % u64::from(TIME_PAIRS)) as usize;
+        // SAFETY: inside the mapping; the card wrote these long ago.
+        let (a, b) = unsafe {
+            let at = (times.data + slot * 16) as *const u64;
+            (at.read_volatile(), at.add(1).read_volatile())
+        };
+        if b < a || b - a > times.frequency * 2 {
+            continue;
+        }
+        let kind = (TIME_KIND[slot].load(Ordering::Relaxed) as usize).min(TIME_KINDS.len() - 1);
+        sums[kind] += b - a;
+        counts[kind] += 1;
+        spans[usize::from(kind != 0)].push((a, b));
+    }
+    TIME_NEXT[1].store(until, Ordering::Relaxed);
+    let ms = |ticks: u64| ticks as f64 * 1e3 / times.frequency as f64 / frames.max(1.0);
+    // The time some list was running: of the title's, of ours, of either.
+    let union = |spans: &mut Vec<(u64, u64)>| {
+        spans.sort_unstable();
+        let (mut total, mut end) = (0u64, 0u64);
+        for &(a, b) in spans.iter() {
+            if b > end {
+                total += b - a.max(end);
+                end = b;
+            }
+        }
+        total
+    };
+    let title = union(&mut spans[0]);
+    let ours = union(&mut spans[1]);
+    let mut all: Vec<(u64, u64)> = spans[0].iter().chain(spans[1].iter()).copied().collect();
+    let either = union(&mut all);
+    let mut text = String::new();
+    for k in 0..TIME_KINDS.len() {
+        if counts[k] > 0 {
+            text.push_str(&format!(" {} {:.2} ms in {:.1};", TIME_KINDS[k], ms(sums[k]), counts[k] as f64 / frames.max(1.0)));
+        }
+    }
+    tracing::info!(
+        "the card's time per frame by list (VICTORY_CARD_TIMES=1, {:.0} frames):{text} some list of the title's running {:.2} ms, of ours {:.2} ms, of either {:.2} ms",
+        frames,
+        ms(title),
+        ms(ours),
+        ms(either)
+    );
+}
+
 /// What the host keeps for copies in the card's own memory
 /// ([`crate::shadow::cards`]): three lists of ours and the compare.
 struct CardWork {
@@ -2017,6 +2191,8 @@ struct Deferred {
     budget_zeroed: bool,
     /// Memory in the card's that the list's fills go to ([`card_fill`]).
     card_scratch: CardScratch,
+    /// The list's pair of timestamps ([`card_times`]).
+    card_time: Option<u64>,
 }
 
 impl Deferred {
@@ -3609,6 +3785,7 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    let timed = card_time_begin(list, 2);
                     // The passes by mask first: they leave the copy as a
                     // copy's destination, which the copies below want.
                     for ((shadow, ..), placed) in dirty.iter().zip(&merges) {
@@ -3633,6 +3810,8 @@ impl Host {
                             D3D12_RESOURCE_STATE_COPY_DEST,
                         )]);
                     }
+                    card_time_end(list, timed);
+                    let timed = card_time_begin(list, 3);
                     // Whether anything went up to a copy.
                     let sent_up = |shadow: &Arc<crate::shadow::Shadow>, ranges: &[(usize, usize)]| {
                         !ranges.is_empty()
@@ -3667,6 +3846,8 @@ impl Host {
                             list.ResourceBarrier(&barriers);
                         }
                     }
+                    card_time_end(list, timed);
+                    let timed = card_time_begin(list, 4);
                     for (shadow, ranges, masks) in &dirty {
                         let Some((staging, before, size)) = shadow.card_sides() else {
                             continue;
@@ -3714,6 +3895,8 @@ impl Host {
                             list.Dispatch(hash_groups(run.pieces), 1, 1);
                         }
                     }
+                    card_time_end(list, timed);
+                    let timed = card_time_begin(list, 5);
                     // The fills, after what the title wrote went up. A copy
                     // hashed above was left readable by shaders.
                     if !fills.is_empty() {
@@ -3748,6 +3931,7 @@ impl Host {
                             list.CopyBufferRegion(to, *at, &shadow.buffer, *from, *len);
                         }
                     }
+                    card_time_end(list, timed);
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     Ok(())
@@ -3810,6 +3994,7 @@ impl Host {
                 (|| -> windows::core::Result<ID3D12CommandList> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    let timed = card_time_begin(list, 6);
                     // What the submission's shaders wrote, first.
                     list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
                         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
@@ -3834,6 +4019,7 @@ impl Host {
                         list.Dispatch(hash_groups(r.span.pieces), 1, 1);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
+                    card_time_end(list, timed);
                     list.Close()?;
                     list.cast()
                 })()
@@ -4000,9 +4186,11 @@ impl Host {
             (|| -> windows::core::Result<u64> {
                 allocator.Reset()?;
                 list.Reset(&allocator, None)?;
+                let timed = card_time_begin(&list, 7);
                 for (shadow, lo, hi, at) in &pieces {
                     list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
                 }
+                card_time_end(&list, timed);
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
                 // In the order of the queue: the sends of title bytes so
@@ -5140,6 +5328,8 @@ impl HostList {
             // SAFETY: an open list and buffers the list holds.
             unsafe { self.list.ResourceBarrier(&back) };
         }
+        let timed = self.deferred().card_time.take();
+        card_time_end(&self.list, timed);
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
             fail(format_args!(
@@ -5179,6 +5369,8 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
+        let timed = card_time_begin(&self.list, 0);
+        self.deferred().card_time = timed;
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
     }
@@ -5541,6 +5733,7 @@ impl HostList {
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
+                let timed = card_time_begin(list, 1);
                 if !to_copy.is_empty() {
                     list.ResourceBarrier(&to_copy);
                 }
@@ -5550,6 +5743,7 @@ impl HostList {
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
                 }
+                card_time_end(list, timed);
                 list.Close()
             })
         };
@@ -6708,6 +6902,12 @@ impl Meter {
         let drops = crate::pipeline::take_drops();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
+            {
+                static FRAMES_THEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let now = crate::profile::frames();
+                let then = FRAMES_THEN.swap(now, Ordering::Relaxed);
+                card_times_line((now - then) as f64);
+            }
             tracing::info!(
                 "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
                 crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)
