@@ -853,6 +853,86 @@ fn buffer_range(buffer: This, offset: u64, len: u64) -> Option<*mut u8> {
     Some(unsafe { data.add(offset as usize) })
 }
 
+/// Whether a title's buffer copy whose source shaders write is done by the
+/// card, between the host copies of the two buffers
+/// (`VICTORY_CARD_COPY=0`: on the CPU at submission, as every other copy).
+///
+/// A buffer copy is done on the CPU when its list is submitted, between
+/// the two buffers' title memory. Where the source is memory that flights
+/// in the air may write (`crate::host::late`), what they wrote is not in
+/// title memory yet, and the submission waited for them to land: in the
+/// first scene one copy a frame, 20,480 bytes out of the 174 MB world
+/// buffer (whose copy is in the card's memory and which every flight
+/// declares written), 7-13 ms of the submitting thread each time, and the
+/// one point of every frame where it could not run ahead of the card.
+///
+/// With the switch such a copy is a host `CopyBufferRegion` in the list,
+/// where the title recorded it: the source's host copy is brought up to
+/// date as for any command that reads it, the destination's is declared
+/// written by the card, and its bytes reach title memory with the rest of
+/// what the list's shaders wrote, before the title is told the list ran.
+#[cfg(windows)]
+fn card_copy() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_COPY").is_none_or(|v| v != "0"))
+}
+
+/// Title buffer copies done on the card ([`card_copy`]), since the start.
+#[cfg(windows)]
+pub(crate) static CARD_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`card_copy`]: records the copy of `len` bytes of title memory from
+/// `from` to `to` as a copy between host copies, if the source's is one
+/// shaders write (in the card's memory, or with writes not copied back
+/// yet); false if the copy is left to the CPU.
+#[cfg(windows)]
+fn copy_on_the_card(list: &crate::host::HostList, to: u64, from: u64, len: u64) -> bool {
+    use windows::core::Interface;
+    if len == 0 || !card_copy() {
+        return false;
+    }
+    let Some(source) = crate::shadow::existing(from, len) else {
+        return false;
+    };
+    if !(source.carded() || source.writes_pending()) {
+        return false;
+    }
+    let Some(target) = crate::shadow::find(to, len) else {
+        return false;
+    };
+    // One buffer cannot be both ends of a host copy.
+    if target.buffer.as_raw() == source.buffer.as_raw() {
+        return false;
+    }
+    // What the title wrote of either range goes up first; the snapshot of
+    // the destination is then title memory's bytes.
+    source.refresh(list, from, len);
+    target.refresh(list, to, len);
+    list.begin_command();
+    list.buffer_state(&source.buffer, crate::host::BUFFER_READ);
+    list.buffer_state(&target.buffer, COPY_DEST);
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| format!("title buffer copy on the card, {len} bytes from {from:#x} to {to:#x}"));
+    // SAFETY: an open list; live buffers the list holds (their states are
+    // noted in it), and the ranges lie in them.
+    unsafe {
+        list.list.CopyBufferRegion(&target.buffer, target.offset(to), &source.buffer, source.offset(from), len);
+    }
+    list.begin_command();
+    target.gpu_writes(list, to, len);
+    let n = CARD_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::info!(
+            n,
+            len,
+            from = format_args!("{from:#x}"),
+            to = format_args!("{to:#x}"),
+            "a title buffer copy whose source shaders write is done on the card (VICTORY_CARD_COPY=0: on the CPU)"
+        );
+    }
+    true
+}
+
 /// Buffer to buffer: both are host memory, copied at submission.
 extern "system" fn copy_buffer_region(
     this: This,
@@ -866,6 +946,7 @@ extern "system" fn copy_buffer_region(
     if let Some(list) = host_list(this)
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
+        && !copy_on_the_card(list, to as u64, from as u64, len)
     {
         list.defer_copy(to, from, len as usize);
     }

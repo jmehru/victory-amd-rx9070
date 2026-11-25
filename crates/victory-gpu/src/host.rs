@@ -2353,6 +2353,30 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
     blocked_by(&written, runs, true)
 }
 
+/// Local diagnostics (`VICTORY_SETTLE_WHY=1`): which of the title's buffer
+/// copies waits for flights, the first eight times and every 512th.
+fn copy_blocked_said(written: &[(usize, usize)], dst: usize, src: usize, len: usize) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_SETTLE_WHY").is_some()) {
+        return;
+    }
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n >= 8 && n % 512 != 0 {
+        return;
+    }
+    let side = |at: usize| {
+        let over = written.iter().find(|r| r.0 < at + len && r.1 > at).copied();
+        let copy = crate::shadow::find_any(at as u64, len as u64);
+        format!(
+            "{at:#x} (flights write {:x?}; host copy {:?})",
+            over,
+            copy.map(|c| (c.span(), c.carded(), c.writes_pending()))
+        )
+    };
+    tracing::info!("a title buffer copy of {len} bytes waits for flights: to {} from {}", side(dst), side(src));
+}
+
 /// [`late_blocked`] against `written`, the title memory flights' shaders
 /// may write (in order, joined); `count` whether the kind of read is
 /// counted for the frame line.
@@ -2367,6 +2391,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     if touches(written, src, src + len) || touches(written, dst, dst + len) {
                         if count {
                             LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
+                            copy_blocked_said(written, dst, src, len);
                         }
                         return Some(WHY_READ);
                     }
@@ -2375,6 +2400,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     if touches(written, src, src + len) {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
+                            copy_blocked_said(written, 0, src, len);
                         }
                         return Some(WHY_READ);
                     }

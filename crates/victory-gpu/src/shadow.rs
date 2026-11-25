@@ -3166,6 +3166,18 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// (and copied) anew. Run 71, on a 256 KiB grid: 350 MB copied per frame
 /// against 120 MB, 7,087 write-watch askings against 2,600, and 5,263
 /// windows (4.5 GB) let go in two minutes against 393 in a whole run.
+/// The host copy of the title buffer that holds `[address, address + len)`,
+/// if it has one already: none is made.
+pub(crate) fn existing(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    let end = address.checked_add(len.max(1))?;
+    let map = buffers();
+    map.range(..=(address, usize::MAX))
+        .rev()
+        .take(64)
+        .find(|(_, e)| e.end >= end)
+        .and_then(|(_, e)| e.shadow.clone())
+}
+
 pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
     // With whole windows (the default) there is one window to a cell and
     // nothing to choose: exactly `find`.
