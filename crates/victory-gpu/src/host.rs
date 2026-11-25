@@ -2788,8 +2788,8 @@ struct RelayFetch {
 }
 
 /// Whether the thread that lands flights fetches card copies' pieces on a
-/// queue of its own (`VICTORY_RELAY_QUEUE=1`; off by default), and not on
-/// the host's.
+/// queue of its own (on by default; `VICTORY_RELAY_QUEUE=0`: on the host's,
+/// as before).
 ///
 /// A fetch is a few copies out of the card's memory, sent when the card has
 /// run the flights being landed. On the host's queue it runs behind every
@@ -2808,7 +2808,10 @@ struct RelayFetch {
 /// made before the fetch as there.
 fn relay_queue() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_RELAY_QUEUE").is_some_and(|v| v == "1"))
+    // On by default since runs N1-N4 against Q1-Q4 (63.0-73.6 ms a frame
+    // against 58.5-63.8, the picture unchanged, no message of the debug
+    // layer in run dbg3).
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RELAY_QUEUE").is_none_or(|v| v != "0"))
 }
 
 /// The thread that lands flights ([`relay`]): as soon as the card has run
@@ -3891,7 +3894,7 @@ impl Host {
                         ..Default::default()
                     })
                     .ok()?;
-                tracing::info!("what shaders wrote to copies in the card's memory is fetched on a queue of its own (VICTORY_RELAY_QUEUE=1)");
+                tracing::info!("what shaders wrote to copies in the card's memory is fetched on a queue of its own (VICTORY_RELAY_QUEUE=0: on the host's)");
                 Some(queue)
             } else {
                 None
