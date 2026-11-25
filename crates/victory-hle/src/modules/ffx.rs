@@ -1,5 +1,15 @@
 //! `amd_fidelityfx_loader_xbox.dll`: the upscale dispatch.
 //!
+//! Two ways, chosen at start:
+//!
+//! - By default the loader and the upscaler are the title's own DLLs and
+//!   run as they are, and `ffxDispatch` alone is taken here (below).
+//! - With `VICTORY_FFX_DIR` (or `VICTORY_FFX_SIMPLE=1`) set, both DLLs are
+//!   an HLE module ([`module`]) whose five FidelityFX calls are served by
+//!   AMD's PC upscaler on the host GPU (`victory_gpu::ffx`, from
+//!   PastiiJay/klbf-lab-beta); the title's DLLs are not loaded and nothing
+//!   below is used.
+//!
 //! The title's Series S mode renders below its output size and calls the
 //! console's FidelityFX upscaler to make the output. The loader and the
 //! upscaler are the title's own DLLs and run as they are, but the
@@ -168,4 +178,40 @@ mod tests {
 /// for the dispatches passed on.
 pub fn dispatch_address() -> usize {
     dispatch as *const () as usize
+}
+
+/// Whether the title's FidelityFX calls go to the PC upscaler on the host
+/// GPU ([`module`]) instead of the title's DLLs and the stretch here.
+#[cfg(windows)]
+pub fn host_upscaler() -> bool {
+    victory_gpu::ffx::enabled()
+}
+
+/// Both console FidelityFX DLLs, which export the same five calls, served
+/// by `victory_gpu::ffx`. Registered only if [`host_upscaler`].
+#[cfg(windows)]
+pub(crate) fn module() -> crate::HleModule {
+    use crate::{HleExport, HleModule};
+    use victory_gpu::ffx;
+    let export = |name, address: usize| HleExport { name, address };
+    HleModule {
+        name: "ffx",
+        dlls: &[
+            "amd_fidelityfx_loader_xbox.dll",
+            "amd_fidelityfx_upscaler_xbox.dll",
+        ],
+        exports: vec![
+            export(
+                "ffxCreateContext",
+                ffx::ffxCreateContext as *const () as usize,
+            ),
+            export(
+                "ffxDestroyContext",
+                ffx::ffxDestroyContext as *const () as usize,
+            ),
+            export("ffxConfigure", ffx::ffxConfigure as *const () as usize),
+            export("ffxQuery", ffx::ffxQuery as *const () as usize),
+            export("ffxDispatch", ffx::ffxDispatch as *const () as usize),
+        ],
+    }
 }
