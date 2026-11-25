@@ -96,10 +96,16 @@ struct Window {
     base: u64,
     records: u32,
     scratch: ID3D12Resource,
+    /// Local: where the window's first record is in the scratch buffer.
+    at0: u64,
 }
 
 /// The most records clamped in one pass ([`windows`]).
-const WINDOW_MOST: u64 = 64;
+/// Local: 256 (was 64), and up to [`WINDOWS`] windows stand beside each
+/// other in the scratch buffer: of 4,096 indirect records 1,360 were
+/// clamped alone for lying outside the one window open, on its buffer.
+const WINDOW_MOST: u64 = 256;
+const WINDOWS: usize = 8;
 
 /// Whether indirect draws that read record after record of one argument
 /// buffer are clamped a window at a time (`VICTORY_INDIRECT_WINDOW=1`; off
@@ -179,7 +185,9 @@ pub(crate) struct State {
     bounds: Option<(f32, f32)>,
     /// The indirect records clamped last, if later draws may still read
     /// them ([`windows`]).
-    window: Option<Window>,
+    window: Vec<Window>,
+    /// Local: the first scratch byte no window of the list has taken.
+    window_top: u64,
     /// What the host list has: pipeline, root signature, heaps.
     host_pipeline: usize,
     /// Graphics, compute.
@@ -1743,7 +1751,7 @@ impl State {
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         // It may write the arguments a window holds clamped.
-        self.window = None;
+        self.window.clear();
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -1892,7 +1900,7 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
-        self.window = None;
+        self.window.clear();
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = mesh_test() != 1
@@ -2215,7 +2223,7 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
-        self.window = None;
+        self.window.clear();
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let ready = self.prepare(list, false);
@@ -2320,7 +2328,7 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
-        self.window = None;
+        self.window.clear();
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         // Indexed rectangles are drawn by the rectangle geometry stage
@@ -2461,15 +2469,54 @@ impl State {
         // Another host list (a new one after a cut, or this one after its
         // reset) has another scratch buffer, or this one's with old bytes.
         if !windowed || list.first_use(WINDOW_USE) {
-            self.window = None;
+            self.window.clear();
+            self.window_top = 0;
         }
         let same = |w: &Window| w.copy == args.id() && w.kind == kind && w.stride == stride;
         let hit = self
             .window
-            .as_ref()
+            .iter()
+            .rev()
             .filter(|w| same(w) && offset >= w.base)
-            .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
-            .map(|w| (w.scratch.clone(), offset - w.base));
+            .find(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
+            .map(|w| (w.scratch.clone(), w.at0 + (offset - w.base)));
+        // Local diagnostics (`VICTORY_WINDOW_WHY=1`): why indirect records
+        // are clamped one at a time, counted and said every 4096 records.
+        {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_WHY").is_some()) {
+                static N: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+                let stores = p.stages.iter().any(|stage| stage.translated().stores);
+                let why = if hit.is_some() {
+                    0
+                } else if kind == DISPATCH {
+                    1
+                } else if max != 1 {
+                    2
+                } else if count.is_some() {
+                    3
+                } else if stores {
+                    4
+                } else if self.window.is_empty() {
+                    5
+                } else if !self.window.iter().any(|w| w.copy == args.id()) {
+                    6
+                } else if !self.window.iter().any(|w| w.copy == args.id() && w.kind == kind && w.stride == stride) {
+                    7
+                } else {
+                    8
+                };
+                N[why].fetch_add(1, Ordering::Relaxed);
+                let all: u64 = N.iter().map(|n| n.load(Ordering::Relaxed)).sum();
+                if all % 4096 == 0 {
+                    let v: Vec<u64> = N.iter().map(|n| n.swap(0, Ordering::Relaxed)).collect();
+                    tracing::info!(
+                        "indirect records of 4096: {} read from a window; clamped alone: {} compute dispatches, {} with more than one record, {} with a count buffer, {} by shaders that store, {} with no window open, {} from another buffer than the window's, {} of another kind or stride, {} outside the window or off its step",
+                        v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8]
+                    );
+                }
+            }
+        }
         let (bounded, at) = match hit {
             Some(hit) => hit,
             None => {
@@ -2477,22 +2524,44 @@ impl State {
                 // (the same step as that window's, if it had one): the
                 // title walks the buffer, so the ones that step apart
                 // after it are clamped with it.
-                let (step, records) = match &self.window {
-                    Some(w) if windowed && same(w) => {
+                let (step, records) = match self.window.iter().rev().find(|w| same(w)) {
+                    Some(w) if windowed => {
                         let last = w.base + u64::from(w.records - 1) * u64::from(w.step);
                         let step = offset.saturating_sub(last);
                         let walks = step >= u64::from(stride)
                             && step <= 256
                             && step % 4 == 0
                             && (w.records == 1 || step == u64::from(w.step));
+                        // Local: a record that many steps of a window's
+                        // away from it, either side: the title jumps about
+                        // one array of records, and the ones after this
+                        // one are clamped with it at the same step.
+                        let grid = w.records > 1 && offset.abs_diff(w.base) % u64::from(w.step) == 0;
                         if walks {
                             let fit = (args.left(arguments) / step).min(WINDOW_MOST) as u32;
                             (step as u32, (if w.records == 1 { 16 } else { w.records * 2 }).min(fit).max(1))
+                        } else if grid {
+                            let fit = (args.left(arguments) / u64::from(w.step)).min(WINDOW_MOST) as u32;
+                            (w.step, fit.max(1))
                         } else {
                             (stride, max)
                         }
                     }
                     _ => (stride, max),
+                };
+                // Local: a windowed record's clamp has scratch bytes of its
+                // own, so the windows before it keep theirs.
+                let room = (u64::from(step) * u64::from(records)).next_multiple_of(16);
+                let at0 = if windowed {
+                    if self.window_top + room > crate::indirect::WINDOW_ROOM || self.window.len() >= WINDOWS {
+                        self.window.clear();
+                        self.window_top = 0;
+                    }
+                    let at0 = self.window_top;
+                    self.window_top += room;
+                    at0
+                } else {
+                    0
                 };
                 args.refresh(list, arguments, len.max(u64::from(step) * u64::from(records)));
                 if let Some((s, at)) = &counter {
@@ -2506,28 +2575,31 @@ impl State {
                 // whose unfilled slots must not spend the list's budget.
                 let bounded = if parts.is_some() {
                     crate::indirect::bound_split(list, (&args.buffer, offset))
-                } else if windowed && records > 1 {
-                    crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
+                } else if windowed {
+                    crate::indirect::bound_window(list, (&args.buffer, offset), (kind, step, records), at0, records > 1)
                 } else {
                     crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
                 };
                 let Some(bounded) = bounded else {
-                    self.window = None;
+                    self.window.clear();
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
                     return false;
                 };
                 self.host_pipeline = 0;
                 self.host_roots[1] = 0;
-                self.window = windowed.then(|| Window {
-                    copy: args.id(),
-                    kind,
-                    stride,
-                    step,
-                    base: offset,
-                    records,
-                    scratch: bounded.clone(),
-                });
-                (bounded, 0)
+                if windowed {
+                    self.window.push(Window {
+                        copy: args.id(),
+                        kind,
+                        stride,
+                        step,
+                        base: offset,
+                        records,
+                        scratch: bounded.clone(),
+                        at0,
+                    });
+                }
+                (bounded, at0)
             }
         };
         let ran = match kind {

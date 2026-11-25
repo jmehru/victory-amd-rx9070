@@ -352,7 +352,48 @@ pub(crate) fn place(device: &ID3D12Device, heap: &ID3D12Heap, offset: u64, size:
     let flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     // SAFETY: plain creation in a live heap.
     unsafe { device.CreatePlacedResource(heap, offset, &buffer_desc(size, flags), D3D12_RESOURCE_STATE_COMMON, None, &mut placed)? };
+    if let Some(buffer) = &placed {
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        note(gpu, size, 0);
+    }
     placed.ok_or_else(windows::core::Error::empty)
+}
+
+/// Local diagnostics: every buffer placed over title memory, as (host GPU
+/// address, bytes, made at ms, let go at ms or 0), for device-removed
+/// reports ([`placed_at`]).
+static PLACED: Mutex<Vec<(u64, u64, u64, u64)>> = Mutex::new(Vec::new());
+
+fn note(gpu: u64, size: u64, gone: u64) {
+    let mut log = PLACED.lock().unwrap_or_else(|e| e.into_inner());
+    let now = crate::host::now_ms();
+    if gone == 0 {
+        log.push((gpu, size, now, 0));
+    } else if let Some(entry) = log.iter_mut().rev().find(|e| e.0 <= gpu && gpu < e.0 + e.1 && e.3 == 0) {
+        entry.3 = now;
+    }
+}
+
+/// The in-place buffer at host GPU address `gpu` was let go.
+pub(crate) fn note_gone(gpu: u64) {
+    note(gpu, 0, 1);
+}
+
+/// For device-removed reports: the in-place buffers whose host range holds `va`.
+pub(crate) fn placed_at(va: u64) -> String {
+    let log = PLACED.lock().unwrap_or_else(|e| e.into_inner());
+    let now = crate::host::now_ms();
+    let hits: Vec<String> = log
+        .iter()
+        .filter(|e| e.0 <= va && va < e.0 + e.1)
+        .map(|e| {
+            let gone = if e.3 == 0 { "not let go".to_owned() } else { format!("let go {} ms ago", now.saturating_sub(e.3)) };
+            format!("{:#x}+{:#x} offset {:#x}, placed {} ms ago, {gone}", e.0, e.1, va - e.0, now.saturating_sub(e.2))
+        })
+        .collect();
+    let ranges = log.iter().map(|e| e.0).min().zip(log.iter().map(|e| e.0 + e.1).max());
+    format!("; in-place buffers holding it: {hits:?} ({} placed since the start, host range {ranges:x?})", log.len())
 }
 
 // The title's views of its physical pages, as the runtime maps them: the

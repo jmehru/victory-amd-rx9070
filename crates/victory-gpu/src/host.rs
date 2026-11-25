@@ -150,6 +150,23 @@ fn sweep() {
     crate::resource::let_go_idle();
 }
 
+/// Local (`VICTORY_SPIN_US`, default 0: off): before sleeping on a fence's
+/// event, looks at the fence for that many microseconds. A frame makes
+/// about 32 submissions that are each waited for; where the card is done
+/// in a millisecond or two, the thread's wake-up is a good part of the wait.
+fn spin_for(fence: &ID3D12Fence, value: u64) {
+    static US: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let us = *US.get_or_init(|| std::env::var("VICTORY_SPIN_US").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
+    if us == 0 {
+        return;
+    }
+    let until = std::time::Instant::now() + std::time::Duration::from_micros(us);
+    // SAFETY: a plain query of our fence.
+    while unsafe { fence.GetCompletedValue() } < value && std::time::Instant::now() < until {
+        std::hint::spin_loop();
+    }
+}
+
 /// Drops `object` once every submission running now has finished: at once
 /// if none is.
 pub(crate) fn retire<T: 'static>(object: T) {
@@ -3550,6 +3567,7 @@ impl Host {
                     self.queue.Signal(&self.fence, *submitted)?;
                     self.fence.SetEventOnCompletion(*submitted, self.event)?;
                     let was_working = working(false);
+                    spin_for(&self.fence, *submitted);
                     WaitForSingleObject(self.event, INFINITE);
                     stood(waiting);
                     working(was_working);
@@ -4047,6 +4065,7 @@ impl Host {
                 match waited {
                     Ok(()) => {
                         working(false);
+                        spin_for(&self.fence, *submitted);
                         WaitForSingleObject(self.event, INFINITE);
                         stood(started);
                         working(true);

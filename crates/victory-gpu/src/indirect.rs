@@ -339,6 +339,39 @@ fn record_clamp_as(
     l: &ID3D12GraphicsCommandList,
     dst: &ID3D12Resource,
     budget: u64,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+    how: u32,
+) -> bool {
+    record_clamp_at(c, l, (dst, 0), budget, src, count, spec, how)
+}
+
+/// The scratch bytes kept for windows of records ([`bound_window`]).
+pub(crate) const WINDOW_ROOM: u64 = 1 << 20;
+
+/// Local: [`bound_ahead`] (or [`bound`] for one record, `ahead` false) into
+/// the scratch buffer from byte `at` on, so that several windows of a list
+/// stand beside each other (`crate::draw`'s windows).
+pub(crate) fn bound_window(
+    list: &HostList,
+    src: (&ID3D12Resource, u64),
+    spec: (u32, u32, u32),
+    at: u64,
+    ahead: bool,
+) -> Option<ID3D12Resource> {
+    let bytes = validate_layout(spec, src.1, None)?;
+    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch((at + bytes).max(WINDOW_ROOM))?);
+    record_clamp_at(c, &list.list, (&dst, at), budget, src, None, spec, if ahead { AHEAD } else { 0 }).then_some(dst)
+}
+
+/// [`record_clamp_as`] with the records written from byte `dst_at` of `dst` on.
+#[allow(clippy::too_many_arguments)]
+fn record_clamp_at(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    (dst, dst_at): (&ID3D12Resource, u64),
+    budget: u64,
     (src, src_offset): (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
@@ -352,7 +385,7 @@ fn record_clamp_as(
         return false;
     };
     // SAFETY: live D3D12 buffer resources.
-    let (src_base, dst_gpu) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress()) };
+    let (src_base, dst_gpu) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress() + dst_at) };
     if !src_base.is_multiple_of(4) || !dst_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
         return false;
     }
