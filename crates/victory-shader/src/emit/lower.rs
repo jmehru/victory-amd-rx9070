@@ -1059,6 +1059,13 @@ pub fn set_host_pixel_wave(lanes: u32) {
     HOST_PIXEL_WAVE.store(lanes, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether a pixel shader's quad-local lane reads go through quad reads
+/// (`Lower::helpers_read`): `VICTORY_QUAD_HELPERS=1`.
+fn quad_helpers() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_QUAD_HELPERS").is_some_and(|v| v == "1"))
+}
+
 fn host_pixel_wave() -> u32 {
     HOST_PIXEL_WAVE.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -4588,8 +4595,13 @@ impl<'a> Lower<'a> {
     /// by hand (`quad_perm`) was the whole value there, the texture read
     /// that used it took its smallest level, and the triangles' edges showed
     /// as lines on car paint, glass and skin. (Belobug 03629f3.)
+    ///
+    /// Off by default (`VICTORY_QUAD_HELPERS=1` turns it on): with it the
+    /// lit wall right of the cell's window went black, and back with the
+    /// wave reads (runs art4h/art6q of 2026-11-25; taking a helper's read
+    /// as the lane's own value did not bring it back, art9w).
     fn helpers_read(&self, quad: bool) -> bool {
-        quad && self.s.pixel
+        quad && self.s.pixel && quad_helpers()
     }
 
     /// `v_readfirstlane_b32`'s result `first` of `own` in a pixel shader:
