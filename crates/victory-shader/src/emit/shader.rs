@@ -160,6 +160,16 @@ pub(crate) struct Shader {
     pub root_srvs: Vec<(u8, V)>,
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
+    /// Root UAV slots whose emitted operations may modify buffer contents
+    /// (see [`Shader::op`]); [`Shader::written`] gives the final answer.
+    pub written_root_uavs: Vec<u8>,
+    /// A translated store or atomic can write title memory through the page
+    /// directory ([`SLOT_MEMORY`]): an operation other than a load was
+    /// emitted on a handle made for a page's copy.
+    pub writes_guest_memory: bool,
+    /// The handles made for copies of title memory by address
+    /// ([`Shader::memory_handle`]).
+    memory_handles: std::collections::HashSet<V>,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
@@ -176,6 +186,11 @@ pub(crate) struct Shader {
     main: V,
     pub entry: usize,
 }
+
+/// `dx.op` opcodes that only read through their handle (the first operand).
+const OP_BUFFER_LOAD: u32 = 68;
+const OP_GET_DIMENSIONS: u32 = 72;
+const OP_RAW_BUFFER_LOAD: u32 = 139;
 
 impl Shader {
     pub fn new(pixel: bool) -> Self {
@@ -220,6 +235,9 @@ impl Shader {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            written_root_uavs: Vec::new(),
+            writes_guest_memory: false,
+            memory_handles: std::collections::HashSet::new(),
             flags: 0,
             nonuniform_handles: 0,
             #[cfg(test)]
@@ -255,6 +273,26 @@ impl Shader {
         opcode: u32,
         args: &[V],
     ) -> V {
+        // Raw root UAVs are also legal inputs, and so are the copies of
+        // title memory by address. Only a load or a size query with the
+        // handle as its resource is known to leave the contents unchanged;
+        // any other use of the handle, in any operand, counts as a write
+        // (stores, atomics, and operations added later).
+        // (After DexNom/VIctory bc3cd4b.)
+        let reads = matches!(opcode, OP_BUFFER_LOAD | OP_GET_DIMENSIONS | OP_RAW_BUFFER_LOAD);
+        for (n, a) in args.iter().enumerate() {
+            if reads && n == 0 {
+                continue;
+            }
+            if let Some(&(slot, _)) = self.root_uavs.iter().find(|(_, h)| h == a)
+                && !self.written_root_uavs.contains(&slot)
+            {
+                self.written_root_uavs.push(slot);
+            }
+            if self.memory_handles.contains(a) {
+                self.writes_guest_memory = true;
+            }
+        }
         let mut params = vec![self.t.i32];
         params.extend(args.iter().map(|&a| self.m.type_of(a)));
         let fty = self.m.func_ty(ret, params);
@@ -361,6 +399,40 @@ impl Shader {
         self.flags |= flags::RAW_BUFFERS;
         self.root_uavs.push((slot, h));
         h
+    }
+
+    /// Notes `h` as a handle of a copy of title memory by address: an
+    /// operation on it other than a load sets `writes_guest_memory`.
+    pub fn memory_handle(&mut self, h: V) {
+        self.memory_handles.insert(h);
+    }
+
+    /// The root UAV slots the module may write through, and whether it may
+    /// write title memory by address: what [`Shader::op`] noted while the
+    /// operations were emitted, and whatever else in the module uses one of
+    /// those handles in any way but as the resource of a load or a size
+    /// query (a phi, a select, a call made past `op`): such a use is not
+    /// understood, so it counts as a write.
+    pub fn written(&self) -> (Vec<u8>, bool) {
+        let mut slots = self.written_root_uavs.clone();
+        let mut memory = self.writes_guest_memory;
+        self.m.for_each_use(|opcode, position, v| {
+            let read = position == Some(0)
+                && matches!(
+                    opcode.and_then(|o| u32::try_from(o).ok()),
+                    Some(OP_BUFFER_LOAD | OP_GET_DIMENSIONS | OP_RAW_BUFFER_LOAD)
+                );
+            if read {
+                return;
+            }
+            if let Some(&(slot, _)) = self.root_uavs.iter().find(|(_, h)| *h == v)
+                && !slots.contains(&slot)
+            {
+                slots.push(slot);
+            }
+            memory |= self.memory_handles.contains(&v);
+        });
+        (slots, memory)
     }
 
     /// The handle of immediate sampler `n` (a comparison sampler when its
@@ -918,5 +990,131 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
+    }
+}
+
+#[cfg(test)]
+mod written_tests {
+    use super::*;
+
+    const LOAD: (&str, u32) = ("rawBufferLoad.f32", 139);
+
+    fn load(s: &mut Shader, handle: V) -> V {
+        let (zero, mask, align) = (s.m.i32(0), s.m.i8(1), s.m.i32(4));
+        let undef = s.m.undef(s.t.i32);
+        s.op(s.entry, LOAD.0, Attr::ReadOnly, s.t.res_ret, LOAD.1, &[handle, zero, undef, mask, align])
+    }
+
+    fn store(s: &mut Shader, handle: V) {
+        let (zero, one, mask, align) = (s.m.i32(0), s.m.i32(1), s.m.i8(1), s.m.i32(4));
+        let undef = s.m.undef(s.t.i32);
+        s.op(
+            s.entry,
+            "rawBufferStore.i32",
+            Attr::NoUnwind,
+            s.t.void,
+            140,
+            &[handle, zero, undef, one, undef, undef, undef, mask, align],
+        );
+    }
+
+    /// After DexNom/VIctory bc3cd4b.
+    #[test]
+    fn only_the_written_root_uavs_need_a_guest_writeback() {
+        let mut s = Shader::new(false);
+        let input = s.root_uav_handle(1);
+        let output = s.root_uav_handle(2);
+        let counter = s.root_uav_handle(3);
+        let exchanged = s.root_uav_handle(4);
+        let sized = s.root_uav_handle(5);
+        let (zero, one) = (s.m.i32(0), s.m.i32(1));
+        let undef = s.m.undef(s.t.i32);
+        for handle in [input, output] {
+            load(&mut s, handle);
+        }
+        store(&mut s, output);
+        s.op(
+            s.entry,
+            "atomicBinOp.i32",
+            Attr::NoUnwind,
+            s.t.i32,
+            78,
+            &[counter, zero, zero, undef, undef, one],
+        );
+        s.op(
+            s.entry,
+            "atomicCompareExchange.i32",
+            Attr::NoUnwind,
+            s.t.i32,
+            79,
+            &[exchanged, zero, undef, undef, zero, one],
+        );
+        let dims = s.m.named_struct("dx.types.Dimensions", vec![s.t.i32, s.t.i32, s.t.i32, s.t.i32]);
+        s.op(s.entry, "getDimensions", Attr::ReadOnly, dims, 72, &[sized, undef]);
+        assert_eq!(s.written_root_uavs, [2, 3, 4]);
+        assert_eq!(s.written(), (vec![2, 3, 4], false));
+        // The same handle is given back for a slot: a store through it
+        // later marks the slot, whatever read it first.
+        let again = s.root_uav_handle(1);
+        assert_eq!(again, input);
+        store(&mut s, again);
+        assert_eq!(s.written().0, [2, 3, 4, 1]);
+    }
+
+    #[test]
+    fn a_use_that_is_not_understood_counts_as_a_write() {
+        // An operation not known to read only.
+        let mut s = Shader::new(false);
+        let h = s.root_uav_handle(7);
+        let undef = s.m.undef(s.t.i32);
+        s.op(s.entry, "bufferUpdateCounter", Attr::NoUnwind, s.t.i32, 70, &[h, undef]);
+        assert_eq!(s.written().0, [7]);
+
+        // A reading operation with the handle anywhere but as its resource.
+        let mut s = Shader::new(false);
+        let (a, b) = (s.root_uav_handle(1), s.root_uav_handle(2));
+        let (zero, align) = (s.m.i32(0), s.m.i32(4));
+        s.op(s.entry, LOAD.0, Attr::ReadOnly, s.t.res_ret, LOAD.1, &[a, zero, zero, b, align]);
+        assert_eq!(s.written().0, [2]);
+
+        // A handle that goes through a select or a phi, past `op`: what is
+        // done with the result is not followed, so both slots are written.
+        let mut s = Shader::new(false);
+        let (a, b, c) = (s.root_uav_handle(1), s.root_uav_handle(2), s.root_uav_handle(3));
+        let pick = s.m.bool(true);
+        let either = s.m.select(s.entry, pick, a, b);
+        load(&mut s, either);
+        load(&mut s, c);
+        assert!(s.written_root_uavs.is_empty());
+        assert_eq!(s.written().0, [1, 2]);
+        let phi = s.m.phi(s.entry, s.t.handle);
+        s.m.set_phi(phi, vec![(c, s.entry)]);
+        assert_eq!(s.written().0, [1, 2, 3]);
+    }
+
+    #[test]
+    fn title_memory_by_address_is_written_only_by_other_than_loads() {
+        let mut s = Shader::new(false);
+        let index = s.m.i32(5);
+        let page = s.heap_handle(s.entry, index, false, true, (11 | 0x1000, 0));
+        s.memory_handle(page);
+        // Another view of the heap, stored to: not title memory by address.
+        let index = s.m.i32(6);
+        let other = s.heap_handle(s.entry, index, false, true, (11 | 0x1000, 0));
+        load(&mut s, page);
+        store(&mut s, other);
+        assert_eq!(s.written(), (vec![], false));
+        store(&mut s, page);
+        assert!(s.writes_guest_memory);
+        assert_eq!(s.written(), (vec![], true));
+
+        let mut s = Shader::new(false);
+        let index = s.m.i32(5);
+        let page = s.heap_handle(s.entry, index, false, true, (11 | 0x1000, 0));
+        s.memory_handle(page);
+        let (zero, one) = (s.m.i32(0), s.m.i32(1));
+        let undef = s.m.undef(s.t.i32);
+        s.op(s.entry, "atomicBinOp.i32", Attr::NoUnwind, s.t.i32, 78, &[page, zero, zero, undef, undef, one]);
+        assert!(s.written().1);
     }
 }

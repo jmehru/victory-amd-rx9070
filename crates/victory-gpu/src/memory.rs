@@ -346,9 +346,12 @@ pub(crate) fn ready(
     // shortcut: a copy another list numbers meanwhile is brought up to date
     // by that list's submission, which may run after this one's.
     const READ: usize = usize::MAX - 0x6d;
-    const WRITE: usize = usize::MAX - 0x6e;
+    // Shader writes are declared once per list for each copy, by its
+    // number: a program that only reads title memory by address does not
+    // declare them (`writes`), and may number a copy between two programs
+    // of the list that write, which the second must still declare.
+    const WRITTEN: usize = 1 << 62;
     let first_read = list.first_use(READ);
-    let first_write = writes && list.first_use(WRITE);
     for (n, shadow) in m.copies.iter().enumerate() {
         let Some(shadow) = shadow else { continue };
         let fresh = numbered.get(n) != Some(&shadow.id());
@@ -356,7 +359,7 @@ pub(crate) fn ready(
         if first_read || fresh {
             shadow.refresh(list, start, len);
         }
-        if writes && (first_write || fresh) {
+        if writes && list.first_use(WRITTEN | shadow.id() as usize) {
             shadow.gpu_writes(list, start, len);
         }
     }

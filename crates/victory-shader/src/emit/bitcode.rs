@@ -448,6 +448,22 @@ impl Module {
         };
         self.push(block, ret, Op::Call(i, args))
     }
+    /// Calls `f` for every operand of every instruction made so far (kept
+    /// or not): the constant opcode and the operand's position after it if
+    /// the instruction is a `dx.op` call, and the operand.
+    pub fn for_each_use(&self, mut f: impl FnMut(Option<i64>, Option<usize>, V)) {
+        for inst in &self.insts {
+            match &inst.op {
+                Op::Call(i, args) if self.funcs[*i as usize].name.starts_with("dx.op.") => {
+                    let opcode = args.first().and_then(|&o| self.int_value(o));
+                    for (n, &a) in args.iter().enumerate().skip(1) {
+                        f(opcode, Some(n - 1), a);
+                    }
+                }
+                op => for_each_operand(op, |v| f(None, None, v)),
+            }
+        }
+    }
     /// A phi at the top of `block`; incoming values come with [`Module::set_phi`].
     pub fn phi(&mut self, block: usize, ty: Ty) -> V {
         let i = self.insts.len() as u32;

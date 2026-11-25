@@ -237,6 +237,13 @@ pub struct HostShader {
     /// Root UAVs (raw buffers) the shader reads or writes: `u<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_uavs: Vec<u8>,
+    /// The root UAVs among them the shader may write through: every slot
+    /// with an operation other than a load or a size query on its handle.
+    /// The others it only reads.
+    pub written_root_uavs: Vec<u8>,
+    /// A translated store or atomic can write title memory through the page
+    /// directory ([`SLOT_MEMORY`]); otherwise the shader only reads it.
+    pub writes_guest_memory: bool,
     /// Heap descriptors that can be selected from root state at bind time.
     pub root_indexed_views: Vec<crate::resource::RootIndexedView>,
 }
@@ -657,6 +664,8 @@ fn emit_program(
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
+        written_root_uavs: l.written_root_uavs,
+        writes_guest_memory: l.writes_guest_memory,
         root_indexed_views: res.root_indexed_views.clone(),
     };
     Ok((shader, wave_size))
@@ -1032,6 +1041,8 @@ mod tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            written_root_uavs: Vec::new(),
+            writes_guest_memory: false,
             root_indexed_views: Vec::new(),
         };
         let file = |var: &str, stage| {
@@ -1044,6 +1055,8 @@ mod tests {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
+                written_root_uavs: Vec::new(),
+                writes_guest_memory: false,
                 root_indexed_views: Vec::new(),
             })
         };
@@ -1532,6 +1545,8 @@ mod tests {
                 root_cbvs: l.root_cbvs,
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
+                written_root_uavs: l.written_root_uavs,
+                writes_guest_memory: l.writes_guest_memory,
                 root_indexed_views: Vec::new(),
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
@@ -2061,6 +2076,8 @@ fn raw_buffer_get_dimensions_compiles_on_host() {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        written_root_uavs: lowered.written_root_uavs,
+        writes_guest_memory: lowered.writes_guest_memory,
         root_indexed_views: Vec::new(),
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {

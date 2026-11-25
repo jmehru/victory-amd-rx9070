@@ -55,6 +55,10 @@ pub(crate) struct Lowered {
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
     pub root_uavs: Vec<u8>,
+    /// The root UAVs among them the shader may write through.
+    pub written_root_uavs: Vec<u8>,
+    /// A translated store or atomic can write through the guest page directory.
+    pub writes_guest_memory: bool,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// The wave size the shader requires of the host, if any.
@@ -2414,12 +2418,15 @@ impl<'a> Lower<'a> {
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
+        let (written_root_uavs, writes_guest_memory) = self.s.written();
         Ok(Lowered {
             wave_size,
             cmp_samplers,
             root_cbvs,
             root_srvs,
             root_uavs,
+            written_root_uavs,
+            writes_guest_memory,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
@@ -3033,6 +3040,8 @@ impl<'a> Lower<'a> {
         let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
         let slot = self.s.m.bin(c, Bin::Add, base, copy);
         let h = self.s.heap_handle(c, slot, false, true, (11 | 0x1000, 0));
+        // Whatever is done through it but loading writes title memory.
+        self.s.memory_handle(h);
         let k64k = k(self, 0xFFFF);
         let within = self.s.m.bin(c, Bin::And, lo, k64k);
         let byte = self.s.m.bin(c, Bin::Add, start, within);
@@ -11903,6 +11912,26 @@ mod tests {
             user_data,
             slot,
         }
+    }
+
+    #[test]
+    fn title_memory_by_address_is_marked_written_only_by_stores_and_atomics() {
+        use crate::emit::shader::{SLOT_FAULTS, SLOT_MEMORY};
+        // The address is v[0:1]; each program ends in `s_endpgm`.
+        let load = [0xDC30_8000, 0x027D_0000]; // global_load_dword v2, v[0:1]
+        let store = [0xDC70_8000, 0x007D_0200]; // global_store_dword v[0:1], v2
+        let atomic = [0xDCC8_8000, 0x007D_0200]; // global_atomic_add v[0:1], v2
+        for (words, writes) in [(load, false), (store, true), (atomic, true)] {
+            let l = lower_with(&[words[0], words[1], S_ENDPGM], vec![], vec![]).unwrap();
+            assert_eq!(l.root_srvs, [SLOT_MEMORY]);
+            // The list of pages without a copy is ours, and always written.
+            assert_eq!(l.root_uavs, [SLOT_FAULTS]);
+            assert_eq!(l.written_root_uavs, [SLOT_FAULTS]);
+            assert_eq!(l.writes_guest_memory, writes, "{words:#x?}");
+        }
+        // A load beside a store: written.
+        let l = lower_with(&[load[0], load[1], store[0], store[1], S_ENDPGM], vec![], vec![]).unwrap();
+        assert!(l.writes_guest_memory);
     }
 
     #[test]

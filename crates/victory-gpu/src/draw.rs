@@ -119,6 +119,35 @@ fn write_skip() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WRITE_SKIP").is_none_or(|v| v != "0"))
 }
 
+/// Whether a program is given as written only the root UAVs its
+/// translation can write through (`HostShader::written_root_uavs`) and,
+/// only if it can write title memory by address
+/// (`HostShader::writes_guest_memory`), the numbered copies of that
+/// memory. Before, one store anywhere in the program
+/// declared every root UAV it binds and every numbered copy: each was
+/// snapshotted, compared and copied back although the shader only read it.
+/// (Unordered access views in tables stay by program: [`readable`].) Only
+/// with [`write_skip`]. On by default; `VICTORY_WRITES_BY_SLOT=0` declares
+/// them by program, as before. (After DexNom/VIctory bc3cd4b.)
+fn writes_by_slot() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WRITES_BY_SLOT").is_none_or(|v| v != "0"))
+}
+
+/// Whether a draw declares written a root UAV (`written`: the translation
+/// can write through its slot) or the copies of title memory by address
+/// (`written`: it can write that memory). `stores`: the console program's
+/// code can store to buffers at all, or is not known. The translation is
+/// the code that runs, so what it says stands alone: a slot it can write
+/// is declared whatever the scan of the console code found.
+fn declares_written(stores: bool, written: bool, skip: bool, by_slot: bool) -> bool {
+    match (skip, by_slot) {
+        (false, _) => true,
+        (true, true) => written,
+        (true, false) => stores,
+    }
+}
+
 /// A run of indirect records clamped in one pass ([`windows`]): the host
 /// copy they came from (its number), their kind and stride, the offset of
 /// the first in that copy, how many, and the list's scratch buffer that
@@ -1038,11 +1067,14 @@ impl State {
             }
             // What the shader stores through root views and raw addresses is
             // copied back into title memory afterwards.
-            let writes = (t.stores || !write_skip())
-                && !crate::pipeline::builder_quarantined(self.pipeline as This);
+            let quarantined = crate::pipeline::builder_quarantined(self.pipeline as This);
+            let writes = |written: bool| {
+                !quarantined && declares_written(t.stores, written, write_skip(), writes_by_slot())
+            };
             // Title memory by address: what the shader finds it by.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
-                let Some(ready) = self.memory_ready(list, compute, writes) else {
+                let raw_writes = writes(t.host.writes_guest_memory);
+                let Some(ready) = self.memory_ready(list, compute, raw_writes) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
                 };
@@ -1177,7 +1209,8 @@ impl State {
                         None
                     }
                 };
-                if !self.root_uav(list, address, param, compute, writes) {
+                let writes_slot = writes(t.host.written_root_uavs.contains(&slot));
+                if !self.root_uav(list, address, param, compute, writes_slot) {
                     return false;
                 }
             }
@@ -3564,4 +3597,31 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     crate::capture::op(std::ptr::from_ref(list) as usize, || format!("STENCIL REF {reference:#x}"));
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(test)]
+mod writes_tests {
+    use super::declares_written;
+
+    #[test]
+    fn a_program_that_stores_declares_only_what_it_can_write() {
+        // (stores, written, skip, by slot)
+        // A slot (or title memory by address) the translation can write.
+        assert!(declares_written(true, true, true, true));
+        // One it only reads, in a program that stores elsewhere.
+        assert!(!declares_written(true, false, true, true));
+        // `VICTORY_WRITES_BY_SLOT=0`: by program, as before.
+        assert!(declares_written(true, false, true, false));
+        assert!(!declares_written(false, false, true, false));
+        // The translation is what runs: a slot it can write is declared
+        // even if the scan of the console code found no store.
+        assert!(declares_written(false, true, true, true));
+        assert!(!declares_written(false, false, true, true));
+        // `VICTORY_WRITE_SKIP=0`: everything, as before.
+        for (stores, written, by_slot) in
+            [(false, false, true), (false, false, false), (true, false, true), (false, true, false)]
+        {
+            assert!(declares_written(stores, written, false, by_slot));
+        }
+    }
 }
