@@ -1645,6 +1645,11 @@ struct CardWork {
     fetch: Prelude,
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
+    /// The pass of [`CARD_MERGE`], the memory its masks are written to
+    /// (buffer, mapping, bytes) and where the next mask goes.
+    merge: (ID3D12RootSignature, ID3D12PipelineState),
+    masks: (ID3D12Resource, usize, u64),
+    mask_at: u64,
     /// One dword per piece compared, set where the piece differs: PC
     /// memory, mapped (buffer, mapping, bytes).
     differs: (ID3D12Resource, usize, u64),
@@ -1710,6 +1715,47 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
 }
 "#;
+
+/// The pass that puts the bytes the title changed in a piece of a copy in
+/// the card's memory into the card's side (`crate::shadow::card_masks`):
+/// a thread per 4 bytes. `staged` is the copy's CPU side, `masks` holds a
+/// bit per byte of the piece from `base` on (the piece's offset rounded
+/// down to 4 bytes), four bits to a thread. A word that is only partly the
+/// title's keeps the card's other bytes.
+pub(crate) const CARD_MERGE: &str = r#"
+#define RS "RootConstants(num32BitConstants=4, b0), SRV(t0), SRV(t1), UAV(u0)"
+cbuffer Piece : register(b0) {
+    uint base;     // the piece's first word, in bytes of the copy
+    uint words;
+    uint mask_at;  // the piece's mask in `masks`, in bytes
+    uint unused;
+};
+ByteAddressBuffer staged : register(t0);
+ByteAddressBuffer masks : register(t1);
+RWByteAddressBuffer card : register(u0);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    uint w = id.x;
+    if (w >= words) return;
+    uint m = (masks.Load(mask_at + (w >> 3) * 4u) >> ((w & 7u) * 4u)) & 15u;
+    if (m == 0u) return;
+    uint at = base + w * 4u;
+    uint v = staged.Load(at);
+    if (m != 15u) {
+        uint keep = ((m & 1u) != 0u ? 0u : 0x000000FFu) | ((m & 2u) != 0u ? 0u : 0x0000FF00u)
+                  | ((m & 4u) != 0u ? 0u : 0x00FF0000u) | ((m & 8u) != 0u ? 0u : 0xFF000000u);
+        v = (v & ~keep) | (card.Load(at) & keep);
+    }
+    card.Store(at, v);
+}
+"#;
+
+/// The bytes of the memory the masks of [`CARD_MERGE`] are written to, in
+/// turn: a mask stays until the list that reads it has run, some frames of
+/// masks later at the most (a frame of the first scene has 30 to 80 pieces
+/// of 8 KiB of mask each).
+const MASK_ROOM: u64 = 16 << 20;
 
 /// As [`CARD_COMPARE`] (the same constants, cuts and results; another
 /// hash), with a group of 64 threads per piece: the threads take the
@@ -3343,26 +3389,31 @@ impl Host {
     fn make_card_work(&self) -> windows::core::Result<CardWork> {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
-        let mut code: Option<ID3DBlob> = None;
-        let source = if hash_wide() { CARD_COMPARE_WIDE } else { CARD_COMPARE };
-        // SAFETY: the source and names live through the call; the out
-        // pointer is ours.
-        unsafe {
-            D3DCompile(
-                source.as_ptr().cast(),
-                source.len(),
-                windows::core::s!("card compare"),
-                None,
-                None,
-                windows::core::s!("main"),
-                windows::core::s!("cs_5_1"),
-                0,
-                0,
-                &mut code,
-                None,
-            )?;
-        }
-        let code = code.ok_or_else(windows::core::Error::empty)?;
+        let compiled = |source: &str| -> windows::core::Result<ID3DBlob> {
+            let mut code: Option<ID3DBlob> = None;
+            // SAFETY: the source and names live through the call; the out
+            // pointer is ours.
+            unsafe {
+                D3DCompile(
+                    source.as_ptr().cast(),
+                    source.len(),
+                    windows::core::s!("card compare"),
+                    None,
+                    None,
+                    windows::core::s!("main"),
+                    windows::core::s!("cs_5_1"),
+                    0,
+                    0,
+                    &mut code,
+                    None,
+                )?;
+            }
+            code.ok_or_else(windows::core::Error::empty)
+        };
+        let code = compiled(if hash_wide() { CARD_COMPARE_WIDE } else { CARD_COMPARE })?;
+        let merge_code = compiled(CARD_MERGE)?;
+        let (masks, masks_data) = self.shared_buffer(MASK_ROOM).ok_or_else(windows::core::Error::empty)?;
+        name(&masks, || "card merge masks".into());
         let list = || self.make_prelude().ok_or_else(windows::core::Error::empty);
         // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
         // in one submission.
@@ -3382,12 +3433,25 @@ impl Host {
                 },
                 ..Default::default()
             })?;
+            let merge_bytes = std::slice::from_raw_parts(merge_code.GetBufferPointer().cast::<u8>(), merge_code.GetBufferSize());
+            let merge_root: ID3D12RootSignature = self.device.CreateRootSignature(0, merge_bytes)?;
+            let merge_pso: ID3D12PipelineState = self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&merge_root),
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: merge_bytes.as_ptr().cast(),
+                    BytecodeLength: merge_bytes.len(),
+                },
+                ..Default::default()
+            })?;
             Ok(CardWork {
                 sync: vec![list()?],
                 check: vec![list()?],
                 fetch: list()?,
                 root,
                 pso,
+                merge: (merge_root, merge_pso),
+                masks: (masks, masks_data as usize, MASK_ROOM),
+                mask_at: 0,
                 differs: (differs, data as usize, RESULTS),
                 fetched: None,
                 taken: 0,
@@ -3465,8 +3529,8 @@ impl Host {
                 Some(before)
             }) {
                 whole.push(shadow.clone());
-                if !dirty.iter().any(|(s, _)| Arc::ptr_eq(s, shadow)) {
-                    dirty.push((shadow.clone(), Vec::new()));
+                if !dirty.iter().any(|(s, ..)| Arc::ptr_eq(s, shadow)) {
+                    dirty.push((shadow.clone(), Vec::new(), Vec::new()));
                 }
             }
         }
@@ -3476,6 +3540,36 @@ impl Host {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
             };
             let (allocator, list) = &sync;
+            // The masks of the pieces that go up by one ([`CARD_MERGE`])
+            // are written where the pass will read them: per copy, each
+            // piece's first word, words and mask (bytes into the masks'
+            // memory). A submission with more of them than the memory
+            // holds sends the rest up run by run.
+            let mut merges: Vec<Vec<[u32; 4]>> = Vec::with_capacity(dirty.len());
+            let mut room = work.masks.2 / 2;
+            for (_, ranges, masks) in &mut dirty {
+                let mut placed = Vec::with_capacity(masks.len());
+                for masked in masks.iter() {
+                    let (at, len, mask) = masked;
+                    let bytes = mask.len() as u64 * 4;
+                    if bytes > room {
+                        ranges.extend(crate::shadow::mask_runs(masked));
+                        continue;
+                    }
+                    room -= bytes;
+                    if work.mask_at + bytes > work.masks.2 {
+                        work.mask_at = 0;
+                    }
+                    // SAFETY: inside the masks' mapping (checked above).
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(mask.as_ptr(), (work.masks.1 + work.mask_at as usize) as *mut u32, mask.len());
+                    }
+                    let base = at & !3;
+                    placed.push([base as u32, (at - base + len).div_ceil(4) as u32, work.mask_at as u32, 0]);
+                    work.mask_at += bytes;
+                }
+                merges.push(placed);
+            }
             // SAFETY: the list's last run finished (it ran ahead of a
             // submission that was waited for, and came back after that);
             // live buffers, and the ranges lie in them.
@@ -3483,6 +3577,35 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    // The passes by mask first: they leave the copy as a
+                    // copy's destination, which the copies below want.
+                    for ((shadow, ..), placed) in dirty.iter().zip(&merges) {
+                        let Some((staging, _, _)) = shadow.card_sides() else {
+                            continue;
+                        };
+                        if placed.is_empty() {
+                            continue;
+                        }
+                        list.SetComputeRootSignature(&work.merge.0);
+                        list.SetPipelineState(&work.merge.1);
+                        list.SetComputeRootShaderResourceView(1, staging.GetGPUVirtualAddress());
+                        list.SetComputeRootShaderResourceView(2, work.masks.0.GetGPUVirtualAddress());
+                        list.SetComputeRootUnorderedAccessView(3, shadow.buffer.GetGPUVirtualAddress());
+                        for piece in placed {
+                            list.SetComputeRoot32BitConstants(0, 4, piece.as_ptr().cast(), 0);
+                            list.Dispatch(piece[1].div_ceil(64), 1, 1);
+                        }
+                        list.ResourceBarrier(&[transition(
+                            &shadow.buffer,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )]);
+                    }
+                    // Whether anything went up to a copy.
+                    let sent_up = |shadow: &Arc<crate::shadow::Shadow>, ranges: &[(usize, usize)]| {
+                        !ranges.is_empty()
+                            || dirty.iter().zip(&merges).any(|((s, ..), placed)| Arc::ptr_eq(s, shadow) && !placed.is_empty())
+                    };
                     let copies = |shadow: &crate::shadow::Shadow, staging: &ID3D12Resource, ranges: &[(usize, usize)]| {
                         for &(a, b) in ranges {
                             list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
@@ -3495,12 +3618,12 @@ impl Host {
                     let wide = hash_wide();
                     if wide {
                         let mut barriers = Vec::new();
-                        for (shadow, ranges) in &dirty {
+                        for (shadow, ranges, _) in &dirty {
                             let Some((staging, before, _)) = shadow.card_sides() else {
                                 continue;
                             };
                             copies(shadow, staging, ranges);
-                            if before.is_some() && !ranges.is_empty() {
+                            if before.is_some() && sent_up(shadow, ranges) {
                                 barriers.push(transition(
                                     &shadow.buffer,
                                     D3D12_RESOURCE_STATE_COPY_DEST,
@@ -3512,7 +3635,7 @@ impl Host {
                             list.ResourceBarrier(&barriers);
                         }
                     }
-                    for (shadow, ranges) in &dirty {
+                    for (shadow, ranges, masks) in &dirty {
                         let Some((staging, before, size)) = shadow.card_sides() else {
                             continue;
                         };
@@ -3528,7 +3651,7 @@ impl Host {
                         // hashed again, all of them the first time; the
                         // compare after the lists hashes the declared
                         // pieces and flags those whose hash is another.
-                        if !wide && !ranges.is_empty() {
+                        if !wide && sent_up(shadow, ranges) {
                             list.ResourceBarrier(&[transition(
                                 &shadow.buffer,
                                 D3D12_RESOURCE_STATE_COPY_DEST,
@@ -3543,7 +3666,11 @@ impl Host {
                         let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
                             vec![shadow.card_run(0, usize::MAX)]
                         } else {
-                            ranges.iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
+                            ranges
+                                .iter()
+                                .map(|&(a, b)| shadow.card_run(a, b))
+                                .chain(masks.iter().map(|m| shadow.card_run(m.0, m.0 + m.1)))
+                                .collect()
                         };
                         // The same pieces in fewer passes (`rehash_runs`).
                         let runs = if rehash_runs() { crate::shadow::joined_piece_runs(runs) } else { runs };
@@ -3558,21 +3685,31 @@ impl Host {
                     // The fills, after what the title wrote went up. A copy
                     // hashed above was left readable by shaders.
                     if !fills.is_empty() {
-                        let hashed: Vec<usize> = dirty
+                        // The state each copy was left in above, if it was
+                        // moved at all.
+                        let left: Vec<(usize, D3D12_RESOURCE_STATES)> = dirty
                             .iter()
-                            .filter(|(shadow, ranges)| !ranges.is_empty() && shadow.card_sides().is_some_and(|s| s.1.is_some()))
-                            .map(|(shadow, _)| Arc::as_ptr(shadow) as usize)
+                            .zip(&merges)
+                            .filter_map(|((shadow, ranges, _), placed)| {
+                                let hashed = sent_up(shadow, ranges) && shadow.card_sides().is_some_and(|s| s.1.is_some());
+                                let state = if hashed {
+                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                                } else if !placed.is_empty() {
+                                    D3D12_RESOURCE_STATE_COPY_DEST
+                                } else {
+                                    return None;
+                                };
+                                Some((Arc::as_ptr(shadow) as usize, state))
+                            })
                             .collect();
                         let mut moved: Vec<usize> = Vec::new();
                         for (shadow, from, len, to, at) in &fills {
                             let key = Arc::as_ptr(shadow) as usize;
-                            if hashed.contains(&key) && !moved.contains(&key) {
+                            if let Some(&(_, state)) = left.iter().find(|l| l.0 == key)
+                                && !moved.contains(&key)
+                            {
                                 moved.push(key);
-                                list.ResourceBarrier(&[transition(
-                                    &shadow.buffer,
-                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                                    D3D12_RESOURCE_STATE_COPY_SOURCE,
-                                )]);
+                                list.ResourceBarrier(&[transition(&shadow.buffer, state, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
                             }
                             list.CopyBufferRegion(to, *at, &shadow.buffer, *from, *len);
                         }
@@ -3591,7 +3728,7 @@ impl Host {
         let mut plan = CardPlan {
             ranges: Vec::new(),
             check: None,
-            _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
+            _synced: dirty.into_iter().map(|(shadow, ..)| shadow).collect(),
             lists: used,
         };
         // Each byte once, as the copy-back joins the declared ranges. The
