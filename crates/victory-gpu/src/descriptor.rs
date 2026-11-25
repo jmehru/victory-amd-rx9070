@@ -354,7 +354,7 @@ struct Views {
 }
 
 /// Whether the threads that record lists read what they share without
-/// keeping one another out (on by default; `VICTORY_RECORD_SHARED=0`: one
+/// keeping one another out (`VICTORY_RECORD_SHARED=1`; off by default: one
 /// at a time, as before).
 ///
 /// A draw's tables are made ready by the thread that records it: for every
@@ -371,7 +371,10 @@ struct Views {
 /// resources kept are locked slot by slot.
 pub(crate) fn record_shared() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_RECORD_SHARED").is_none_or(|v| v != "0"))
+    // Off by default: two runs each way in the first scene gave 60.3 and
+    // 57.4 ms a frame with it against 61.9 and 60.9 without (RA1, RA2, RB1,
+    // RB2), inside what runs of one setting differ by.
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RECORD_SHARED").is_some_and(|v| v == "1"))
 }
 
 static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
