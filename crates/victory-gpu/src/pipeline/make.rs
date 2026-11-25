@@ -43,6 +43,14 @@ pub(crate) struct Pending {
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     if without_structures(shaders) {
         Some("shades ray-tracing hits, left out")
+    } else if named(shaders, b"CSComputeSkinningTreeAnim")
+        || named(shaders, b"CS_UpdateSkinnedAttachMeshTreeParticles")
+        || shaders.iter().any(|s| s.hash == "a567b9ef845fb680")
+    {
+        // Local: these crash the RDNA4 driver's compiler (amdxc64.dll+0x861b9f,
+        // RX 9070, 32.0.32029.2010): f16876929fa64f9f, 878933b499cfa14d,
+        // c1eee35dbc50a9ef, a567b9ef845fb680 (fxceless #120, #145).
+        Some("crashes the RDNA4 compiler, left out")
     } else if too_dear(shaders) {
         Some("too dear to compile, left out")
     } else {
