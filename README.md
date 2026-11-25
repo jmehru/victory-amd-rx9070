@@ -264,6 +264,8 @@ Point `VICTORY_FFX_DIR` at `Kits\FidelityFX\signedbin` of AMD's public
 [FidelityFX SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK)
 (2.x) to answer its FidelityFX calls with the PC upscaler for D3D12 instead
 (experimental; from PastiiJay/klbf-lab-beta).
+`VICTORY_FFX_SIMPLE=1` takes the same calls with no upscaler: a bilinear
+scale with one jitter phase, to tell what FSR adds to a picture.
 
 ## Commands
 

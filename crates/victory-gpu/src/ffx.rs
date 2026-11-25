@@ -24,6 +24,7 @@ use windows::core::{Interface, PCSTR, PCWSTR};
 use crate::object::This;
 
 pub(crate) mod rgb9e5;
+mod simple;
 
 type ReturnCode = u32;
 const OK: ReturnCode = 0;
@@ -135,12 +136,28 @@ struct Api {
     dispatch: Dispatch,
 }
 
-/// Whether the title's FidelityFX calls come here: `VICTORY_FFX_DIR` set.
-/// Read once: draws ask too.
+/// Whether the title's FidelityFX calls come here: `VICTORY_FFX_DIR` or
+/// `VICTORY_FFX_SIMPLE=1` set. Read once: draws ask too.
 pub fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_FFX_DIR").is_some())
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FFX_DIR").is_some() || simple_mode())
 }
+
+/// `VICTORY_FFX_SIMPLE=1`: no upscaler, the colour input scaled to the
+/// output bilinearly ([`simple`]); `VICTORY_FFX_DIR` is not used then.
+fn simple_mode() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_FFX_SIMPLE").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("ffx: simple upscale (VICTORY_FFX_SIMPLE=1): bilinear scale of the colour input, no FSR, no history, no jitter");
+        }
+        on
+    })
+}
+
+/// The context handed to the title in simple mode: never dereferenced.
+const SIMPLE_CONTEXT: usize = 0x5157_0001;
 
 /// AMD's loader, loaded on first use. The upscaler it picks is loaded by
 /// full path first, so the loader finds it without a change to the DLL
@@ -230,6 +247,14 @@ pub extern "C" fn ffxCreateContext(
     desc: *mut Header,
     _memory: *const c_void,
 ) -> ReturnCode {
+    if simple_mode() {
+        if context.is_null() {
+            return ERROR_PARAMETER;
+        }
+        // SAFETY: the title's out pointer, checked for null.
+        unsafe { *context = SIMPLE_CONTEXT as *mut c_void };
+        return OK;
+    }
     let (Some(api), Some(device)) = (api(), host_device()) else {
         return ERROR;
     };
@@ -296,12 +321,18 @@ pub extern "C" fn ffxDestroyContext(
     context: *mut *mut c_void,
     _memory: *const c_void,
 ) -> ReturnCode {
+    if simple_mode() {
+        return OK;
+    }
     let Some(api) = api() else { return ERROR };
     // SAFETY: a context this module created.
     unsafe { (api.destroy)(context, std::ptr::null()) }
 }
 
 pub extern "C" fn ffxConfigure(context: *mut *mut c_void, desc: *const Header) -> ReturnCode {
+    if simple_mode() {
+        return OK;
+    }
     let Some(api) = api() else { return ERROR };
     if !desc.is_null() {
         // SAFETY: the title's description.
@@ -312,6 +343,9 @@ pub extern "C" fn ffxConfigure(context: *mut *mut c_void, desc: *const Header) -
 }
 
 pub extern "C" fn ffxQuery(context: *mut *mut c_void, desc: *mut Header) -> ReturnCode {
+    if simple_mode() {
+        return simple_query(desc);
+    }
     let (Some(api), Some(device)) = (api(), host_device()) else {
         return ERROR;
     };
@@ -362,6 +396,28 @@ pub extern "C" fn ffxQuery(context: *mut *mut c_void, desc: *mut Header) -> Retu
     r
 }
 
+/// Simple mode's answers: one jitter phase (the title then keeps the same
+/// sub-pixel offset every frame, nothing to accumulate); other queries are
+/// logged and answered as done.
+fn simple_query(desc: *mut Header) -> ReturnCode {
+    if desc.is_null() {
+        return ERROR_PARAMETER;
+    }
+    // SAFETY: the title's description.
+    let kind = unsafe { (*desc).kind };
+    note("ffxQuery", kind);
+    if kind == QUERY_JITTER_PHASE_COUNT {
+        // SAFETY: a description of this type (`log_query`'s layout): the
+        // output pointer after the header and the two widths.
+        let out = unsafe { *desc.cast::<u8>().add(24).cast::<*mut i32>() };
+        if !out.is_null() {
+            // SAFETY: the title's output.
+            unsafe { *out = 1 };
+        }
+    }
+    OK
+}
+
 /// A query's result, once per type, with the jitter phase count it gave.
 fn log_query(kind: u64, desc: *mut Header, r: ReturnCode) {
     static SEEN: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
@@ -396,7 +452,12 @@ fn log_query(kind: u64, desc: *mut Header, r: ReturnCode) {
 }
 
 pub extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *const Header) -> ReturnCode {
-    let Some(api) = api() else { return ERROR };
+    let api = if simple_mode() {
+        None
+    } else {
+        let Some(api) = api() else { return ERROR };
+        Some(api)
+    };
     if context.is_null() || desc.is_null() {
         return ERROR_PARAMETER;
     }
@@ -418,9 +479,9 @@ pub extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *const Header) ->
         missing_texture(OUTPUT, output);
         return ERROR_PARAMETER;
     };
-    let packed_output = if crate::host::legal_state(destination, HOST_UNORDERED_ACCESS)
-        != HOST_UNORDERED_ACCESS
-    {
+    let writable = crate::host::legal_state(destination, HOST_UNORDERED_ACCESS) == HOST_UNORDERED_ACCESS
+        && (api.is_some() || simple::supports(destination, true));
+    let packed_output = if !writable {
         let Some(packed) = crate::resource::rgb9e5_fsr_output(output)
             .filter(|packed| packed.matches(d.upscale_size))
         else {
@@ -433,6 +494,9 @@ pub extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *const Header) ->
         Some(packed)
     } else {
         None
+    };
+    let Some(api) = api else {
+        return simple_dispatch(list, title_list, &d, (input, output), destination, packed_output);
     };
     for (i, r) in d.resources.iter_mut().enumerate() {
         if i == OUTPUT && let Some(packed) = packed_output {
@@ -504,6 +568,49 @@ pub extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *const Header) ->
         tracing::info!(render = ?d.render_size, upscale = ?d.upscale_size, result = r, ?input, ?output, format, packed = packed_output.is_some(), "ffx: first upscale recorded on the host GPU");
     });
     r
+}
+
+/// [`ffxDispatch`] in simple mode: the colour input's render rectangle
+/// scaled to the output ([`simple::record`]), packed into RGB9E5 after if
+/// the output has that fallback.
+fn simple_dispatch(
+    list: &crate::host::HostList,
+    title_list: This,
+    d: &DispatchUpscale,
+    (input, output): (This, This),
+    destination: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    packed: Option<&'static rgb9e5::Output>,
+) -> ReturnCode {
+    let Some(source) = crate::resource::host_resource(input) else {
+        missing_texture(0, input);
+        return ERROR_PARAMETER;
+    };
+    if !simple::supports(source, false) {
+        static REPORTED: std::sync::Once = std::sync::Once::new();
+        REPORTED.call_once(|| tracing::warn!(?input, "ffx: simple upscale: the colour input cannot be sampled"));
+        return ERROR_PARAMETER;
+    }
+    crate::list::ensure_state(list, input, HOST_NON_PIXEL_SHADER_RESOURCE);
+    let target = match packed {
+        Some(p) => p.float(list),
+        None => {
+            crate::list::ensure_state(list, output, HOST_UNORDERED_ACCESS);
+            destination
+        }
+    };
+    let recorded = simple::record(list, source, target, d.render_size, d.upscale_size);
+    if recorded {
+        if let Some(p) = packed {
+            p.copy_to(list, output, destination);
+        }
+        crate::texture::host_written(output);
+    }
+    crate::list::forget_host_bindings(title_list);
+    static FIRST: std::sync::Once = std::sync::Once::new();
+    FIRST.call_once(|| {
+        tracing::info!(render = ?d.render_size, upscale = ?d.upscale_size, recorded, ?input, ?output, packed = packed.is_some(), "ffx: first simple upscale recorded");
+    });
+    if recorded { OK } else { ERROR }
 }
 
 fn missing_texture(slot: usize, title: This) {

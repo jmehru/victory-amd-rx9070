@@ -223,6 +223,13 @@ impl Output {
         size == [footprint.Width, footprint.Height]
     }
 
+    /// The FP16 texture the upscale writes (in unordered access), which
+    /// [`Output::copy_to`] packs.
+    pub(super) fn float(&self, list: &HostList) -> &ID3D12Resource {
+        list.keep(&self.float);
+        &self.float
+    }
+
     pub(super) fn sdk_resource(&self, list: &HostList) -> Resource {
         // The SDK can record references even if dispatch returns an error.
         list.keep(&self.float);
