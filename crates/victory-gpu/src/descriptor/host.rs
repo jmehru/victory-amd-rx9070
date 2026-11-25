@@ -242,6 +242,10 @@ static SWEEP: Mutex<(u32, [u64; 10], u64)> = Mutex::new((0, [0; 10], 0));
 /// texture pass last took the ranges ([`remapped`]).
 static REMAPPED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
+/// More ranges came than [`REMAPPED`] keeps: the next texture pass looks
+/// at every placed slot once instead ([`HostHeap::texture_slots_remapped`]).
+static OVERFLOWED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// The lowest start and the highest end of any span of [`Spans`] so far
 /// (the start is `u64::MAX` until there is one): what the runtime does to
 /// memory outside is none of the texture pass's business.
@@ -272,7 +276,8 @@ fn stale_out() -> bool {
 /// locks held: this locks one mutex of its own and calls nothing.
 pub(crate) fn remapped(at: usize, len: usize) {
     use std::sync::atomic::Ordering::Relaxed;
-    /// Ranges kept until a pass takes them.
+    /// Ranges kept until a pass takes them; past this many, every placed
+    /// slot is looked at once instead ([`OVERFLOWED`]).
     /// (A world's first minutes note tens of thousands between two passes:
     /// 131,072 were dropped in one run at the 32,768 there were.)
     const MOST: usize = 1 << 18;
@@ -291,8 +296,10 @@ pub(crate) fn remapped(at: usize, len: usize) {
     }
     if ranges.len() >= MOST {
         // No pass runs (no shader that picks textures by index is bound):
-        // the slots there are looked at when they are due, as before.
+        // the ranges go, and the next pass looks at every placed slot. Lost,
+        // a texture streamed in there would stay stale or null (klbf 56bb7c3).
         STALE[2].fetch_add(ranges.len() as u64, Relaxed);
+        OVERFLOWED.store(true, Relaxed);
         ranges.clear();
     }
     ranges.push((start, end));
@@ -1108,13 +1115,22 @@ impl HostHeap {
     pub(crate) fn texture_slots_remapped(&self, frame: u64) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
         let ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
-        if ranges.is_empty() {
+        // Taken once: the flag is set again only by another overflow.
+        let all = OVERFLOWED.swap(false, Relaxed);
+        if ranges.is_empty() && !all {
             return 0;
         }
         let mut slots: Vec<u32> = {
             let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
-            ranges.iter().flat_map(|&(start, end)| placed.slots_in(start, end)).collect()
+            if all {
+                placed.by_slot.keys().copied().collect()
+            } else {
+                ranges.iter().flat_map(|&(start, end)| placed.slots_in(start, end)).collect()
+            }
         };
+        if all {
+            tracing::info!("remapped ranges overflowed: full rescan of {} slots", slots.len());
+        }
         slots.sort_unstable();
         slots.dedup();
         // A table's slot waits for its draw, as a write of it does: the
