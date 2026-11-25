@@ -147,6 +147,20 @@ pub(crate) fn copied(len: usize) {
     }
 }
 
+/// Texture hashes taken: how many and their bytes, and of those the ones
+/// of 2 MiB and more.
+static HASHED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Called for each hash of a texture's bytes.
+pub(crate) fn hashed(len: usize) {
+    HASHED[0].fetch_add(1, Ordering::Relaxed);
+    HASHED[1].fetch_add(len as u64, Ordering::Relaxed);
+    if len >= 2 << 20 {
+        HASHED[2].fetch_add(1, Ordering::Relaxed);
+        HASHED[3].fetch_add(len as u64, Ordering::Relaxed);
+    }
+}
+
 /// Called at each present.
 pub(crate) fn presented() {
     FRAMES.fetch_add(1, Ordering::Relaxed);
@@ -191,13 +205,14 @@ fn seconds(name: &str, default: u64) -> std::time::Duration {
 
 /// Counts kept elsewhere, since the start: questions to Windows about
 /// absent blocks and those answered from kept answers; write-watch askings.
-fn counts() -> [u64; 17] {
+fn counts() -> [u64; 21] {
     std::array::from_fn(|i| match i {
         0 => crate::watch::ABSENT_ASKS.load(Ordering::Relaxed),
         1 => 0,
         2..=5 => crate::watch::KERNEL_ASKS[i - 2].load(Ordering::Relaxed),
         6..=9 => COPIES[i - 6].load(Ordering::Relaxed),
-        _ => crate::watch::GUARD_STATS[i - 10].load(Ordering::Relaxed),
+        10..=16 => crate::watch::GUARD_STATS[i - 10].load(Ordering::Relaxed),
+        _ => HASHED[i - 17].load(Ordering::Relaxed),
     })
 }
 
@@ -214,7 +229,7 @@ fn sample(file: &str) {
     let mut written = 0u32;
     // How many times each was sampled (a sample of the helpers is of all).
     let mut rounds = [0u32; 3];
-    let mut counted = [0u64; 17];
+    let mut counted = [0u64; 21];
     loop {
         std::thread::sleep(std::time::Duration::from_millis(1));
         if THREADS[0].load(Ordering::Relaxed) == 0 {
@@ -285,7 +300,7 @@ fn sample(file: &str) {
             }
             // Counts kept elsewhere, per frame of the window.
             let now = counts();
-            let per: [f64; 17] = std::array::from_fn(|i| (now[i] - counted[i]) as f64 / frames.max(1) as f64);
+            let per: [f64; 21] = std::array::from_fn(|i| (now[i] - counted[i]) as f64 / frames.max(1) as f64);
             counted = now;
             text.push_str(&format!(
                 "==== per frame: {:.0} questions to Windows about absent blocks;                  write-watch askings made ahead {:.0} answered and {:.0} failed, for one range {:.0} answered and {:.0} failed;                  the title's buffer copies {:.0} of {:.1} MB, of them {:.1} of 1 MiB and more with {:.1} MB
@@ -297,6 +312,10 @@ fn sample(file: &str) {
                  {:.0} absent blocks met, {:.0} of them in a placeholder and not asked about, {:.2} found committed by a question ({} since the start), \
                  {:.0} runs made read-only\n",
                 per[10], per[11], per[12], per[13], per[14], per[15], now[15], per[16]
+            ));
+            text.push_str(&format!(
+                "==== per frame: {:.1} texture hashes of {:.1} MB, of them {:.1} of 2 MiB and more with {:.1} MB\n",
+                per[17], per[18] / 1e6, per[19], per[20] / 1e6
             ));
             let _ = std::fs::write(format!("{file}.{written}"), text);
             since = None;

@@ -379,6 +379,49 @@ fn through_copy() -> bool {
 /// Calls `f` with the `size` bytes of title memory at `memory`, read
 /// through the kernel into this thread's read buffer; pages that are not
 /// there read as zeros. The bytes are those a read in place would see.
+/// Whether a texture of 2 MiB or more is hashed a megabyte to a thread
+/// (`VICTORY_TEXTURE_HASH_WIDE=0`: on the checking thread alone, as
+/// before).
+///
+/// A texture in view memory is hashed whole every eighth frame, on the
+/// submitting thread: 13.6 MB and 3.2 ms a frame in the first scene (run
+/// n3p), one core's 4.2 GB/s.
+fn hash_wide() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_HASH_WIDE").is_none_or(|v| v != "0"))
+}
+
+/// The hash a texture's bytes are known by from one check to the next
+/// (only ever compared with an earlier one of the same texture, so of the
+/// same length): of the bytes, or for many bytes ([`hash_wide`]) of the
+/// hashes of their megabytes, taken on the kept threads.
+fn content_hash(bytes: &[u8]) -> blake3::Hash {
+    const PART: usize = 1 << 20;
+    crate::profile::hashed(bytes.len());
+    if bytes.len() < 2 * PART || !hash_wide() {
+        return blake3::hash(bytes);
+    }
+    let parts = bytes.len().div_ceil(PART);
+    let mut digests = vec![[0u8; 32]; parts];
+    let (from, len, to) = (bytes.as_ptr() as usize, bytes.len(), digests.as_mut_ptr() as usize);
+    let jobs: Vec<Box<dyn FnOnce() + Send>> = (0..parts)
+        .map(|i| {
+            Box::new(move || {
+                let at = i * PART;
+                // SAFETY: a part of `bytes` and its own place in `digests`,
+                // both alive until `wide_run` returns, which is after
+                // every piece of work is done.
+                unsafe {
+                    let part = std::slice::from_raw_parts((from + at) as *const u8, PART.min(len - at));
+                    (to as *mut [u8; 32]).add(i).write(*blake3::hash(part).as_bytes());
+                }
+            }) as Box<dyn FnOnce() + Send>
+        })
+        .collect();
+    crate::shadow::wide_run(jobs);
+    blake3::hash(digests.as_flattened())
+}
+
 fn with_title<R>(memory: *const u8, size: usize, f: impl FnOnce(&[u8]) -> R) -> R {
     with_read(size, |read| {
         crate::host::copy_mapped(read.as_mut_ptr(), memory, size, false);
@@ -792,7 +835,7 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                let hash = blake3::hash(read);
+                let hash = content_hash(read);
                 if last.hash == Some(hash) {
                     return false;
                 }
@@ -812,7 +855,7 @@ impl Staging {
         }
         if through_copy() {
             return with_title(self.memory, size, |tiled| {
-                let hash = blake3::hash(tiled);
+                let hash = content_hash(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
                 if last.hash == Some(hash) {
@@ -831,7 +874,7 @@ impl Staging {
         // SAFETY: committed memory of the texture's layout size, and it
         // stays committed while `_mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        let hash = blake3::hash(tiled);
+        let hash = content_hash(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
@@ -890,7 +933,7 @@ impl Staging {
             if !crate::host::read_into(self.memory, read) {
                 return false;
             }
-            let hash = blake3::hash(read);
+            let hash = content_hash(read);
             if last.hash != Some(hash) {
                 last.hash = Some(hash);
                 self.detile(read);

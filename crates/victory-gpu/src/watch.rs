@@ -94,6 +94,11 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
         .collect();
     not_known_views(&mut pieces);
+    ask_ahead_pieces(pieces);
+}
+
+/// [`ask_ahead`] for page ranges, none of them the guards'.
+fn ask_ahead_pieces(mut pieces: Vec<(usize, usize)>) {
     if pieces.len() < 2 {
         return;
     }
@@ -190,14 +195,15 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         return;
     }
     ask_once_end();
-    ask_ahead(ranges);
-    // The ranges still to be asked about alone, but those of view memory.
+    // The ranges to ask about (not those of view memory): together where
+    // they lie close, then those still alone.
     let mut alone: Vec<(usize, usize)> = ranges
         .iter()
         .filter(|r| r.0 < r.1)
         .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
         .collect();
     not_known_views(&mut alone);
+    ask_ahead_pieces(alone.clone());
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     if j.ahead.is_empty() {
@@ -531,6 +537,23 @@ pub fn title_memory_placeholder(at: usize, len: usize) {
     }
     let mut g = guards();
     // Reservations it overlaps are older ones of the same addresses, gone.
+    forget_placeholders(&mut g, first, end);
+    g.placeholders.insert(first, end);
+}
+
+/// The runtime reserved or committed ordinary memory in `[at, at + len)`
+/// (which fails inside a placeholder): a placeholder noted there
+/// ([`title_memory_placeholder`]) was given back since, and what is absent
+/// there is asked about at every check again.
+pub fn title_memory_reserved(at: usize, len: usize) {
+    let mut g = guards();
+    if !g.placeholders.is_empty() {
+        forget_placeholders(&mut g, at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    }
+}
+
+/// Forgets the placeholders that hold a block of `[first, end)`.
+fn forget_placeholders(g: &mut Guards, first: usize, end: usize) {
     let over: Vec<usize> = g
         .placeholders
         .range(..end)
@@ -540,7 +563,6 @@ pub fn title_memory_placeholder(at: usize, len: usize) {
     for f in over {
         g.placeholders.remove(&f);
     }
-    g.placeholders.insert(first, end);
 }
 
 /// Every how many frames an absent block inside a placeholder of the
@@ -556,8 +578,10 @@ pub fn title_memory_placeholder(at: usize, len: usize) {
 /// committed but a view of the runtime's, which is told
 /// ([`title_memory_remapped`] forgets the block as absent). There the
 /// question is only a net under what we may not know (the title giving the
-/// reservation back and something else taking the addresses): each block
-/// is asked about in its turn, every so many frames. Absent blocks outside
+/// reservation back through a call the runtime does not see, and other
+/// memory taking the addresses; what the runtime itself reserves or commits
+/// there forgets the placeholder, [`title_memory_reserved`]): each block is
+/// asked about in its turn, every so many frames. Absent blocks outside
 /// placeholders are asked about at every check, as before.
 fn placeholder_ask_every() -> u64 {
     static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -663,7 +687,10 @@ fn guard_walk(g: &mut Guards, first: usize, last: usize) -> Vec<usize> {
         return written;
     }
     guard_stat(2, last - first);
-    let mut next_clean = 0;
+    // The range's absent blocks likewise (those noted before this walk;
+    // the walk only takes blocks out of the set).
+    let absent: Vec<usize> = g.absent.range(first..last).copied().collect();
+    let (mut next_clean, mut next_absent) = (0, 0);
     let mut uncommitted_until = first;
     // The placeholder the loop stands in, if any (first, end), and the
     // turn of its absent blocks to be asked about.
@@ -676,7 +703,10 @@ fn guard_walk(g: &mut Guards, first: usize, last: usize) -> Vec<usize> {
         }
         let is_clean = next_clean < clean.len() && clean[next_clean] == block;
         let mut open = block < last && !is_clean;
-        if open && g.absent.contains(&block) {
+        while next_absent < absent.len() && absent[next_absent] < block {
+            next_absent += 1;
+        }
+        if open && next_absent < absent.len() && absent[next_absent] == block {
             guard_stat(3, 1);
             if every > 1 && block >= uncommitted_until {
                 if block >= placeholder.1 {
@@ -1748,6 +1778,69 @@ mod tests {
             windows_sys::Win32::Foundation::CloseHandle(section);
         }
         title_memory_remapped(p, BLOCKS * BLOCK);
+        // Given back: the addresses may be anything from now on.
+        title_memory_reserved(p, BLOCKS * BLOCK);
+        assert!(guards().placeholders.range(..p / BLOCK + BLOCKS).all(|(_, &e)| e <= p / BLOCK));
+    }
+
+    /// What an asking of the write watch costs on this machine, with and
+    /// without the reset, by the size of the range and by how much of it
+    /// was written (`cargo test --release -p victory-gpu --lib asking_costs -- --ignored --nocapture`).
+    /// On the Ryzen 5 7600 (2026-11-25): 6-8 us for 64 KiB, 8-11 us for
+    /// 4 MiB, 43-59 us for 64 MiB, 155-177 us for 256 MiB, the same with
+    /// and without the reset and with 0, 1 or 64 pages written: the price
+    /// is the pages asked about (some 2.4 ns each), not the call, the reset
+    /// or what was written. Asking first without the reset saves nothing.
+    #[test]
+    #[ignore = "a measurement, not a check"]
+    fn asking_costs() {
+        use windows_sys::Win32::System::Memory::GetWriteWatch;
+        const SIZE: usize = 256 << 20;
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe { VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+        assert_ne!(p, 0);
+        // Every page there (as title memory is), then the watch reset.
+        for at in (0..SIZE).step_by(4096) {
+            // SAFETY: committed pages of ours.
+            unsafe { ((p + at) as *mut u8).write(1) };
+        }
+        let mut found = vec![0usize; SIZE / 4096];
+        let mut ask = |at: usize, len: usize, reset: u32| {
+            let (mut count, mut granularity) = (found.len(), 0u32);
+            // SAFETY: the answer buffer holds `count` entries.
+            let failed = unsafe { GetWriteWatch(reset, (p + at) as *const _, len, found.as_mut_ptr().cast(), &mut count, &mut granularity) };
+            assert_eq!(failed, 0);
+            count
+        };
+        ask(0, SIZE, 1);
+        for &(len, name) in &[(64usize << 10, "64 KiB"), (4 << 20, "4 MiB"), (64 << 20, "64 MiB"), (256 << 20, "256 MiB")] {
+            for &dirty in &[0usize, 1, 64] {
+                for &reset in &[0u32, 1] {
+                    const TIMES: u32 = 200;
+                    let mut total = std::time::Duration::ZERO;
+                    let mut counted = 0;
+                    for _ in 0..TIMES {
+                        for k in 0..dirty {
+                            // SAFETY: committed pages of ours, inside `len`.
+                            unsafe { ((p + (k * 4096 * 3) % len) as *mut u8).write(2) };
+                        }
+                        let started = std::time::Instant::now();
+                        counted = ask(0, len, reset);
+                        total += started.elapsed();
+                        if reset == 0 {
+                            ask(0, len, 1);
+                        }
+                    }
+                    println!(
+                        "{name:>8}, {dirty:2} pages written ({counted} found), {}: {:.2} us an asking",
+                        if reset == 1 { "with reset" } else { "no reset  " },
+                        total.as_secs_f64() * 1e6 / f64::from(TIMES)
+                    );
+                }
+            }
+        }
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
 
     #[test]

@@ -166,6 +166,9 @@ pub extern "system" fn XMemVirtualAlloc(
         // The GPU side may take what is not mapped there for absent until
         // a view is mapped (`map`, which tells it).
         victory_gpu::title_memory_placeholder(at as usize, size);
+    } else if !at.is_null() {
+        // Ordinary memory: no placeholder of ours is there (any more).
+        victory_gpu::title_memory_reserved(at as usize, size);
     }
     at
 }

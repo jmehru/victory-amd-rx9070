@@ -1089,9 +1089,63 @@ pub(crate) fn take_snapshots() {
     wide(copy_jobs(snaps));
 }
 
+/// Whether snapshots are written past the processor's cache
+/// (`VICTORY_SNAPSHOT_STREAM=0`: with the ordinary copy, as before).
+///
+/// A submission's snapshots are some 84 MB a frame in the first scene,
+/// several times the cache, and are next read after the card has run, by
+/// the compare: an ordinary store first reads each line of the snapshot
+/// into the cache only to overwrite it, a third of the memory traffic of
+/// the copy, which is bound by that traffic (6.4 ms a frame on four
+/// threads, run n3p).
+fn stream_snapshots() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SNAPSHOT_STREAM").is_none_or(|v| v != "0"))
+}
+
+/// Copies `len` bytes with stores that go past the cache (short copies:
+/// the ordinary way).
+///
+/// # Safety
+/// As `std::ptr::copy_nonoverlapping`.
+unsafe fn copy_streamed(src: *const u8, dst: *mut u8, len: usize) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: the caller's ranges; every load and store is inside them (the
+    // stores to addresses on 16 bytes, after the unaligned head).
+    unsafe {
+        use core::arch::x86_64::{_mm_loadu_si128, _mm_sfence, _mm_stream_si128};
+        if len < 16 << 10 {
+            std::ptr::copy_nonoverlapping(src, dst, len);
+            return;
+        }
+        let head = dst.align_offset(64).min(len);
+        std::ptr::copy_nonoverlapping(src, dst, head);
+        let (mut s, mut d, mut left) = (src.add(head), dst.add(head), len - head);
+        while left >= 64 {
+            let a = _mm_loadu_si128(s.cast());
+            let b = _mm_loadu_si128(s.add(16).cast());
+            let c = _mm_loadu_si128(s.add(32).cast());
+            let e = _mm_loadu_si128(s.add(48).cast());
+            _mm_stream_si128(d.cast(), a);
+            _mm_stream_si128(d.add(16).cast(), b);
+            _mm_stream_si128(d.add(32).cast(), c);
+            _mm_stream_si128(d.add(48).cast(), e);
+            (s, d, left) = (s.add(64), d.add(64), left - 64);
+        }
+        _mm_sfence();
+        std::ptr::copy_nonoverlapping(s, d, left);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    // SAFETY: the caller's.
+    unsafe {
+        std::ptr::copy_nonoverlapping(src, dst, len)
+    }
+}
+
 /// `copies` (from, to, bytes) as pieces of work of about [`WIDE_JOB`]
 /// bytes each: long ones cut, short ones together.
 fn copy_jobs(copies: Vec<(usize, usize, usize)>) -> Vec<Job> {
+    let stream = stream_snapshots();
     let mut jobs: Vec<Job> = Vec::new();
     let mut group: Vec<(usize, usize, usize)> = Vec::new();
     let mut bytes = 0;
@@ -1102,7 +1156,13 @@ fn copy_jobs(copies: Vec<(usize, usize, usize)>) -> Vec<Job> {
                 for (src, dst, len) in group {
                     // SAFETY: the caller's ranges: a host copy's mapping and
                     // its snapshot, which do not overlap.
-                    unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
+                    unsafe {
+                        if stream {
+                            copy_streamed(src as *const u8, dst as *mut u8, len);
+                        } else {
+                            std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len);
+                        }
+                    }
                 }
             }));
         }
@@ -1285,6 +1345,66 @@ mod wide_tests {
 
     /// Copies cut into jobs copy every byte once: long ones, short ones
     /// and empty ones.
+    #[test]
+    fn a_streamed_copy_copies_the_same_bytes() {
+        let from: Vec<u8> = (0..(3usize << 20) + 77).map(|i| (i * 31 % 251) as u8).collect();
+        for (at, len) in [(0, 0), (1, 15), (3, 16 << 10), (5, (16 << 10) + 1), (7, (1 << 20) + 63), (0, from.len())] {
+            let mut to = vec![0xAAu8; len + 130];
+            // SAFETY: `len` bytes inside both; the rest of `to` is checked untouched.
+            unsafe { super::copy_streamed(from.as_ptr().add(at), to.as_mut_ptr().add(65), len) };
+            assert!(to[..65].iter().all(|&b| b == 0xAA) && to[65 + len..].iter().all(|&b| b == 0xAA));
+            assert_eq!(&to[65..65 + len], &from[at..at + len]);
+        }
+    }
+
+    /// What a snapshot's copy costs each way on this machine
+    /// (`cargo test --release -p victory-gpu --lib snapshot_copy_costs -- --ignored --nocapture`).
+    /// On the Ryzen 5 7600 (2026-11-25), 96 MB in pieces of 1 MiB: one
+    /// thread 13-17 GB/s ordinary and 22-24 streamed, four threads 19-20
+    /// ordinary and 26-27 streamed.
+    #[test]
+    #[ignore = "a measurement, not a check"]
+    fn snapshot_copy_costs() {
+        const SIZE: usize = 96 << 20;
+        let from = vec![3u8; SIZE];
+        let mut to = vec![0u8; SIZE];
+        for threads in [1usize, 4] {
+            for streamed in [false, true, false, true] {
+                let started = std::time::Instant::now();
+                const TIMES: usize = 6;
+                for _ in 0..TIMES {
+                    let (src, dst) = (from.as_ptr() as usize, to.as_mut_ptr() as usize);
+                    std::thread::scope(|scope| {
+                        for t in 0..threads {
+                            scope.spawn(move || {
+                                let mut at = t << 20;
+                                while at < SIZE {
+                                    // SAFETY: a megabyte of each, no two threads the same.
+                                    unsafe {
+                                        if streamed {
+                                            super::copy_streamed((src + at) as *const u8, (dst + at) as *mut u8, 1 << 20);
+                                        } else {
+                                            std::ptr::copy_nonoverlapping((src + at) as *const u8, (dst + at) as *mut u8, 1 << 20);
+                                        }
+                                    }
+                                    at += threads << 20;
+                                }
+                            });
+                        }
+                    });
+                }
+                let secs = started.elapsed().as_secs_f64() / TIMES as f64;
+                println!(
+                    "{threads} threads, {}: {:.1} ms for 96 MB, {:.1} GB/s",
+                    if streamed { "streamed" } else { "ordinary" },
+                    secs * 1e3,
+                    SIZE as f64 / secs / 1e9
+                );
+            }
+        }
+        assert_eq!(to[SIZE - 1], 3);
+    }
+
     #[test]
     fn copies_cut_into_jobs_copy_the_same_bytes() {
         let len = 3 * WIDE_JOB + 12345;
