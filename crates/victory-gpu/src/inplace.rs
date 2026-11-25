@@ -248,9 +248,19 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     // View memory: known from the runtime without asking Windows.
     let covered = match cover(start as usize, len as usize) {
         Cover::Holes | Cover::None if gaps() && views_in_place() => {
-            match linear_in(&views().views, start as usize, len as usize) {
-                Some((section, offset)) => Cover::Run(section, offset),
-                None => cover(start as usize, len as usize),
+            // (Asked in a statement of its own: the lock on the views is
+            // let go before `cover` below takes it again. Inside the match
+            // it was held, and the thread waited for itself.)
+            let linear = linear_in(&views().views, start as usize, len as usize);
+            match linear {
+                Some((section, offset)) if no_private(start as usize, len as usize) => {
+                    static SAID: AtomicU64 = AtomicU64::new(0);
+                    if SAID.fetch_add(1, Ordering::Relaxed) < 64 {
+                        tracing::info!(start = format_args!("{start:#x}"), len, section, offset, window, regions = %regions_of(start as usize, len as usize), "title memory with holes placed along one run");
+                    }
+                    Cover::Run(section, offset)
+                }
+                _ => cover(start as usize, len as usize),
             }
         }
         other => other,
@@ -695,6 +705,30 @@ fn linear_in(views: &BTreeMap<usize, (usize, usize, u64)>, at: usize, len: usize
     }
     let (section, of_at) = run?;
     u64::try_from(of_at).ok().map(|offset| (section, offset))
+}
+
+/// Whether no byte of `[at, at + len)` is committed private memory: with
+/// [`gaps`], what lies between the views must be nothing. A range that
+/// begins in the title's private memory and reaches a view was placed as
+/// that view's section, and its shaders read the section's bytes where the
+/// title's own stood (the title stopped in its menus, twice of two runs).
+fn no_private(at: usize, len: usize) -> bool {
+    let end = at.saturating_add(len.max(1));
+    let mut now = at;
+    while now < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { mem::VirtualQuery(now as *const c_void, &mut info, size_of_val(&info)) };
+        if n == 0 || info.RegionSize == 0 {
+            return false;
+        }
+        if info.State == mem::MEM_COMMIT && info.Type == mem::MEM_PRIVATE {
+            return false;
+        }
+        now = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+    }
+    true
 }
 
 /// Whether `[at, at + len)` is private memory, all committed and
