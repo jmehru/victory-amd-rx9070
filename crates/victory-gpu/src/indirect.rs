@@ -465,6 +465,7 @@ fn record_clamp_at(
     ];
     let skip = usize::from(!waits);
     unsafe {
+        let timed = crate::host::card_time_begin(l, 8);
         // Earlier shader writes (the title's argument and count passes) first.
         l.ResourceBarrier(&first[skip..]);
         if records > 0 {
@@ -478,6 +479,7 @@ fn record_clamp_at(
             l.Dispatch(records.div_ceil(64), 1, 1);
         }
         l.ResourceBarrier(&second[skip..]);
+        crate::host::card_time_end(l, timed);
     }
     true
 }

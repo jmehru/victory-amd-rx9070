@@ -353,7 +353,28 @@ struct Views {
     shape_index: std::collections::BTreeMap<Shape, u32>,
 }
 
-static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
+/// Whether the threads that record lists read what they share without
+/// keeping one another out (on by default; `VICTORY_RECORD_SHARED=0`: one
+/// at a time, as before).
+///
+/// A draw's tables are made ready by the thread that records it: for every
+/// slot it reads the view the title wrote there ([`view_at`]), asks whether
+/// the host slot shows it already (`host::HostHeap::mirror`) and finds the
+/// host copies of the buffers it views (`crate::shadow::find`). Each of
+/// those was behind one lock for all threads, taken for every slot of
+/// every draw, though nearly every asking only reads: the title's five
+/// recording threads waited 75 ms a frame between them for locks of ours
+/// (run T1: 25 ms for the host heap's slots, 14 ms for the copies' map,
+/// 12 ms for the resources the slots keep, 6 ms for the views), and the
+/// thread that submits waited 14.5 ms a frame for them. Reads now share
+/// their locks, a slot already made is found without one, and the
+/// resources kept are locked slot by slot.
+pub(crate) fn record_shared() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RECORD_SHARED").is_none_or(|v| v != "0"))
+}
+
+static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     list: Vec::new(),
     index: std::collections::BTreeMap::new(),
     by_resource: std::collections::BTreeMap::new(),
@@ -522,7 +543,7 @@ fn words_for(view: View) -> [u32; 2] {
             View::Placed(unordered, resource, desc) => {
                 let (shape, address) = shape_of(*unordered, resource, desc);
                 if address >> PLACED_ADDRESS_BITS == 0 {
-                    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
                     if let Some(shape) = views.shape(shape) {
                         NAMED_WHOLE[1].fetch_add(1, Relaxed);
                         return placed_words(shape, address);
@@ -532,7 +553,7 @@ fn words_for(view: View) -> [u32; 2] {
             _ => {}
         }
     }
-    VIEWS.lock().unwrap_or_else(|e| e.into_inner()).entry(view)
+    VIEWS.write().unwrap_or_else(|e| e.into_inner()).entry(view)
 }
 
 /// For the memory line: the distinct views kept ([`Views`]), those of them
@@ -546,7 +567,7 @@ fn words_for(view: View) -> [u32; 2] {
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn views_kept() -> [u64; 8] {
     use std::sync::atomic::Ordering::Relaxed;
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
     let each = size_of::<(View, u32)>() as u64;
     let shape = size_of::<Shape>() as u64;
     let (mut constants, mut placed) = (0, 0);
@@ -697,7 +718,7 @@ pub(crate) fn forget(resource: usize) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&resource);
-    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
     let Some(entries) = views.by_resource.remove(&resource) else {
         return;
     };
@@ -772,13 +793,19 @@ pub(crate) fn record_entry(record: [u32; 3]) -> Option<u32> {
 /// whole, or the view of entry `i` if `generation` is still its own.
 fn view_at(i: u32, generation: u32) -> Option<View> {
     match generation >> KIND_SHIFT {
+        0 if record_shared() => {
+            let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+            let (view, current) = views.list.get(i as usize)?;
+            (*current == generation).then(|| view.clone())
+        }
         0 => {
-            let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+            let views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
             let (view, current) = views.list.get(i as usize)?;
             (*current == generation).then(|| view.clone())
         }
         CONSTANT => Some(constant_of(i, generation)),
-        PLACED => VIEWS.lock().unwrap_or_else(|e| e.into_inner()).placed_of(i, generation),
+        PLACED if record_shared() => VIEWS.read().unwrap_or_else(|e| e.into_inner()).placed_of(i, generation),
+        PLACED => VIEWS.write().unwrap_or_else(|e| e.into_inner()).placed_of(i, generation),
         _ => None,
     }
 }
@@ -1155,8 +1182,8 @@ mod tests {
             View::Placed(_, r, _) => *r == resource,
             _ => false,
         };
-        let entries = || VIEWS.lock().unwrap().list.iter().filter(|(v, _)| mine(v)).count();
-        let shapes = || VIEWS.lock().unwrap().shapes.iter().filter(|s| s.1 == resource).count();
+        let entries = || VIEWS.read().unwrap().list.iter().filter(|(v, _)| mine(v)).count();
+        let shapes = || VIEWS.read().unwrap().shapes.iter().filter(|s| s.1 == resource).count();
         for n in 0..20_000u64 {
             let address = 0x6_0000_0000 + n * 0x100;
             create_cbv(null, &[address as u32, (address >> 32) as u32, 512, 0], at);

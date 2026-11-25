@@ -71,7 +71,20 @@ unsafe impl Sync for Host {}
 /// releases reach the host at once, from its own threads, while the host
 /// runs a submission: freeing there is a GPU page fault on the freed
 /// texture (a device hang).
-static RETIRED: Mutex<Vec<(u64, Retired)>> = Mutex::new(Vec::new());
+/// What waits for running submissions to finish before it is dropped, in
+/// several lists: a thread adds to the one of its own (the title's five
+/// recording threads retire a slot's old resource at every slot they make,
+/// and waited 10 ms a frame between them for the one list, run R1).
+static RETIRED: [Mutex<Vec<(u64, Retired)>>; 16] = [const { Mutex::new(Vec::new()) }; 16];
+
+/// The list of [`RETIRED`] the calling thread adds to.
+fn retired() -> &'static Mutex<Vec<(u64, Retired)>> {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    thread_local! {
+        static MINE: usize = NEXT.fetch_add(1, Ordering::Relaxed) % RETIRED.len();
+    }
+    &RETIRED[MINE.with(|mine| *mine)]
+}
 /// Submissions started and finished (waited for).
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -231,7 +244,7 @@ pub(crate) fn retire<T: 'static>(object: T) {
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    RETIRED
+    retired()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push((started, Retired(Box::new(object))));
@@ -245,7 +258,7 @@ pub(crate) fn retire<T: 'static>(object: T) {
 pub(crate) fn retire_after<T: 'static>(object: T, more: u64) {
     let started = STARTED.load(Ordering::Acquire);
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    RETIRED
+    retired()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push((started + more, Retired(Box::new(object))));
@@ -253,18 +266,21 @@ pub(crate) fn retire_after<T: 'static>(object: T, more: u64) {
 
 /// Drops what waited for submissions up to `finished`.
 fn bury(finished: u64) {
-    let done: Vec<(u64, Retired)> = {
-        let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
-        if retired.is_empty() {
-            return;
-        }
-        let (done, keep) = std::mem::take(&mut *retired)
-            .into_iter()
-            .partition(|(at, _)| *at <= finished);
-        *retired = keep;
-        done
-    };
-    drop(done);
+    for list in &RETIRED {
+        let done: Vec<(u64, Retired)> = {
+            let mut retired = list.lock().unwrap_or_else(|e| e.into_inner());
+            if retired.is_empty() {
+                continue;
+            }
+            let (done, keep) = std::mem::take(&mut *retired)
+                .into_iter()
+                .partition(|(at, _)| *at <= finished);
+            *retired = keep;
+            done
+        };
+        // Dropped outside the lock.
+        drop(done);
+    }
 }
 
 /// Objects [`retire`] dropped at once (no submission was running) and
@@ -1698,8 +1714,12 @@ unsafe impl Send for CardTimes {}
 // SAFETY: as above.
 unsafe impl Sync for CardTimes {}
 
-const TIME_PAIRS: u32 = 1 << 15;
-const TIME_KINDS: [&str; 9] = [
+const TIME_PAIRS: u32 = 1 << 18;
+
+/// Transitions of host copies of title buffers recorded into the title's
+/// lists between two of their commands, since the start.
+pub(crate) static BUFFER_MOVES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const TIME_KINDS: [&str; 10] = [
     "the title's lists",
     "state preludes",
     "passes by mask",
@@ -1708,6 +1728,7 @@ const TIME_KINDS: [&str; 9] = [
     "fills",
     "compares",
     "the relay's fetches",
+    "argument clamps (inside the title's lists)",
     "other",
 ];
 /// The next pair of timestamps to hand out, and the next to read.
@@ -1716,7 +1737,7 @@ static TIME_KIND: [std::sync::atomic::AtomicU8; TIME_PAIRS as usize] = [const { 
 
 /// [`card_times`]: a timestamp where `list` stands, the start of a part of
 /// `kind` ([`TIME_KINDS`]); to be ended by [`card_time_end`].
-fn card_time_begin(list: &ID3D12GraphicsCommandList, kind: u8) -> Option<u64> {
+pub(crate) fn card_time_begin(list: &ID3D12GraphicsCommandList, kind: u8) -> Option<u64> {
     let times = card_times()?;
     let pair = TIME_NEXT[0].fetch_add(1, Ordering::Relaxed);
     let slot = (pair % u64::from(TIME_PAIRS)) as u32;
@@ -1726,7 +1747,7 @@ fn card_time_begin(list: &ID3D12GraphicsCommandList, kind: u8) -> Option<u64> {
     Some(pair)
 }
 
-fn card_time_end(list: &ID3D12GraphicsCommandList, pair: Option<u64>) {
+pub(crate) fn card_time_end(list: &ID3D12GraphicsCommandList, pair: Option<u64>) {
     let (Some(times), Some(pair)) = (card_times(), pair) else {
         return;
     };
@@ -1744,7 +1765,7 @@ fn card_times_line(frames: f64) {
     let Some(times) = card_times() else {
         return;
     };
-    const LAG: u64 = 6000;
+    const LAG: u64 = 20_000;
     let (next, mut read) = (TIME_NEXT[0].load(Ordering::Relaxed), TIME_NEXT[1].load(Ordering::Relaxed));
     let until = next.saturating_sub(LAG);
     read = read.max(until.saturating_sub(u64::from(TIME_PAIRS) - LAG));
@@ -1769,7 +1790,10 @@ fn card_times_line(frames: f64) {
         let kind = (TIME_KIND[slot].load(Ordering::Relaxed) as usize).min(TIME_KINDS.len() - 1);
         sums[kind] += b - a;
         counts[kind] += 1;
-        spans[usize::from(kind != 0)].push((a, b));
+        // (The clamps run inside the title's lists: not a span of their own.)
+        if kind != 8 {
+            spans[usize::from(kind != 0)].push((a, b));
+        }
     }
     TIME_NEXT[1].store(until, Ordering::Relaxed);
     let ms = |ticks: u64| ticks as f64 * 1e3 / times.frequency as f64 / frames.max(1.0);
@@ -1795,12 +1819,16 @@ fn card_times_line(frames: f64) {
             text.push_str(&format!(" {} {:.2} ms in {:.1};", TIME_KINDS[k], ms(sums[k]), counts[k] as f64 / frames.max(1.0)));
         }
     }
+    static MOVES_THEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let moves = BUFFER_MOVES.load(Ordering::Relaxed);
+    let moved = moves - MOVES_THEN.swap(moves, Ordering::Relaxed);
     tracing::info!(
-        "the card's time per frame by list (VICTORY_CARD_TIMES=1, {:.0} frames):{text} some list of the title's running {:.2} ms, of ours {:.2} ms, of either {:.2} ms",
+        "the card's time per frame by list (VICTORY_CARD_TIMES=1, {:.0} frames):{text} some list of the title's running {:.2} ms, of ours {:.2} ms, of either {:.2} ms; {:.0} transitions of buffer copies between commands",
         frames,
         ms(title),
         ms(ours),
-        ms(either)
+        ms(either),
+        moved as f64 / frames.max(1.0)
     );
 }
 
@@ -5639,6 +5667,7 @@ impl HostList {
                 D3D12_RESOURCE_STATES(before as i32),
                 D3D12_RESOURCE_STATES(wanted as i32),
             );
+            BUFFER_MOVES.fetch_add(1, Ordering::Relaxed);
             // SAFETY: an open list and a buffer the list holds.
             unsafe { self.list.ResourceBarrier(&[barrier]) };
         }
