@@ -1916,7 +1916,7 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
 /// MB in use of a budget of 13,879, 156 blocks, 1,173 MB of them in pieces
 /// let go; 7,316 textures still waiting at the end against 137 without),
 /// and the room came out black, without the window's glass or with broken
-/// posters, in 14 of 15 runs. Made each on its own the textures in use stay
+/// posters, in 13 of 14 runs. Made each on its own the textures in use stay
 /// near 10,200 MB of the card's memory and the system keeps as much again
 /// in the PC's.
 #[cfg(windows)]
