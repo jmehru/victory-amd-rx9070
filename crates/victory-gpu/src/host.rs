@@ -912,7 +912,7 @@ impl std::ops::Deref for Recorded {
 }
 
 /// Whether a list of the title's that nothing was recorded into is left out
-/// of its submission (`VICTORY_SKIP_EMPTY_LISTS=1`; off). What the list
+/// of its submission (`VICTORY_SKIP_EMPTY_LISTS=0`: run too). What the list
 /// defers to its submission (waits, values written when it has run, fills)
 /// is done all the same.
 ///
@@ -923,7 +923,7 @@ impl std::ops::Deref for Recorded {
 /// draw more than one list of 10,000).
 fn skip_empty() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_SKIP_EMPTY_LISTS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SKIP_EMPTY_LISTS").is_none_or(|v| v != "0"))
 }
 
 /// Lists of the title's closed since the last frame line: all, and those
@@ -7171,7 +7171,7 @@ impl Meter {
         {
             let [all, untouched] = [0, 1].map(|i| CLOSED[i].swap(0, Ordering::Relaxed) as f64 / frames);
             tracing::info!(
-                "lists of the title's closed per frame: {all:.1}, {untouched:.1} of them with nothing recorded into them (VICTORY_SKIP_EMPTY_LISTS=1 leaves those out of their submissions)"
+                "lists of the title's closed per frame: {all:.1}, {untouched:.1} of them with nothing recorded into them (left out of their submissions; VICTORY_SKIP_EMPTY_LISTS=0 runs them)"
             );
         }
         {
