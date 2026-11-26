@@ -158,6 +158,58 @@ fn mask_of(at: usize, len: usize, runs: &[(usize, usize)]) -> Vec<u32> {
     mask
 }
 
+/// The mask of the bytes where `now` differs from `was` (a bit a byte, as
+/// [`mask_of`] at a piece that starts on a word), the runs of such bytes and
+/// their number: 32 bytes a compare (`VICTORY_MASK_WIDE=1`; off, no gain
+/// shown. Unset, or on a processor without AVX2: `None`, and the runs are
+/// listed as before).
+fn diff_mask(now: &[u8], was: &[u8]) -> Option<(Vec<u32>, usize, usize)> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_MASK_WIDE").is_some_and(|v| v == "1") && std::is_x86_feature_detected!("avx2")) {
+            return None;
+        }
+        let n = now.len().min(was.len());
+        let mut mask = vec![0u32; n.div_ceil(32)];
+        // SAFETY: the processor has AVX2 (asked above).
+        unsafe { diff_mask_wide(&now[..n], &was[..n], &mut mask) };
+        let (mut runs, mut bytes, mut carry) = (0usize, 0usize, 0u32);
+        for &m in &mask {
+            bytes += m.count_ones() as usize;
+            runs += (m & !(m << 1 | carry)).count_ones() as usize;
+            carry = m >> 31;
+        }
+        Some((mask, runs, bytes))
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (now, was);
+        None
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn diff_mask_wide(now: &[u8], was: &[u8], mask: &mut [u32]) {
+    use std::arch::x86_64::{_mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8};
+    let n = now.len();
+    let whole = n / 32;
+    for (i, m) in mask.iter_mut().enumerate().take(whole) {
+        // SAFETY: 32 bytes inside both slices.
+        unsafe {
+            let a = _mm256_loadu_si256(now.as_ptr().add(32 * i).cast());
+            let b = _mm256_loadu_si256(was.as_ptr().add(32 * i).cast());
+            *m = !(_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, b)) as u32);
+        }
+    }
+    for j in whole * 32..n {
+        if now[j] != was[j] {
+            mask[j / 32] |= 1 << (j % 32);
+        }
+    }
+}
+
 /// The runs of bytes (offsets in the copy) a mask names: for a piece that
 /// goes up run by run after all.
 pub(crate) fn mask_runs(masked: &Masked) -> Vec<(usize, usize)> {
@@ -1676,6 +1728,33 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
 mod merge_tests {
     use super::{PIECE, back_piece, changed_runs};
 
+    /// The mask made by the wide compare is the mask of the runs listed
+    /// byte by byte, with their number and bytes, at lengths with and
+    /// without a tail.
+    #[test]
+    fn the_wide_mask_is_the_mask_of_the_runs() {
+        for n in [1usize, 31, 32, 33, 64, 4096, 65536, 65536 - 5] {
+            let was: Vec<u8> = (0..n).map(|i| (i * 13 + i / 97) as u8).collect();
+            let mut now = was.clone();
+            let mut x = 12345u32;
+            for _ in 0..n / 7 + 1 {
+                x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+                let at = x as usize % n;
+                let len = (x >> 20) as usize % 40;
+                for b in &mut now[at..(at + len).min(n)] {
+                    *b ^= 0x5a;
+                }
+            }
+            let runs = changed_runs(&now, &was);
+            let Some((mask, count, bytes)) = super::diff_mask(&now, &was) else {
+                return;
+            };
+            assert_eq!(mask, super::mask_of(0, n, &runs), "length {n}");
+            assert_eq!(count, runs.len(), "length {n}");
+            assert_eq!(bytes, runs.iter().map(|r| r.1).sum::<usize>(), "length {n}");
+        }
+    }
+
     /// A piece put back takes the GPU's bytes where the copy changed and
     /// the title's everywhere else, reads and writes title memory only from
     /// the first change to the last, and its scratch holds that stretch and
@@ -2663,6 +2742,37 @@ impl Shadow {
                     // SAFETY: inside the mapping of the copy's CPU side,
                     // which only the submitting thread writes.
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+                    // Many runs (a page of the world buffer holds some 900
+                    // of ten bytes): the mask the piece goes up by is made
+                    // by the compare itself, 32 bytes at a time, and the
+                    // runs are counted from it, not listed.
+                    if card_masks()
+                        && at & 3 == 0
+                        && let Some(card) = &self.card
+                        && let Some((mask, runs, bytes)) = diff_mask(title, held)
+                        && runs > MASK_RUNS
+                    {
+                        if *runs_left == 0 {
+                            return settle_why(2, self.start, self.len);
+                        }
+                        *runs_left -= 1;
+                        MASKED[0].fetch_add(1, Ordering::Relaxed);
+                        MASKED[1].fetch_add(runs as u64, Ordering::Relaxed);
+                        held.copy_from_slice(title);
+                        MERGED[1].fetch_add(runs as u64, Ordering::Relaxed);
+                        MERGED[2].fetch_add(bytes as u64, Ordering::Relaxed);
+                        let _dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+                        card.masked.lock().unwrap_or_else(|e| e.into_inner()).push((at, n, Arc::new(mask)));
+                        drop(_dirty);
+                        drop(before);
+                        if (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
+                            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                            if let Some(at) = copied.get_mut(page - base) {
+                                *at = now;
+                            }
+                        }
+                        continue;
+                    }
                     let mut runs = changed_runs(title, held);
                     // Many runs: the piece goes up by its mask, one pass
                     // on the card whatever their number.

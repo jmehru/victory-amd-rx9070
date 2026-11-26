@@ -2925,20 +2925,40 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
 /// the title's bytes there would reach the card a submission late.
 fn stale_under_flights(runs: &[&HostList]) -> bool {
     use std::sync::Arc;
-    // Per copy, the span of what is refreshed (a flush brings that much
-    // up to date at most).
-    let mut spans: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+    // Per copy, the ranges that are refreshed, joined where less than a
+    // page apart (`VICTORY_LATE_UNION=1`; off, no gain shown: runs um1, um2
+    // against uo1, uo2. Else their span, which a
+    // flush brings up to date at most: a range shaders may write that lies
+    // between two refreshed ones and that no list of these reads was then
+    // read from title memory and compared all the same).
+    static UNION: OnceLock<bool> = OnceLock::new();
+    let union = *UNION.get_or_init(|| std::env::var_os("VICTORY_LATE_UNION").is_some_and(|v| v == "1"));
+    let mut copies: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
     for list in runs {
         for step in &list.deferred().copies {
             if let Step::Refresh(shadow, address, len) = step
                 && shadow.writes_pending()
             {
-                match spans.iter_mut().find(|s| Arc::ptr_eq(&s.0, shadow)) {
-                    Some(s) => (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len)),
-                    None => spans.push((shadow.clone(), *address, *address + *len)),
+                match copies.iter_mut().find(|s| Arc::ptr_eq(&s.0, shadow)) {
+                    Some(s) => s.1.push((*address, *address + *len)),
+                    None => copies.push((shadow.clone(), vec![(*address, *address + *len)])),
                 }
             }
         }
+    }
+    let mut spans: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+    for (shadow, mut ranges) in copies {
+        ranges.sort_unstable();
+        let mut at = ranges[0];
+        for &(from, to) in &ranges[1..] {
+            if !union || from < at.1 + 65536 {
+                at.1 = at.1.max(to);
+            } else {
+                spans.push((shadow.clone(), at.0, at.1));
+                at = (from, to);
+            }
+        }
+        spans.push((shadow, at.0, at.1));
     }
     if late_exact() {
         // The title's bytes are put in beside the flights' writes; a
