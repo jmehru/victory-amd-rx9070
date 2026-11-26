@@ -872,6 +872,32 @@ const BATCHES: u32 = 8;
 /// records, and for records clamped alone.
 static SCRATCH_MADE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// Scratch buffers of batched clamps (all of one size, in the common state)
+/// that lists let go of with themselves: taken by the next list that needs
+/// one (`VICTORY_BUFFER_POOL=0`: made anew). A frame has some 410 lists and
+/// 128 are kept idle at most, so the rest were made with new buffers: 7 a
+/// frame (run r1), 5 thread-ms a frame of the recording threads.
+static SCRATCH_FREE: Mutex<Vec<ID3D12Resource>> = Mutex::new(Vec::new());
+
+impl Drop for HostList {
+    fn drop(&mut self) {
+        if !crate::texture::buffers_pooled() {
+            return;
+        }
+        // (A list is let go when it has run, or was never sent: its last
+        // recording left the buffers in the common state.)
+        let args = self.batch_args.get_mut().unwrap_or_else(|e| e.into_inner());
+        if args.1 == 0 && !args.0.is_empty() {
+            let mut free = SCRATCH_FREE.lock().unwrap_or_else(|e| e.into_inner());
+            while free.len() < 256
+                && let Some(buffer) = args.0.pop()
+            {
+                free.push(buffer);
+            }
+        }
+    }
+}
+
 /// Batched clamp passes recorded since the last frame line.
 pub(crate) static BATCH_PASSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -6119,8 +6145,14 @@ impl HostList {
         let (buffer, i) = ((args.1 / BATCHES) as usize, args.1 % BATCHES);
         if buffer == args.0.len() {
             let size = u64::from(BATCHES * JOBS * SLOT);
-            let made = host()?.uav_buffer(size)?;
-            SCRATCH_MADE[0].fetch_add(1, Ordering::Relaxed);
+            let free = SCRATCH_FREE.lock().unwrap_or_else(|e| e.into_inner()).pop();
+            let made = match free {
+                Some(free) => free,
+                None => {
+                    SCRATCH_MADE[0].fetch_add(1, Ordering::Relaxed);
+                    host()?.uav_buffer(size)?
+                }
+            };
             name(&made, || format!("indirect batches {size:#x}"));
             args.0.push(made);
         }
