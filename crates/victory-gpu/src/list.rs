@@ -2070,9 +2070,10 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     #[cfg(all(windows, feature = "diagnostics"))]
     if count > 0 {
         crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
-        if crate::copystat::barrier_test() & 1 != 0 {
-            return;
-        }
+    }
+    #[cfg(windows)]
+    if count > 0 && crate::indirect::barrier_test() & 1 != 0 {
+        return;
     }
     #[cfg(windows)]
     if count > 0

@@ -443,10 +443,7 @@ fn record_clamp_at(
     // waits for every earlier shader write out (the state changes stay).
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
-    #[cfg(feature = "diagnostics")]
-    let waits = crate::copystat::barrier_test() & 2 == 0;
-    #[cfg(not(feature = "diagnostics"))]
-    let waits = true;
+    let waits = barrier_test() & 2 == 0;
     let first = [
         uav_barrier(),
         transition(
@@ -510,6 +507,19 @@ fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
             D3D12_RESOURCE_STATE_COMMON,
         )])
     };
+}
+
+/// `VICTORY_BARRIER_TEST` in every build (the diagnostics' report reads the same
+/// switch): bit 0 for `groups`, bit 1 for `indirect`, both for `both`. For timing
+/// only: without the waits a shader may read what another has not finished writing.
+pub(crate) fn barrier_test() -> u8 {
+    static TEST: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *TEST.get_or_init(|| match std::env::var("VICTORY_BARRIER_TEST").as_deref() {
+        Ok("groups") => 1,
+        Ok("indirect") => 2,
+        Ok("both") => 3,
+        _ => 0,
+    })
 }
 
 fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
@@ -1468,9 +1478,33 @@ void work() {
 }
 "#;
 
+    /// A compute pass that writes one draw record (three vertices, one
+    /// instance), as our clamp writes the record an indirect command reads.
+    const FILL: &str = r#"
+#define RS "UAV(u0)"
+RWByteAddressBuffer record : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void fill() {
+    record.Store4(0, uint4(3, 1, 0, 0));
+}
+"#;
+
     /// What changes between every two draws of a batch.
     #[derive(Clone, Copy, PartialEq)]
     enum Between {
+        /// Nothing, and the draw is an indirect execution of one record
+        /// that nothing writes.
+        Indirect,
+        /// The record is written by a compute pass of ours before every
+        /// draw, which is an indirect execution of it: the clamp as the
+        /// layer records it (two waits for earlier shader writes, the
+        /// record's buffer moved to shader writes, to arguments and back)
+        /// when the flag is set, without the two waits when it is not.
+        Clamped(bool),
+        /// One such pass before every sixteenth draw; the fifteen after it
+        /// execute the same record (a window).
+        Window,
         /// Nothing.
         Nothing,
         /// The pipeline: two alternate.
@@ -1502,6 +1536,12 @@ void work() {
         pipelines: [ID3D12PipelineState; 2],
         work_root: ID3D12RootSignature,
         work: ID3D12PipelineState,
+        fill: ID3D12PipelineState,
+        signature: ID3D12CommandSignature,
+        /// A record nothing writes after the first list, and one the
+        /// clamp-like pass writes.
+        fixed: ID3D12Resource,
+        record: ID3D12Resource,
         words: ID3D12Resource,
         other: ID3D12Resource,
         depth: ID3D12Resource,
@@ -1654,6 +1694,7 @@ void work() {
                 compile(DRAW, s!("second"), s!("ps_5_1")).ok()?,
             ];
             let cs = compile(WORK, s!("work"), s!("cs_5_1")).ok()?;
+            let fill_cs = compile(FILL, s!("fill"), s!("cs_5_1")).ok()?;
             // SAFETY: plain object creation on a device of our own; the
             // views are made in heaps that live as long as the rig.
             unsafe {
@@ -1703,6 +1744,49 @@ void work() {
                         ..Default::default()
                     })
                     .ok()?;
+
+                let fill: ID3D12PipelineState = device
+                    .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                        pRootSignature: std::mem::transmute_copy(&work_root),
+                        CS: D3D12_SHADER_BYTECODE {
+                            pShaderBytecode: fill_cs.as_ptr().cast(),
+                            BytecodeLength: fill_cs.len(),
+                        },
+                        ..Default::default()
+                    })
+                    .ok()?;
+                let argument = D3D12_INDIRECT_ARGUMENT_DESC {
+                    Type: D3D12_INDIRECT_ARGUMENT_TYPE_DRAW,
+                    ..Default::default()
+                };
+                let mut signature: Option<ID3D12CommandSignature> = None;
+                device
+                    .CreateCommandSignature(
+                        &D3D12_COMMAND_SIGNATURE_DESC {
+                            ByteStride: 16,
+                            NumArgumentDescs: 1,
+                            pArgumentDescs: &argument,
+                            NodeMask: 0,
+                        },
+                        None::<&ID3D12RootSignature>,
+                        &mut signature,
+                    )
+                    .ok()?;
+                let signature = signature?;
+                let fixed = buffer(
+                    &device,
+                    64 << 10,
+                    D3D12_HEAP_TYPE_DEFAULT,
+                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                );
+                let record = buffer(
+                    &device,
+                    64 << 10,
+                    D3D12_HEAP_TYPE_DEFAULT,
+                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COMMON,
+                );
 
                 let size = (WIDTH, HEIGHT);
                 let colour = |state| texture(&device, size, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, state);
@@ -1799,6 +1883,16 @@ void work() {
                 list.ClearRenderTargetView(targets[0], &[0.0; 4], None);
                 list.ClearRenderTargetView(targets[1], &[0.0; 4], None);
                 list.ClearDepthStencilView(depth_written, D3D12_CLEAR_FLAG_DEPTH, 1.0, 0, None);
+                // And the record nothing writes afterwards.
+                list.SetComputeRootSignature(&work_root);
+                list.SetPipelineState(&fill);
+                list.SetComputeRootUnorderedAccessView(0, fixed.GetGPUVirtualAddress());
+                list.Dispatch(1, 1, 1);
+                list.ResourceBarrier(&[transition(
+                    &fixed,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                )]);
                 let [first_target, second_target] = target;
                 let mut rig = Rig {
                     queue,
@@ -1811,6 +1905,10 @@ void work() {
                     pipelines,
                     work_root,
                     work,
+                    fill,
+                    signature,
+                    fixed,
+                    record,
                     words,
                     other,
                     depth,
@@ -1904,7 +2002,48 @@ void work() {
                 unsafe {
                     for _ in 0..DRAWS / lists {
                         let odd = (drawn % 2) as usize;
+                        let (common, shader, arguments) = (
+                            D3D12_RESOURCE_STATE_COMMON,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                        );
+                        // The clamp as `bound` records it.
+                        let clamp = |waits: bool| {
+                            let first = [super::uav_barrier(), transition(&self.record, common, shader)];
+                            let second = [super::uav_barrier(), transition(&self.record, shader, arguments)];
+                            let skip = usize::from(!waits);
+                            l.ResourceBarrier(&first[skip..]);
+                            l.SetComputeRootSignature(&self.work_root);
+                            l.SetPipelineState(&self.fill);
+                            l.SetComputeRootUnorderedAccessView(0, self.record.GetGPUVirtualAddress());
+                            l.Dispatch(1, 1, 1);
+                            l.ResourceBarrier(&second[skip..]);
+                            l.SetPipelineState(&self.pipelines[0]);
+                        };
                         match between {
+                            Between::Indirect => {
+                                l.ExecuteIndirect(&self.signature, 1, &self.fixed, 0, None, 0);
+                                drawn += 1;
+                                continue;
+                            }
+                            Between::Clamped(waits) => {
+                                clamp(waits);
+                                l.ExecuteIndirect(&self.signature, 1, &self.record, 0, None, 0);
+                                l.ResourceBarrier(&[transition(&self.record, arguments, common)]);
+                                drawn += 1;
+                                continue;
+                            }
+                            Between::Window => {
+                                if drawn % 16 == 0 {
+                                    clamp(true);
+                                }
+                                l.ExecuteIndirect(&self.signature, 1, &self.record, 0, None, 0);
+                                if drawn % 16 == 15 {
+                                    l.ResourceBarrier(&[transition(&self.record, arguments, common)]);
+                                }
+                                drawn += 1;
+                                continue;
+                            }
                             Between::Nothing => {}
                             Between::Pipeline => l.SetPipelineState(&self.pipelines[odd]),
                             Between::BarrierPair => {
@@ -1993,6 +2132,10 @@ void work() {
             ("(g) nothing changes, in 100 lists run one by one", Between::Nothing, 100),
             ("(h) a compute pass of ours of one group before every draw", Between::Compute, 1),
             ("(i) the same pass between two waits for earlier shader writes", Between::ComputeWithWaits, 1),
+            ("(j) nothing changes, each draw an indirect execution of one record nothing writes", Between::Indirect, 1),
+            ("(k) the record written by a pass of ours before every indirect execution, as the clamp records it", Between::Clamped(true), 1),
+            ("(l) the same without the two waits for earlier shader writes", Between::Clamped(false), 1),
+            ("(m) one such pass for every sixteen indirect executions (a window)", Between::Window, 1),
         ];
         let mut least = Vec::new();
         for (name, between, lists) in variants {
