@@ -317,6 +317,8 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// A pixel program exporting depth and no colour ([`depth_only`]).
+    depth_only: bool,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -1079,6 +1081,37 @@ thread_local! {
     static QUAD_FOR_THIS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// Whether a depth-only pixel program (see [`depth_only`]) takes quad reads
+/// too: off unless `VICTORY_QUAD_DEPTH_ONLY=1`, or the host picked the
+/// program by hash (`VICTORY_QUAD_LIST`).
+fn quad_depth_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    QUAD_FOR_THIS.with(|c| c.get()) == Some(true)
+        || *ON.get_or_init(|| std::env::var_os("VICTORY_QUAD_DEPTH_ONLY").is_some_and(|v| v == "1"))
+}
+
+/// A pixel program that exports depth (`exp mrtz`) and no colour: a
+/// shadow map's, whose picture never reaches the screen. Its quad-local
+/// lane reads go through wave reads, as before ceb0546: the title's lamps'
+/// shadow programs take a depth slope from quad neighbours inside a dither
+/// branch, and with quad reads there the cell's right wall went black
+/// under that lamp's shadow (pixel 9f14b72117e2abec, bisect runs bL6/bL7).
+/// Triangle-edge lines, which the quad reads mend, cannot show in a
+/// shadow map.
+fn depth_only(p: &crate::ir::Program) -> bool {
+    let mut depth = false;
+    for i in p.blocks.iter().flat_map(|b| &b.insts) {
+        if let Fields::Exp { target, src, .. } = &i.fields {
+            match *target {
+                0..=7 if src.iter().any(Option::is_some) => return false,
+                8 => depth = true,
+                _ => {}
+            }
+        }
+    }
+    depth
+}
+
 /// Local (diagnostics of the quad reads): whether the next translations on
 /// this thread take quad reads, whatever `VICTORY_QUAD_HELPERS` says
 /// (`None`: as it says). The host picks programs by hash
@@ -1715,6 +1748,7 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+            depth_only: depth_only(x.p),
         }
     }
 
@@ -4619,7 +4653,7 @@ impl<'a> Lower<'a> {
     /// lane reads from a lane that is not running blacked the cell's right
     /// wall, spotted wall edges and put green blobs in foliage.
     fn helpers_read(&self, quad: bool) -> bool {
-        quad && self.s.pixel && quad_helpers()
+        quad && self.s.pixel && quad_helpers() && (!self.depth_only || quad_depth_only())
     }
 
     /// `x` of the lane of this lane's quad that `lanes` names for each of
