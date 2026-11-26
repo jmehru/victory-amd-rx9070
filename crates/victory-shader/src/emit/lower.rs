@@ -4596,12 +4596,63 @@ impl<'a> Lower<'a> {
     /// that used it took its smallest level, and the triangles' edges showed
     /// as lines on car paint, glass and skin. (Belobug 03629f3.)
     ///
-    /// Off by default (`VICTORY_QUAD_HELPERS=1` turns it on): with it the
-    /// lit wall right of the cell's window went black, and back with the
-    /// wave reads (runs art4h/art6q of 2026-11-25; taking a helper's read
-    /// as the lane's own value did not bring it back, art9w).
+    /// Off by default (`VICTORY_QUAD_HELPERS=1` turns it on), through
+    /// [`Lower::quad_read`]. The lit wall right of the cell's window went
+    /// black with quad reads, in the form of four `QuadReadLaneAt` and
+    /// selects (runs art4h/art6q of 2026-11-25) and in avatarmanz 1c8dd31's
+    /// form of quad operations chosen from the pattern (face2-1).
     fn helpers_read(&self, quad: bool) -> bool {
         quad && self.s.pixel && quad_helpers()
+    }
+
+    /// `x` of the lane of this lane's quad that `lanes` names for each of
+    /// the quad's four, by the host's quad operations (avatarmanz 1c8dd31):
+    /// one `QuadReadLaneAt` with a constant lane when all four read the
+    /// same, else `QuadReadAcrossX`, `Y` or `Diagonal` (and the lane's own
+    /// value) chosen by the lane's place in its quad. In place of
+    /// [`Lower::quad_pick`]'s four reads and selects, which darkened the
+    /// cell's right wall.
+    fn quad_read(&mut self, x: V, lanes: [u8; 4]) -> V {
+        self.s.flags |= flags::WAVE_OPS;
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        if lanes == [0, 1, 2, 3] {
+            return x;
+        }
+        if lanes.iter().all(|&l| l == lanes[0]) {
+            let n = self.s.m.i32(lanes[0].into());
+            return self.s.op(c, "quadReadLaneAt.i32", Attr::NoUnwind, i32t, 122, &[x, n]);
+        }
+        let across = |i: usize| i as u8 ^ lanes[i];
+        let mut r = None;
+        for by in 0..4u8 {
+            if !(0..4).any(|i| across(i) == by) {
+                continue;
+            }
+            let read = if by == 0 {
+                x
+            } else {
+                // QuadReadAcrossX, Y, Diagonal.
+                let kind = self.s.m.i8(by - 1);
+                self.s.op(c, "quadOp.i32", Attr::NoUnwind, i32t, 123, &[x, kind])
+            };
+            r = Some(match r {
+                None => read,
+                Some(r) => {
+                    let mut here = self.s.m.bool(false);
+                    let lane = self.lane_index();
+                    let three = self.s.m.i32(3);
+                    let at = self.s.m.bin(c, Bin::And, lane, three);
+                    for i in (0..4).filter(|&i| across(i) == by) {
+                        let k = self.s.m.i32(i as u32);
+                        let is = self.s.m.cmp(c, pred::EQ, at, k);
+                        here = self.s.m.bin(c, Bin::Or, here, is);
+                    }
+                    self.s.m.select(c, here, read, r)
+                }
+            });
+        }
+        r.unwrap_or(x)
     }
 
     /// `v_readfirstlane_b32`'s result `first` of `own` in a pixel shader:
@@ -4719,8 +4770,17 @@ impl<'a> Lower<'a> {
                 let t = self.s.m.bin(c, Bin::Or, t, or);
                 self.s.m.bin(c, Bin::Xor, t, xor)
             };
-            let r = if mesh_quad || self.helpers_read(quad) {
+            let r = if mesh_quad {
                 self.quad_pick(x, src)
+            } else if self.helpers_read(quad) {
+                // The quad's pattern is known from the offset: read with
+                // the quad operations it names (avatarmanz 1c8dd31).
+                let lanes = if offset & 0x8000 != 0 {
+                    [0, 1, 2, 3].map(|i| (offset >> (2 * i) & 3) as u8)
+                } else {
+                    [0u32, 1, 2, 3].map(|i| ((i & offset | offset >> 5 & 3) ^ offset >> 10 & 3) as u8 & 3)
+                };
+                self.quad_read(x, lanes)
             } else {
                 self.read_lane(x, src)
             };
@@ -7203,8 +7263,14 @@ impl<'a> Lower<'a> {
                 (src, inside, masks, bound_ctrl)
             }
         };
-        let mut r = if mesh_quad || self.helpers_read(quad) {
+        let mut r = if mesh_quad {
             self.quad_pick(x, src)
+        } else if let Dpp::Row { ctrl, .. } = dpp
+            && self.helpers_read(quad)
+        {
+            // A quad_perm: its pattern read with quad operations
+            // (avatarmanz 1c8dd31).
+            self.quad_read(x, [0, 1, 2, 3].map(|i| (ctrl >> (2 * i) & 3) as u8))
         } else {
             self.read_lane(x, src)
         };
