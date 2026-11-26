@@ -4413,6 +4413,7 @@ impl Host {
                     return Ok(*after);
                 }
                 let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+                crate::resource::flush_cleared();
                 self.queue.ExecuteCommandLists(&lists);
                 let after = *order;
                 drop(order);
@@ -4961,6 +4962,7 @@ impl Host {
     /// to be done once they have run comes back with the submission lock
     /// still held.
     fn submit<'a>(&'a self, runs: &[&HostList], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
+        crate::resource::flush_cleared();
         let _profiled = crate::profile::here();
         #[cfg(feature = "diagnostics")]
         let called = std::time::Instant::now();
@@ -5095,6 +5097,7 @@ impl Host {
             *submitted += 1;
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
+                crate::resource::flush_cleared();
                 self.queue.ExecuteCommandLists(&lists);
                 self.queue.Signal(&self.fence, *submitted)
             };
@@ -5136,6 +5139,7 @@ impl Host {
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
+                crate::resource::flush_cleared();
                 self.queue.ExecuteCommandLists(group);
                 self.card_sent();
                 let waited = self
@@ -7692,6 +7696,11 @@ impl Host {
     /// bytes: the budget and the use of the card's own memory, then of the
     /// PC's memory shared with the card (where the system moves what does
     /// not fit on the card).
+    /// The queue the title's lists run on.
+    pub(crate) fn queue(&self) -> &ID3D12CommandQueue {
+        &self.queue
+    }
+
     pub(crate) fn video_memory(&self) -> Option<[u64; 4]> {
         let adapter = self.adapter.as_ref()?;
         let mut own = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
