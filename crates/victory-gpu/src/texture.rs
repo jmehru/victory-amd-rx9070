@@ -734,6 +734,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
         // SAFETY: an open list; both locations name live resources.
         unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
+    list.tally(5);
     // When the list is submitted, its copy takes what the staging buffer
     // holds by then: noted before the check below, which sets `dirty`
     // again if it detiles (the next list then uploads once more).

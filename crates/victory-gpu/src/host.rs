@@ -896,6 +896,40 @@ mod tests {
     }
 }
 
+/// A host command list that knows whether anything was recorded into it:
+/// whoever takes the list to record takes it through this.
+pub(crate) struct Recorded {
+    inner: ID3D12GraphicsCommandList,
+    touched: std::sync::atomic::AtomicBool,
+}
+
+impl std::ops::Deref for Recorded {
+    type Target = ID3D12GraphicsCommandList;
+    fn deref(&self) -> &ID3D12GraphicsCommandList {
+        self.touched.store(true, Ordering::Relaxed);
+        &self.inner
+    }
+}
+
+/// Whether a list of the title's that nothing was recorded into is left out
+/// of its submission (`VICTORY_SKIP_EMPTY_LISTS=1`; off). What the list
+/// defers to its submission (waits, values written when it has run, fills)
+/// is done all the same.
+///
+/// The title closes and submits some 330 lists a frame that hold no draw,
+/// dispatch, clear, copy or barrier (run y1), and each costs the card about
+/// 25 us between its two timestamps, 8 ms a frame: what a list costs the card
+/// by being one (the bare cost test: 100 lists of 100 draws take 0.2 us a
+/// draw more than one list of 10,000).
+fn skip_empty() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SKIP_EMPTY_LISTS").is_some_and(|v| v == "1"))
+}
+
+/// Lists of the title's closed since the last frame line: all, and those
+/// nothing was recorded into.
+static CLOSED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// The batches of clamped records in one scratch buffer
 /// ([`HostList::batch_place`]).
 const BATCHES: u32 = 8;
@@ -936,7 +970,9 @@ pub(crate) static BATCH_PASSES: std::sync::atomic::AtomicU64 = std::sync::atomic
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
-    pub(crate) list: ID3D12GraphicsCommandList,
+    pub(crate) list: Recorded,
+    /// Closed with nothing recorded into it ([`skip_empty`]): not run.
+    empty: std::sync::atomic::AtomicBool,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
     /// Upload memory for data the list's draws make (expanded vertices),
@@ -1828,6 +1864,18 @@ fn card_time_pass(pair: Option<u64>, text: String) {
     TIME_PASS[(pair % u64::from(TIME_PAIRS)) as usize].store(n as u32 + 1, Ordering::Relaxed);
 }
 
+/// The kinds of commands [`HostList::tally`] counts.
+pub(crate) const TALLIED: [&str; 8] = [
+    "target clears",
+    "depth clears",
+    "texture copies",
+    "buffer copies",
+    "resolves",
+    "texture uploads",
+    "barriers of the title",
+    "read-backs",
+];
+
 /// Whether the card's time is measured ([`card_times`]).
 pub(crate) fn card_times_on() -> bool {
     card_times().is_some()
@@ -1884,6 +1932,10 @@ fn card_times_line(frames: f64) {
             (at.read_volatile(), at.add(1).read_volatile())
         };
         if b < a || b - a > times.frequency * 2 {
+            continue;
+        }
+        if TIME_KIND[slot].load(Ordering::Relaxed) == u8::MAX {
+            // A list that was not run.
             continue;
         }
         let kind = (TIME_KIND[slot].load(Ordering::Relaxed) as usize).min(TIME_KINDS.len() - 1);
@@ -2346,6 +2398,9 @@ struct Deferred {
     /// With [`card_times`]: the size of the first colour target (or depth
     /// target) the list drew to, and how many colour targets.
     target: Option<(u64, u32, usize)>,
+    /// With [`card_times`]: commands of the list that need no pipeline, by
+    /// kind ([`TALLIED`]).
+    tally: [u32; TALLIED.len()],
 }
 
 impl Deferred {
@@ -3669,7 +3724,8 @@ impl Host {
             }
             Ok(HostList {
                 allocator,
-                list,
+                list: Recorded { inner: list, touched: std::sync::atomic::AtomicBool::new(false) },
+                empty: std::sync::atomic::AtomicBool::new(false),
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
@@ -5001,10 +5057,13 @@ impl Host {
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
+            if list.empty.load(Ordering::Relaxed) {
+                continue;
+            }
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
             }
-            lists.push(list.list.cast().ok());
+            lists.push(list.list.inner.cast().ok());
         }
         batch.flush();
         crate::watch::ask_once_end();
@@ -5488,20 +5547,42 @@ impl HostList {
         let timed = self.deferred().card_time.take();
         if timed.is_some() {
             let target = self.deferred().target.take();
+            let tally = std::mem::take(&mut self.deferred().tally);
             let pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
             let names: Vec<&str> = pipelines.iter().take(3).map(String::as_str).collect();
-            let text = format!(
-                "{} pipelines, target {}: {}",
-                pipelines.len(),
-                target.map_or("none".into(), |(w, h, n)| format!("{w}x{h} x{n}")),
-                names.join(" | ")
-            );
+            let text = if pipelines.is_empty() {
+                // By the kinds of commands it holds (how many: 1, 2-3, 4+).
+                let held: Vec<String> = TALLIED
+                    .iter()
+                    .zip(tally)
+                    .filter(|(_, n)| *n > 0)
+                    .map(|(what, n)| format!("{what} {}", if n == 1 { "1" } else if n < 4 { "2-3" } else { "4+" }))
+                    .collect();
+                format!("no pipeline: {}", if held.is_empty() { "none of the commands counted".into() } else { held.join(", ") })
+            } else {
+                format!(
+                    "{} pipelines, target {}: {}",
+                    pipelines.len(),
+                    target.map_or("none".into(), |(w, h, n)| format!("{w}x{h} x{n}")),
+                    names.join(" | ")
+                )
+            };
             drop(pipelines);
             card_time_pass(timed, text);
         }
-        card_time_end(&self.list, timed);
+        // Nothing recorded since the reset: said, and with the switch the
+        // list is not run (its timestamps then are not the card's).
+        let untouched = !self.list.touched.load(Ordering::Relaxed);
+        CLOSED[0].fetch_add(1, Ordering::Relaxed);
+        CLOSED[1].fetch_add(u64::from(untouched), Ordering::Relaxed);
+        let empty = untouched && skip_empty();
+        self.empty.store(empty, Ordering::Relaxed);
+        if empty && let Some(pair) = timed {
+            TIME_KIND[(pair % u64::from(TIME_PAIRS)) as usize].store(u8::MAX, Ordering::Relaxed);
+        }
+        card_time_end(&self.list.inner, timed);
         // SAFETY: our list.
-        if let Err(e) = unsafe { self.list.Close() } {
+        if let Err(e) = unsafe { self.list.inner.Close() } {
             fail(format_args!(
                 "a host command list did not close ({e}): a command recorded into it was invalid"
             ));
@@ -5539,8 +5620,9 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
-        let timed = card_time_begin(&self.list, 0);
+        let timed = card_time_begin(&self.list.inner, 0);
         self.deferred().card_time = timed;
+        self.list.touched.store(false, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
     }
@@ -6273,6 +6355,17 @@ impl HostList {
             // SAFETY: an open list and live buffers this recording left in
             // `INDIRECT_ARGUMENT`.
             unsafe { self.list.ResourceBarrier(&barriers) };
+        }
+    }
+
+    /// With [`card_times`]: the list holds another command of kind `kind`
+    /// ([`TALLIED`]).
+    pub(crate) fn tally(&self, kind: usize) {
+        if card_times_on() {
+            let mut deferred = self.deferred();
+            if deferred.card_time.is_some() {
+                deferred.tally[kind] += 1;
+            }
         }
     }
 
@@ -7074,6 +7167,12 @@ impl Meter {
                      (each is the clock when its list has landed, not a time on the card)"
                 );
             }
+        }
+        {
+            let [all, untouched] = [0, 1].map(|i| CLOSED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            tracing::info!(
+                "lists of the title's closed per frame: {all:.1}, {untouched:.1} of them with nothing recorded into them (VICTORY_SKIP_EMPTY_LISTS=1 leaves those out of their submissions)"
+            );
         }
         let passes = BATCH_PASSES.swap(0, Ordering::Relaxed);
         if passes > 0 {

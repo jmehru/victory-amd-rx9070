@@ -185,6 +185,16 @@ pub(crate) fn hashed(len: usize) {
 /// and binds answered whole from what the list had bound last.
 pub(crate) static TABLES: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
+/// 4 KiB parts copied by refreshes and those of them that held other bytes
+/// than the copy had, for copies in the card's memory and for the others.
+static PARTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// `parts` 4 KiB parts were copied, `differ` of them held other bytes.
+pub(crate) fn parts(card: bool, parts: u64, differ: u64) {
+    PARTS[2 * usize::from(card)].fetch_add(parts, Ordering::Relaxed);
+    PARTS[2 * usize::from(card) + 1].fetch_add(differ, Ordering::Relaxed);
+}
+
 /// Whether a profile is taken.
 pub(crate) fn on() -> bool {
     file().is_some()
@@ -390,6 +400,7 @@ fn sample(file: &str) {
             counted = counts();
             REFRESHED.lock().unwrap_or_else(|e| e.into_inner()).take();
             BOUND.lock().unwrap_or_else(|e| e.into_inner()).take();
+            PARTS.iter().for_each(|p| p.store(0, Ordering::Relaxed));
             tabled = std::array::from_fn(|i| TABLES[i].load(Ordering::Relaxed));
         }
         let (start, frames) = *since.get_or_insert_with(|| (std::time::Instant::now(), FRAMES.load(Ordering::Relaxed)));
@@ -500,6 +511,13 @@ fn sample(file: &str) {
                 per[21], per[22], per[23] / 1e6, per[24], per[25] / 1e6
             ));
             text.push_str(&refreshed_text(frames));
+            {
+                let p: [f64; 4] = std::array::from_fn(|i| PARTS[i].swap(0, Ordering::Relaxed) as f64 / frames.max(1) as f64);
+                text.push_str(&format!(
+                    "==== 4 KiB parts copied by refreshes, per frame (since the start of the run over this window's frames): {:.0} of copies outside the card's memory, {:.0} of them with other bytes than the copy had; {:.0} of copies in the card's memory, {:.0} of them with other bytes\n",
+                    p[0], p[1], p[2], p[3]
+                ));
+            }
             let tables_now: [u64; 7] = std::array::from_fn(|i| TABLES[i].load(Ordering::Relaxed));
             let t: [f64; 7] = std::array::from_fn(|i| (tables_now[i] - tabled[i]) as f64 / frames.max(1) as f64);
             tabled = tables_now;

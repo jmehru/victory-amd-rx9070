@@ -780,6 +780,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
                     host.len(),
                 )
             };
+            list.tally(6);
             // SAFETY: an open list and live resources.
             unsafe { list.list.ResourceBarrier(host) };
         }
@@ -919,6 +920,7 @@ fn copy_on_the_card(list: &crate::host::HostList, to: u64, from: u64, len: u64) 
     list.note_op(|| format!("title buffer copy on the card, {len} bytes from {from:#x} to {to:#x}"));
     // SAFETY: an open list; live buffers the list holds (their states are
     // noted in it), and the ranges lie in them.
+    list.tally(3);
     unsafe {
         list.list.CopyBufferRegion(&target.buffer, target.offset(to), &source.buffer, source.offset(from), len);
     }
@@ -1000,6 +1002,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
+            list.tally(2);
             unsafe { list.list.CopyResource(to, from) };
         } else if let (Some((to, a)), Some((from, b))) = (
             crate::resource::buffer_bytes(dst),
@@ -1158,6 +1161,7 @@ extern "system" fn copy_texture_region(
             assert!(size_of::<CopyLocation>() == size_of::<D3D12_TEXTURE_COPY_LOCATION>());
         // SAFETY: an open list; both locations in the host's layout, naming
         // live resources; the box is the title's (same layout).
+        list.tally(2);
         unsafe {
             list.list.CopyTextureRegion(
                 (&raw const to_location).cast(),
@@ -1229,6 +1233,7 @@ fn read_back(
     // SAFETY: an open list; both locations in the host's layout (asserted
     // in `copy_texture_region`), naming a live texture and our buffer, which
     // the list keeps until it is reset; the box is the title's.
+    list.tally(7);
     unsafe {
         list.list
             .CopyTextureRegion((&raw const to).cast(), 0, 0, 0, (&raw const from).cast(), host_box)
@@ -1371,6 +1376,7 @@ extern "system" fn clear_rtv(
                     State(RENDER_TARGET as i32),
                 )]);
             }
+            list.tally(0);
             list.list.ClearRenderTargetView(rtv, color, rects);
         }
     }
@@ -1416,6 +1422,7 @@ extern "system" fn clear_dsv(
         }
         let dsv = host.dsv(texture, record.depth_desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
+        list.tally(1);
         unsafe {
             list.list
                 .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAGS(flags as i32 & 3), depth, stencil, rects)

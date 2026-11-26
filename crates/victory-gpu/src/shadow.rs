@@ -2957,6 +2957,25 @@ impl Shadow {
         let (from, to) = (from.max(start), to.min(end));
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
+        // While a profile is taken: of the 4 KiB parts about to be copied,
+        // how many hold other bytes than the copy has (what tracking writes
+        // by 4 KiB instead of 64 KiB would have to copy).
+        if crate::profile::on() {
+            let mut title = vec![0u8; 4096];
+            let (mut parts, mut differ) = (0u64, 0u64);
+            let mut a = from;
+            while a < to {
+                let n = (4096 - a % 4096).min(to - a);
+                if crate::host::read_into(a as *const u8, &mut title[..n]) {
+                    parts += 1;
+                    // SAFETY: inside the copy's mapping, as `at` is.
+                    let held = unsafe { std::slice::from_raw_parts(self.data.add(a - start).cast_const(), n) };
+                    differ += u64::from(held != &title[..n]);
+                }
+                a += n;
+            }
+            crate::profile::parts(self.card.is_some(), parts, differ);
+        }
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
