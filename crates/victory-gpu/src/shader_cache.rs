@@ -67,6 +67,9 @@ fn build() -> &'static [u8; 32] {
             u32::from(victory_shader::emit::group_sync()),
             // And which clean-up passes ran over the translated code.
             victory_shader::emit::shader_opt(),
+            // And where a table's constant buffers are read from (by what
+            // is in force, not by the switch's text: it is on when unset).
+            u32::from(victory_shader::emit::cbv_slots()),
         ] {
             hash.update(&n.to_le_bytes());
         }
@@ -87,7 +90,6 @@ fn build() -> &'static [u8; 32] {
             "VICTORY_NAN_GUARD",
             "VICTORY_DENORM",
             "VICTORY_QUAD_HELPERS",
-            "VICTORY_CBV_SLOTS",
         ] {
             hash.update(name.as_bytes());
             hash.update(b"=");

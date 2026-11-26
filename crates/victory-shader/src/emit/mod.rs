@@ -171,8 +171,8 @@ pub fn group_sync() -> u8 {
 
 /// Whether a program takes the constant buffers of its descriptor tables
 /// from view heap slots the host names one by one
-/// ([`shader::USER_CBV_SLOT`]), not from the table (`VICTORY_CBV_SLOTS=1`;
-/// off).
+/// ([`shader::USER_CBV_SLOT`]), not from the table (`VICTORY_CBV_SLOTS=0`: from
+/// the table, as before).
 ///
 /// The host wants constant buffers on 256 bytes and the console's are on 16,
 /// so the host cannot show a table's constant buffer in the title's own
@@ -186,7 +186,7 @@ pub fn group_sync() -> u8 {
 /// does).
 pub fn cbv_slots() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CBV_SLOTS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CBV_SLOTS").is_none_or(|v| v != "0"))
 }
 
 /// The clean-up passes that run over a translated program before it is
