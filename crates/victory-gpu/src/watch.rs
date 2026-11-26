@@ -507,14 +507,177 @@ fn known_view(start: usize) -> bool {
     g.protected.contains(&first) || g.absent.contains(&first)
 }
 
+/// A set of block numbers. One bit a block, in pieces of 4096 blocks
+/// (256 MiB of addresses), unless `VICTORY_GUARD_BITS=0` keeps the tree it
+/// was: a frame's checks walk some 80,000 blocks of guarded view memory,
+/// nearly all clean, and reading the clean and the absent ones of every
+/// range off a tree into a list, then noting runs of them block by block,
+/// was half of the 8 ms a frame the walks took (run p5).
+struct Blocks {
+    tree: BTreeSet<usize>,
+    bits: BTreeMap<usize, Box<[u64; 64]>>,
+    held: usize,
+}
+
+/// `n` bits (1 to 64) from bit `low` of a word.
+fn bits_mask(low: usize, n: usize) -> u64 {
+    if n >= 64 { !0 } else { ((1u64 << n) - 1) << low }
+}
+
+impl Blocks {
+    const fn new() -> Self {
+        Self {
+            tree: BTreeSet::new(),
+            bits: BTreeMap::new(),
+            held: 0,
+        }
+    }
+
+    /// Whether the sets are bits (`VICTORY_GUARD_BITS`, on unless `0`).
+    fn bits_on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_BITS").is_none_or(|v| v != "0"))
+    }
+
+    fn is_empty(&self) -> bool {
+        if Self::bits_on() { self.held == 0 } else { self.tree.is_empty() }
+    }
+
+    fn contains(&self, block: &usize) -> bool {
+        if !Self::bits_on() {
+            return self.tree.contains(block);
+        }
+        let b = *block;
+        self.bits.get(&(b >> 12)).is_some_and(|words| words[b >> 6 & 63] >> (b & 63) & 1 != 0)
+    }
+
+    fn insert(&mut self, block: usize) -> bool {
+        if !Self::bits_on() {
+            return self.tree.insert(block);
+        }
+        let word = &mut self.bits.entry(block >> 12).or_insert_with(|| Box::new([0; 64]))[block >> 6 & 63];
+        let bit = 1u64 << (block & 63);
+        let new = *word & bit == 0;
+        *word |= bit;
+        self.held += usize::from(new);
+        new
+    }
+
+    fn remove(&mut self, block: &usize) -> bool {
+        if !Self::bits_on() {
+            return self.tree.remove(block);
+        }
+        let b = *block;
+        let Some(words) = self.bits.get_mut(&(b >> 12)) else {
+            return false;
+        };
+        let bit = 1u64 << (b & 63);
+        let was = words[b >> 6 & 63] & bit != 0;
+        words[b >> 6 & 63] &= !bit;
+        self.held -= usize::from(was);
+        was
+    }
+
+    /// Every block of `range` in.
+    fn extend(&mut self, range: std::ops::Range<usize>) {
+        if !Self::bits_on() {
+            self.tree.extend(range);
+            return;
+        }
+        let mut b = range.start;
+        while b < range.end {
+            let end = ((b | 63) + 1).min(range.end);
+            let mask = bits_mask(b & 63, end - b);
+            let word = &mut self.bits.entry(b >> 12).or_insert_with(|| Box::new([0; 64]))[b >> 6 & 63];
+            self.held += (mask & !*word).count_ones() as usize;
+            *word |= mask;
+            b = end;
+        }
+    }
+
+    /// The set's blocks in `range`, in order.
+    fn within(&self, range: std::ops::Range<usize>) -> Vec<usize> {
+        if !Self::bits_on() {
+            return self.tree.range(range).copied().collect();
+        }
+        let mut found = Vec::new();
+        if range.start >= range.end {
+            return found;
+        }
+        for (&piece, words) in self.bits.range(range.start >> 12..=(range.end - 1) >> 12) {
+            let from = range.start.max(piece << 12);
+            let to = range.end.min((piece + 1) << 12);
+            let mut b = from;
+            while b < to {
+                let end = ((b | 63) + 1).min(to);
+                let mut word = words[b >> 6 & 63] & bits_mask(b & 63, end - b);
+                while word != 0 {
+                    found.push((b & !63) + word.trailing_zeros() as usize);
+                    word &= word - 1;
+                }
+                b = end;
+            }
+        }
+        found
+    }
+
+    /// How many of `range`'s blocks are in the set.
+    fn count(&self, range: std::ops::Range<usize>) -> usize {
+        if !Self::bits_on() {
+            return self.tree.range(range).count();
+        }
+        let mut n = 0;
+        if range.start >= range.end {
+            return n;
+        }
+        for (&piece, words) in self.bits.range(range.start >> 12..=(range.end - 1) >> 12) {
+            let from = range.start.max(piece << 12);
+            let to = range.end.min((piece + 1) << 12);
+            let mut b = from;
+            while b < to {
+                let end = ((b | 63) + 1).min(to);
+                n += (words[b >> 6 & 63] & bits_mask(b & 63, end - b)).count_ones() as usize;
+                b = end;
+            }
+        }
+        n
+    }
+
+    /// The first block of `[from, to)` that is not in the set; `to` if all are.
+    fn next_out(&self, from: usize, to: usize) -> usize {
+        if !Self::bits_on() {
+            let mut at = from;
+            for &block in self.tree.range(from..to) {
+                if block != at {
+                    break;
+                }
+                at += 1;
+            }
+            return at.min(to);
+        }
+        let mut b = from;
+        while b < to {
+            let Some(words) = self.bits.get(&(b >> 12)) else {
+                return b;
+            };
+            let out = !words[b >> 6 & 63] >> (b & 63);
+            if out != 0 {
+                return (b + out.trailing_zeros() as usize).min(to);
+            }
+            b = (b | 63) + 1;
+        }
+        to
+    }
+}
+
 struct Guards {
     /// Blocks we made read-only.
-    protected: BTreeSet<usize>,
+    protected: Blocks,
     /// Of those, the ones not written since a copy took them.
-    clean: BTreeSet<usize>,
+    clean: Blocks,
     /// Blocks already copied as zeros. While they remain wholly uncommitted,
     /// the copy can skip hundreds of MB of failing kernel reads per world frame.
-    absent: BTreeSet<usize>,
+    absent: Blocks,
     /// Blocks whose physical page was guarded together with its other views
     /// (those views' blocks are in it too): a write to one opens them all.
     /// A write range can be huge (`fread`), so only these are looked up.
@@ -609,9 +772,9 @@ pub(crate) static ABSENT_ASKS: std::sync::atomic::AtomicU64 = std::sync::atomic:
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     placeholders: BTreeMap::new(),
-    protected: BTreeSet::new(),
-    clean: BTreeSet::new(),
-    absent: BTreeSet::new(),
+    protected: Blocks::new(),
+    clean: Blocks::new(),
+    absent: Blocks::new(),
     aliased: BTreeSet::new(),
 });
 
@@ -672,6 +835,9 @@ fn guard_known(start: usize, end: usize) -> Option<Vec<usize>> {
 /// [`guard_known`] for blocks `[first, last)` of view memory, with the
 /// guards' lock held.
 fn guard_walk(g: &mut Guards, first: usize, last: usize) -> Vec<usize> {
+    if Blocks::bits_on() {
+        return guard_walk_bits(g, first, last);
+    }
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
     // The range's clean blocks, in order: read off the set in one pass,
@@ -679,7 +845,7 @@ fn guard_walk(g: &mut Guards, first: usize, last: usize) -> Vec<usize> {
     // view memory, 150,000 blocks, nearly all clean: the lookups were most
     // of the 60-90 ms a frame of "guards" (run 54). What the loop adds to
     // the set meanwhile is the block it stands at or ones before it.
-    let clean: Vec<usize> = g.clean.range(first..last).copied().collect();
+    let clean: Vec<usize> = g.clean.within(first..last);
     guard_stat(0, 1);
     if clean.len() == last - first {
         // Nothing written, mapped or new since the range was last taken.
@@ -689,7 +855,7 @@ fn guard_walk(g: &mut Guards, first: usize, last: usize) -> Vec<usize> {
     guard_stat(2, last - first);
     // The range's absent blocks likewise (those noted before this walk;
     // the walk only takes blocks out of the set).
-    let absent: Vec<usize> = g.absent.range(first..last).copied().collect();
+    let absent: Vec<usize> = g.absent.within(first..last);
     let (mut next_clean, mut next_absent) = (0, 0);
     let mut uncommitted_until = first;
     // The placeholder the loop stands in, if any (first, end), and the
@@ -750,6 +916,144 @@ fn guard_walk(g: &mut Guards, first: usize, last: usize) -> Vec<usize> {
             guard_stat(6, 1);
             protect(g, from, block);
         }
+    }
+    written
+}
+
+#[cfg(test)]
+mod blocks_tests {
+    use super::Blocks;
+
+    /// The bit sets against a plain tree, through every operation the
+    /// guards use, over ranges that cross words and pieces.
+    #[test]
+    fn bits_answer_as_a_tree_does() {
+        if !Blocks::bits_on() {
+            return;
+        }
+        let mut bits = Blocks::new();
+        let mut tree = std::collections::BTreeSet::new();
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move |most: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % most as u64) as usize
+        };
+        let base = 0x7_ff00usize;
+        for round in 0..4000 {
+            let at = base + next(3 * 4096);
+            match next(5) {
+                0 => assert_eq!(bits.insert(at), tree.insert(at)),
+                1 => assert_eq!(bits.remove(&at), tree.remove(&at)),
+                2 => {
+                    let to = at + next(300);
+                    bits.extend(at..to);
+                    tree.extend(at..to);
+                }
+                3 => {
+                    for block in at..at + next(40) {
+                        assert_eq!(bits.remove(&block), tree.remove(&block));
+                    }
+                }
+                _ => assert_eq!(bits.contains(&at), tree.contains(&at)),
+            }
+            if round % 16 == 0 {
+                let from = base + next(3 * 4096);
+                let to = from + next(5000);
+                let listed: Vec<usize> = tree.range(from..to).copied().collect();
+                assert_eq!(bits.within(from..to), listed);
+                assert_eq!(bits.count(from..to), listed.len());
+                let out = (from..to).find(|b| !tree.contains(b)).unwrap_or(to);
+                assert_eq!(bits.next_out(from, to), out);
+                assert_eq!(bits.is_empty(), tree.is_empty());
+            }
+        }
+        assert_eq!(bits.within(0..usize::MAX >> 1), tree.iter().copied().collect::<Vec<_>>());
+    }
+}
+
+/// [`guard_walk`] over sets of bits: the same answers and the same blocks
+/// guarded, absent or asked about, block for block, but the clean blocks are
+/// counted and stepped over a word at a time instead of read into a list,
+/// and the absent ones are looked up where the walk stands. (What the walk
+/// adds to the clean and the absent sets is the block it stands at or ones
+/// before it, and it takes only that block out of the absent ones: looking
+/// the sets up as it goes sees what the lists read at its start saw.)
+fn guard_walk_bits(g: &mut Guards, first: usize, last: usize) -> Vec<usize> {
+    let mut written = Vec::new();
+    guard_stat(0, 1);
+    if g.clean.count(first..last) == last - first {
+        // Nothing written, mapped or new since the range was last taken.
+        guard_stat(1, 1);
+        return written;
+    }
+    guard_stat(2, last - first);
+    let mut run: Option<usize> = None;
+    let mut uncommitted_until = first;
+    let mut placeholder = (0, 0);
+    let every = placeholder_ask_every();
+    let turn = if every > 1 { crate::frame::current() % every } else { 0 };
+    let mut block = first;
+    loop {
+        // The clean blocks from here on (or the range's end) close a run.
+        let next = if block < last { g.clean.next_out(block, last) } else { last };
+        if next > block || block >= last {
+            if let Some(from) = run.take() {
+                guard_stat(6, 1);
+                protect(g, from, block);
+            }
+            if next >= last {
+                break;
+            }
+            block = next;
+        }
+        let mut open = true;
+        if g.absent.contains(&block) {
+            guard_stat(3, 1);
+            if every > 1 && block >= uncommitted_until {
+                if block >= placeholder.1 {
+                    placeholder = match g.placeholders.range(..=block).next_back() {
+                        Some((&f, &e)) if e > block => (f, e),
+                        _ => (0, 0),
+                    };
+                }
+                if block < placeholder.1 && block as u64 % every != turn {
+                    // In a placeholder and not its turn: absent still.
+                    guard_stat(4, 1);
+                    if let Some(from) = run.take() {
+                        protect(g, from, block);
+                    }
+                    block += 1;
+                    continue;
+                }
+            }
+            if block >= uncommitted_until {
+                ABSENT_ASKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                uncommitted_until = uncommitted_end(block);
+            }
+            open = block >= uncommitted_until;
+            if open {
+                guard_stat(5, 1);
+                g.absent.remove(&block);
+            }
+        }
+        if open {
+            written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
+            if g.protected.contains(&block) {
+                // Written through the runtime, still read-only.
+                g.clean.insert(block);
+            } else {
+                run.get_or_insert(block);
+                block += 1;
+                continue;
+            }
+        }
+        if let Some(from) = run.take() {
+            guard_stat(6, 1);
+            protect(g, from, block);
+        }
+        block += 1;
     }
     written
 }
@@ -944,11 +1248,7 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
 /// [`open`] for one range, without the other views of its pages.
 fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
-    let blocks: Vec<usize> = g
-        .protected
-        .range(start / BLOCK..end.div_ceil(BLOCK))
-        .copied()
-        .collect();
+    let blocks: Vec<usize> = g.protected.within(start / BLOCK..end.div_ceil(BLOCK));
     for &block in &blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
@@ -1129,11 +1429,11 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::inplace::title_memory_freeing(at, len);
     let mut g = guards();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
-    let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
+    let absent: Vec<usize> = g.absent.within(range.clone());
     for block in absent {
         g.absent.remove(&block);
     }
-    let blocks: Vec<usize> = g.protected.range(range).copied().collect();
+    let blocks: Vec<usize> = g.protected.within(range);
     for block in blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
