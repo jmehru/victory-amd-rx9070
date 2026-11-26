@@ -24,7 +24,11 @@
 //! at once). No occlusion but the creases'.
 //!
 //! `VICTORY_AMBIENT`:
-//! - unset or `0`/`off`: the title's own output.
+//! - unset: 0.8 of the estimate. Without it a character standing in shade
+//!   had no indirect light in about one run of three (face, hair and suit
+//!   near black, the eyes glowing: runs bk-1, bi2-1; with 0.8, ba1-1 and
+//!   ba2-1 read like the console's prologue I1-I4 and P1).
+//! - `0`/`off`: the title's own output.
 //! - a number: that share of the estimate (1: all of it).
 //! - `constant:<level>`: the constant, as beloooo's fork has it.
 //!
@@ -92,9 +96,12 @@ fn parse(set: &str) -> Set {
     }
 }
 
+/// What an unset `VICTORY_AMBIENT` means.
+const DEFAULT: &str = "0.8";
+
 fn set() -> Set {
     static SET: OnceLock<Set> = OnceLock::new();
-    *SET.get_or_init(|| parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default()))
+    *SET.get_or_init(|| parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_else(|_| DEFAULT.to_owned())))
 }
 
 /// Whether the stand-in is on: set, and the title's rays find nothing.
