@@ -1395,6 +1395,7 @@ pub(crate) fn room() -> bool {
             // What is free in the blocks textures are placed in counts as
             // in use with the system and is room all the same.
             blocks::tend();
+            blocks::spares_tend();
             let room = used.saturating_sub(blocks::free()) < budget / 100 * room_percent();
             // The answer changed: said, with what it was made from.
             static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
@@ -1825,6 +1826,9 @@ impl Drop for HostTexture {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
         blocks::let_go(&self.texture);
+        if self.filled {
+            blocks::spare_keep(&self.texture, self.bytes, self.state.load(Relaxed));
+        }
         HOST_TEXTURES[0].fetch_sub(1, Relaxed);
         HOST_TEXTURES[1].fetch_sub(self.bytes, Relaxed);
         if self.filled {
@@ -2002,13 +2006,25 @@ mod blocks {
     /// Runs the list that clears the textures placed since the last time,
     /// if there is one: before the title's lists of a submission run.
     pub(super) fn flush() {
-        if !on() || PENDING.load(Relaxed) == 0 {
+        if PENDING.load(Relaxed) == 0 {
             return;
         }
-        let Some(host) = crate::host::host() else { return };
-        let mut blocks = BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(z) = blocks.as_mut().and_then(|b| b.zeroer.as_mut()) else { return };
         PENDING.store(0, Relaxed);
+        {
+            let mut blocks = BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(z) = blocks.as_mut().and_then(|b| b.zeroer.as_mut()) {
+                run(z);
+            }
+        }
+        let mut spares = SPARES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(z) = spares.zeroer.as_mut() {
+            run(z);
+        }
+    }
+
+    /// Runs the list `z` is recording, if it is.
+    fn run(z: &mut Zeroer) {
+        let Some(host) = crate::host::host() else { return };
         let Some((allocator, list, textures)) = z.open.take() else { return };
         // SAFETY: a list of our own, recorded under the lock we hold.
         unsafe {
@@ -2240,6 +2256,11 @@ mod blocks {
     /// Zeros into every part of `texture` (made in the copy destination
     /// state), which is then put in `state`: by a list of our own, run now.
     fn clear(device: &ID3D12Device, zeroer: &mut Option<Zeroer>, texture: &ID3D12Resource, d: &D3D12_RESOURCE_DESC, state: i32) -> bool {
+        clear_from(device, zeroer, texture, d, 0x400, state)
+    }
+
+    /// [`clear`] of a texture that is in state `from`.
+    fn clear_from(device: &ID3D12Device, zeroer: &mut Option<Zeroer>, texture: &ID3D12Resource, d: &D3D12_RESOURCE_DESC, from: i32, state: i32) -> bool {
         const COPY_DEST: i32 = 0x400;
         let mut run = || -> windows::core::Result<bool> {
             // SAFETY: plain creation and recording on objects of our own;
@@ -2305,6 +2326,9 @@ mod blocks {
                 let Some((_, list, textures)) = z.open.as_mut() else {
                     return Ok(false);
                 };
+                if from != COPY_DEST {
+                    list.ResourceBarrier(&[crate::host::transition(texture, D3D12_RESOURCE_STATES(from), D3D12_RESOURCE_STATES(COPY_DEST))]);
+                }
                 for (i, footprint) in footprints.iter().enumerate() {
                     let to = D3D12_TEXTURE_COPY_LOCATION {
                         pResource: std::mem::transmute_copy(texture),
@@ -2335,6 +2359,152 @@ mod blocks {
                 ONCE.call_once(|| tracing::warn!(error = %e, "a piece of a texture block taken again is not cleared: the texture is made on its own"));
                 false
             }
+        }
+    }
+
+    /// Host textures let go, kept for the next texture of the very same
+    /// description (`VICTORY_TEXTURE_SPARES=1`; off): while the player
+    /// walks and turns the title streams some 1,100 textures a second, most
+    /// of them of sizes and formats it had a moment before, and making each
+    /// anew was the largest part of the pass that uploads them (17 thread-ms
+    /// a frame in the system's creation call, profile tnP). Each spare is a
+    /// texture of its own, which the system may move out of the card's
+    /// memory as any other: not a piece of a block. Cleared before it is
+    /// handed out, as a texture made anew starts as zeros.
+    struct Spares {
+        /// By description: the textures, the state each is in, its bytes
+        /// and the frame it was let go in.
+        by: BTreeMap<[u64; 6], Vec<(ID3D12Resource, i32, u64, u64)>>,
+        count: u64,
+        bytes: u64,
+        zeroer: Option<Zeroer>,
+    }
+
+    // SAFETY: Direct3D 12 objects are free-threaded.
+    unsafe impl Send for Spares {}
+
+    static SPARES: Mutex<Spares> =
+        Mutex::new(Spares { by: BTreeMap::new(), count: 0, bytes: 0, zeroer: None });
+    /// Since the start: spares taken, textures kept as spares, spares let
+    /// go for their age or for memory.
+    static SPARE_COUNTS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+    /// The most spares kept, their bytes, the frames one is kept, and the
+    /// free memory of the PC under which none are.
+    const SPARES_MOST: u64 = 2048;
+    const SPARE_BYTES_MOST: u64 = 512 << 20;
+    const SPARE_FRAMES: u64 = 900;
+    const SPARE_RAM: u64 = 3 << 30;
+
+    fn spares_on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SPARES").is_some_and(|v| v == "1"))
+    }
+
+    /// What two textures must share to stand in for each other.
+    fn spare_key(d: &D3D12_RESOURCE_DESC) -> [u64; 6] {
+        [
+            d.Dimension.0 as u64,
+            d.Width,
+            u64::from(d.Height) << 32 | u64::from(d.DepthOrArraySize) << 16 | u64::from(d.MipLevels),
+            d.Format.0 as u64,
+            u64::from(d.SampleDesc.Count) << 32 | u64::from(d.SampleDesc.Quality),
+            (d.Flags.0 as u64) << 32 | d.Layout.0 as u64,
+        ]
+    }
+
+    /// Spares: count, bytes, then [`SPARE_COUNTS`].
+    pub(super) fn spare_census() -> [u64; 5] {
+        let spares = SPARES.lock().unwrap_or_else(|e| e.into_inner());
+        [spares.count, spares.bytes, SPARE_COUNTS[0].load(Relaxed), SPARE_COUNTS[1].load(Relaxed), SPARE_COUNTS[2].load(Relaxed)]
+    }
+
+    /// A spare of `desc` (the host's layout), cleared and put in `state`.
+    pub(super) fn spare(device: &ID3D12Device, desc: &super::ResourceDesc, state: u32) -> Option<ID3D12Resource> {
+        if !spares_on() {
+            return None;
+        }
+        // SAFETY: the description has the host's layout.
+        let d = unsafe { &*std::ptr::from_ref(desc).cast::<D3D12_RESOURCE_DESC>() };
+        if d.MipLevels == 0 {
+            return None;
+        }
+        let mut spares = SPARES.lock().unwrap_or_else(|e| e.into_inner());
+        let (texture, from, bytes, _) = spares.by.get_mut(&spare_key(d))?.pop()?;
+        spares.count -= 1;
+        spares.bytes -= bytes;
+        if !clear_from(device, &mut spares.zeroer, &texture, d, from, state as i32) {
+            return None;
+        }
+        SPARE_COUNTS[0].fetch_add(1, Relaxed);
+        Some(texture)
+    }
+
+    /// The host copy that holds `texture` (of `bytes`, in `state`, one the
+    /// title fills) goes: kept as a spare if nothing else holds it and
+    /// there is room for it.
+    pub(super) fn spare_keep(texture: &ID3D12Resource, bytes: u64, state: u32) {
+        if !spares_on() || bytes == 0 || bytes > MOST || crate::host::references(texture) != 1 {
+            return;
+        }
+        // SAFETY: a live resource.
+        let d = unsafe { texture.GetDesc() };
+        if d.Flags.0 & 7 != 0 || d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
+            return;
+        }
+        let mut spares = SPARES.lock().unwrap_or_else(|e| e.into_inner());
+        if spares.count >= SPARES_MOST || spares.bytes + bytes > SPARE_BYTES_MOST {
+            return;
+        }
+        spares.count += 1;
+        spares.bytes += bytes;
+        spares.by.entry(spare_key(&d)).or_default().push((texture.clone(), state as i32, bytes, crate::frame::current()));
+        SPARE_COUNTS[1].fetch_add(1, Relaxed);
+    }
+
+    /// Once a frame or so: spares kept longer than [`SPARE_FRAMES`] go, and
+    /// all of them if the PC's free memory is under [`SPARE_RAM`].
+    pub(super) fn spares_tend() {
+        if !spares_on() {
+            return;
+        }
+        static LOOKED: AtomicU64 = AtomicU64::new(0);
+        let now = crate::frame::current();
+        if LOOKED.swap(now / 30, Relaxed) == now / 30 {
+            return;
+        }
+        let low = crate::host::available_physical_ram().is_some_and(|free| free < SPARE_RAM);
+        let mut spares = SPARES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(z) = spares.zeroer.as_mut() {
+            // SAFETY: a plain query of our fence.
+            let done = unsafe { z.fence.GetCompletedValue() };
+            for run in z.lists.iter_mut().filter(|run| run.0 <= done) {
+                run.3.clear();
+            }
+        }
+        let (mut count, mut bytes) = (0, 0);
+        for of in spares.by.values_mut() {
+            of.retain(|&(_, _, n, since)| {
+                let keep = !low && since + SPARE_FRAMES > now;
+                if keep {
+                    count += 1;
+                    bytes += n;
+                }
+                keep
+            });
+        }
+        SPARE_COUNTS[2].fetch_add(spares.count - count, Relaxed);
+        (spares.count, spares.bytes) = (count, bytes);
+        spares.by.retain(|_, of| !of.is_empty());
+        if now % 600 < 30 {
+            tracing::info!(
+                "spare host textures (VICTORY_TEXTURE_SPARES): {} kept now with {} MB; since the start {} taken for a new texture, {} kept, {} let go for their age or for memory",
+                spares.count,
+                spares.bytes >> 20,
+                SPARE_COUNTS[0].load(Relaxed),
+                SPARE_COUNTS[1].load(Relaxed),
+                SPARE_COUNTS[2].load(Relaxed)
+            );
         }
     }
 
@@ -2432,6 +2602,12 @@ fn host_texture(
     let allocate = |d: &ResourceDesc, clear: Option<&[u32; 5]>| {
         // A texture the title fills (no target, depth or unordered access):
         // cut from a block of card memory kept for such ([`blocks`]).
+        if d.flags & 7 == 0
+            && clear.is_none()
+            && let Some(texture) = blocks::spare(&host.device, d, crate::host::legal_for(d.flags, crate::host::texture_state(state)))
+        {
+            return Ok(Some(texture));
+        }
         if d.flags & 7 == 0
             && clear.is_none()
             && let Some(texture) = blocks::place(&host.device, d, crate::host::legal_for(d.flags, crate::host::texture_state(state)))
