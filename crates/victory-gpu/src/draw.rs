@@ -1053,6 +1053,16 @@ impl State {
         for &t in &self.targets {
             crate::list::ensure_state(list, t as This, RENDER_TARGET);
         }
+        if crate::host::card_times_on() {
+            list.note_target(|| {
+                let colours = self.targets.iter().filter(|&&t| t != 0).count();
+                let first = self.targets.iter().copied().find(|&t| t != 0).unwrap_or(self.depth);
+                let texture = crate::resource::host_resource(first as This)?;
+                // SAFETY: a live texture.
+                let desc = unsafe { texture.GetDesc() };
+                Some((desc.Width, desc.Height, colours))
+            });
+        }
         if self.depth != 0 {
             // A depth texture shaders also write: what they wrote, first.
             list.twin_use(self.depth as This, false, true);

@@ -2047,6 +2047,11 @@ impl Shadow {
         self.id
     }
 
+    /// Where its title memory starts.
+    pub(crate) fn start_address(&self) -> u64 {
+        self.start
+    }
+
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
         address - self.start + self.place.as_ref().map_or(0, |place| place.1)
@@ -2819,11 +2824,13 @@ impl Shadow {
     /// The second half of [`Shadow::update`]: copies what `asked` found
     /// stale. Returns the bytes copied.
     pub(crate) fn update_copy(&self, asked: Asked) -> usize {
-        asked
+        let bytes = asked
             .0
             .into_iter()
             .map(|(from, to, answer)| self.copy_free(from, to, answer))
-            .sum()
+            .sum();
+        crate::profile::refreshed(self.start, self.len, self.card.is_some(), bytes);
+        bytes
     }
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no

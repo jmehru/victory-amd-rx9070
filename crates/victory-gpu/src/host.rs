@@ -1808,6 +1808,30 @@ const TIME_KINDS: [&str; 10] = [
 /// The next pair of timestamps to hand out, and the next to read.
 static TIME_NEXT: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 static TIME_KIND: [std::sync::atomic::AtomicU8; TIME_PAIRS as usize] = [const { std::sync::atomic::AtomicU8::new(0) }; TIME_PAIRS as usize];
+/// Of a list of the title's: the number of what it is ([`PASSES`]), or 0.
+static TIME_PASS: [std::sync::atomic::AtomicU32; TIME_PAIRS as usize] = [const { std::sync::atomic::AtomicU32::new(0) }; TIME_PAIRS as usize];
+/// What the title's lists are, by the pipelines they bind (the first three
+/// by name and how many) and the size of the first target they draw to.
+static PASSES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Notes what the list timed as `pair` was: `text`.
+fn card_time_pass(pair: Option<u64>, text: String) {
+    let Some(pair) = pair else { return };
+    let mut passes = PASSES.lock().unwrap_or_else(|e| e.into_inner());
+    let n = match passes.iter().position(|p| *p == text) {
+        Some(n) => n,
+        None => {
+            passes.push(text);
+            passes.len() - 1
+        }
+    };
+    TIME_PASS[(pair % u64::from(TIME_PAIRS)) as usize].store(n as u32 + 1, Ordering::Relaxed);
+}
+
+/// Whether the card's time is measured ([`card_times`]).
+pub(crate) fn card_times_on() -> bool {
+    card_times().is_some()
+}
 
 /// [`card_times`]: a timestamp where `list` stands, the start of a part of
 /// `kind` ([`TIME_KINDS`]); to be ended by [`card_time_end`].
@@ -1851,6 +1875,7 @@ fn card_times_line(frames: f64) {
     let mut sums = [0u64; TIME_KINDS.len()];
     let mut counts = [0u64; TIME_KINDS.len()];
     let mut spans: [Vec<(u64, u64)>; 2] = [Vec::new(), Vec::new()];
+    let mut by_pass: std::collections::HashMap<u32, (u64, u64)> = std::collections::HashMap::new();
     for pair in read..until {
         let slot = (pair % u64::from(TIME_PAIRS)) as usize;
         // SAFETY: inside the mapping; the card wrote these long ago.
@@ -1864,6 +1889,12 @@ fn card_times_line(frames: f64) {
         let kind = (TIME_KIND[slot].load(Ordering::Relaxed) as usize).min(TIME_KINDS.len() - 1);
         sums[kind] += b - a;
         counts[kind] += 1;
+        if kind == 0 {
+            let pass = TIME_PASS[slot].swap(0, Ordering::Relaxed);
+            let entry = by_pass.entry(pass).or_insert((0u64, 0u64));
+            entry.0 += b - a;
+            entry.1 += 1;
+        }
         // (The clamps run inside the title's lists: not a span of their own.)
         if kind != 8 {
             spans[usize::from(kind != 0)].push((a, b));
@@ -1891,6 +1922,23 @@ fn card_times_line(frames: f64) {
     for k in 0..TIME_KINDS.len() {
         if counts[k] > 0 {
             text.push_str(&format!(" {} {:.2} ms in {:.1};", TIME_KINDS[k], ms(sums[k]), counts[k] as f64 / frames.max(1.0)));
+        }
+    }
+    // The title's lists by what they are, the twelve that took longest.
+    {
+        let passes = PASSES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut by: Vec<(u32, (u64, u64))> = by_pass.into_iter().collect();
+        by.sort_unstable_by(|a, b| b.1.0.cmp(&a.1.0));
+        for (pass, (ticks, n)) in by.into_iter().take(12) {
+            let what = match pass {
+                0 => "(not named)",
+                n => passes.get(n as usize - 1).map_or("?", |p| p.as_str()),
+            };
+            tracing::info!(
+                "  the card's time by pass: {:.2} ms a frame in {:.1} lists: {what}",
+                ms(ticks),
+                n as f64 / frames.max(1.0)
+            );
         }
     }
     static MOVES_THEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2295,6 +2343,9 @@ struct Deferred {
     card_scratch: CardScratch,
     /// The list's pair of timestamps ([`card_times`]).
     card_time: Option<u64>,
+    /// With [`card_times`]: the size of the first colour target (or depth
+    /// target) the list drew to, and how many colour targets.
+    target: Option<(u64, u32, usize)>,
 }
 
 impl Deferred {
@@ -5435,6 +5486,19 @@ impl HostList {
             unsafe { self.list.ResourceBarrier(&back) };
         }
         let timed = self.deferred().card_time.take();
+        if timed.is_some() {
+            let target = self.deferred().target.take();
+            let pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
+            let names: Vec<&str> = pipelines.iter().take(3).map(String::as_str).collect();
+            let text = format!(
+                "{} pipelines, target {}: {}",
+                pipelines.len(),
+                target.map_or("none".into(), |(w, h, n)| format!("{w}x{h} x{n}")),
+                names.join(" | ")
+            );
+            drop(pipelines);
+            card_time_pass(timed, text);
+        }
         card_time_end(&self.list, timed);
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
@@ -6212,6 +6276,15 @@ impl HostList {
         }
     }
 
+    /// With [`card_times`]: the list draws to a target of this size (the
+    /// first one said stays).
+    pub(crate) fn note_target(&self, size: impl FnOnce() -> Option<(u64, u32, usize)>) {
+        let mut deferred = self.deferred();
+        if deferred.card_time.is_some() && deferred.target.is_none() {
+            deferred.target = size();
+        }
+    }
+
     /// Keeps `object` alive until the list is reset.
     pub(crate) fn keep(&self, object: &impl Interface) {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
@@ -6444,6 +6517,7 @@ struct Batch {
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
+        crate::profile::bound(shadow.start_address(), address, end);
         let key = std::sync::Arc::as_ptr(shadow) as usize;
         match self.index.get(&key) {
             Some(&at) => {
@@ -6496,6 +6570,7 @@ impl Batch {
     }
 
     fn flush(&mut self) {
+        crate::profile::bound_flush();
         self.index.clear();
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
@@ -6991,6 +7066,15 @@ impl Meter {
         );
         late_line(frames);
         crate::queue::behind_line(frames);
+        {
+            let [marks, resolved] = [0, 1].map(|i| crate::queue::TIMESTAMPS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if marks + resolved > 0.0 {
+                tracing::info!(
+                    "GPU timestamps the title asks for, per frame: {marks:.1} written at the bottom of the pipe, {resolved:.1} resolved from queries \
+                     (each is the clock when its list has landed, not a time on the card)"
+                );
+            }
+        }
         let passes = BATCH_PASSES.swap(0, Ordering::Relaxed);
         if passes > 0 {
             let [batches, alone] = [0, 1].map(|i| SCRATCH_MADE[i].swap(0, Ordering::Relaxed) as f64 / frames);

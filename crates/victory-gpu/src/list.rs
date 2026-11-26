@@ -1494,7 +1494,10 @@ extern "system" fn resolve_queries(
     let (what, bytes) = match kind {
         OCCLUSION => (Written::Value(1 << 20), 8),
         BINARY => (Written::Value(1), 8),
-        TIMESTAMP => (Written::GpuTimestamp, 8),
+        TIMESTAMP => {
+            crate::queue::TIMESTAMPS[1].fetch_add(u64::from(count), std::sync::atomic::Ordering::Relaxed);
+            (Written::GpuTimestamp, 8)
+        }
         PIPELINE_STATISTICS => (Written::Value(0), 88),
         _ => (Written::Value(0), 16),
     };
@@ -2111,7 +2114,10 @@ extern "system" fn write64(this: This, address: u64, value: u64, _flush: u32, fl
     const GPU_TIMESTAMP: u32 = 1;
     const SYSTEM_TIMESTAMP: u32 = 2;
     let what = match flags {
-        GPU_TIMESTAMP => Written::GpuTimestamp,
+        GPU_TIMESTAMP => {
+            crate::queue::TIMESTAMPS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Written::GpuTimestamp
+        }
         SYSTEM_TIMESTAMP => Written::SystemTimestamp,
         _ => Written::Value(value),
     };

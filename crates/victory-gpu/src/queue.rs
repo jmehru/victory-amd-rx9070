@@ -741,6 +741,10 @@ extern "system" fn timestamp_frequency(_: This, out: *mut u64) -> HRESULT {
 }
 const TIMESTAMP_FREQUENCY: u64 = 100_000_000;
 
+/// GPU timestamps written since the last frame line: asked for at the bottom
+/// of the pipe, and resolved from queries.
+pub(crate) static TIMESTAMPS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 /// What a list's bottom-of-pipe write stores when the list has run.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Written {
@@ -760,7 +764,16 @@ impl Written {
             Written::GpuTimestamp => {
                 static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
                 let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
-                (elapsed.as_nanos() / (1_000_000_000 / u128::from(TIMESTAMP_FREQUENCY))) as u64
+                // An experiment (`VICTORY_GPU_CLOCK_SCALE=<factor>`): the
+                // clock runs that much faster or slower for the title, so
+                // every span of card time it measures is that many times
+                // what it was. It tells whether the title goes by them.
+                static SCALE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+                let scale = *SCALE.get_or_init(|| {
+                    std::env::var("VICTORY_GPU_CLOCK_SCALE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1.0)
+                });
+                let ticks = (elapsed.as_nanos() / (1_000_000_000 / u128::from(TIMESTAMP_FREQUENCY))) as u64;
+                if scale == 1.0 { ticks } else { (ticks as f64 * scale) as u64 }
             }
             Written::SystemTimestamp => system_timestamp(),
         };

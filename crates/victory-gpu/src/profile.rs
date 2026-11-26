@@ -190,6 +190,84 @@ pub(crate) fn on() -> bool {
     file().is_some()
 }
 
+/// Per host copy (where its title memory starts, its bytes, whether it is in
+/// the card's memory): refreshes that copied something or were asked to,
+/// and the bytes they copied, since the start.
+static REFRESHED: std::sync::Mutex<Option<HashMap<(u64, u64, bool), (u64, u64)>>> = std::sync::Mutex::new(None);
+
+/// A refresh of the copy of `len` bytes at `start` copied `bytes` (only
+/// while a profile is taken).
+pub(crate) fn refreshed(start: u64, len: u64, card: bool, bytes: usize) {
+    if file().is_none() {
+        return;
+    }
+    let mut all = REFRESHED.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = all.get_or_insert_with(HashMap::new).entry((start, len, card)).or_insert((0, 0));
+    entry.0 += 1;
+    entry.1 += bytes as u64;
+}
+
+/// Per host copy (where its title memory starts): the ranges asked to be
+/// refreshed since the last flush, and the bytes of such ranges in all,
+/// overlaps counted once per flush.
+static BOUND: std::sync::Mutex<Option<HashMap<u64, (Vec<(usize, usize)>, u64)>>> = std::sync::Mutex::new(None);
+
+/// `[from, to)` of the copy at `start` is asked to be refreshed (only while a
+/// profile is taken).
+pub(crate) fn bound(start: u64, from: usize, to: usize) {
+    if file().is_none() {
+        return;
+    }
+    let mut all = BOUND.lock().unwrap_or_else(|e| e.into_inner());
+    all.get_or_insert_with(HashMap::new).entry(start).or_default().0.push((from, to));
+}
+
+/// A flush: the ranges noted since the last are counted.
+pub(crate) fn bound_flush() {
+    if file().is_none() {
+        return;
+    }
+    let mut all = BOUND.lock().unwrap_or_else(|e| e.into_inner());
+    for (ranges, bytes) in all.get_or_insert_with(HashMap::new).values_mut() {
+        ranges.sort_unstable();
+        let mut end = 0;
+        for &(a, e) in ranges.iter() {
+            if e > end {
+                *bytes += (e - a.max(end)) as u64;
+                end = e;
+            }
+        }
+        ranges.clear();
+    }
+}
+
+/// [`REFRESHED`], taken: the copies by bytes copied, most first.
+fn refreshed_text(frames: u64) -> String {
+    let all = REFRESHED.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+    let bound = BOUND.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+    let mut by: Vec<_> = all.into_iter().collect();
+    by.sort_unstable_by(|a, b| b.1.1.cmp(&a.1.1));
+    let f = frames.max(1) as f64;
+    let total: u64 = by.iter().map(|e| e.1.1).sum();
+    let mut text = format!(
+        "==== refreshes of host copies, per frame: {:.2} MB copied in {} copies, {:.2} MB in the ranges asked for (overlaps once a flush); the twenty that took most (title address, MB of the copy, in the card's memory, refreshes a frame, MB copied a frame, MB asked for a frame)\n",
+        total as f64 / 1e6 / f,
+        by.len(),
+        bound.values().map(|b| b.1).sum::<u64>() as f64 / 1e6 / f
+    );
+    for ((start, len, card), (n, bytes)) in by.into_iter().take(20) {
+        text.push_str(&format!(
+            "  {start:#x} {:.2} MB {} {:.1} {:.3} {:.3}\n",
+            len as f64 / 1e6,
+            if card { "card" } else { "-" },
+            n as f64 / f,
+            bytes as f64 / 1e6 / f,
+            bound.get(&start).map_or(0, |b| b.1) as f64 / 1e6 / f
+        ));
+    }
+    text
+}
+
 /// Counts `n` more of table work `what` (only while a profile is taken).
 pub(crate) fn tables(what: usize, n: u64) {
     if file().is_some() {
@@ -310,6 +388,8 @@ fn sample(file: &str) {
         }
         if since.is_none() {
             counted = counts();
+            REFRESHED.lock().unwrap_or_else(|e| e.into_inner()).take();
+            BOUND.lock().unwrap_or_else(|e| e.into_inner()).take();
             tabled = std::array::from_fn(|i| TABLES[i].load(Ordering::Relaxed));
         }
         let (start, frames) = *since.get_or_insert_with(|| (std::time::Instant::now(), FRAMES.load(Ordering::Relaxed)));
@@ -419,6 +499,7 @@ fn sample(file: &str) {
                 "==== per frame: {:.1} snapshot buffers asked for, {:.1} of them made new with {:.1} MB of room; {:.1} let go by the pool with {:.1} MB\n",
                 per[21], per[22], per[23] / 1e6, per[24], per[25] / 1e6
             ));
+            text.push_str(&refreshed_text(frames));
             let tables_now: [u64; 7] = std::array::from_fn(|i| TABLES[i].load(Ordering::Relaxed));
             let t: [f64; 7] = std::array::from_fn(|i| (tables_now[i] - tabled[i]) as f64 / frames.max(1) as f64);
             tabled = tables_now;
