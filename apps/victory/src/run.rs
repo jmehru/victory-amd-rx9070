@@ -137,6 +137,13 @@ pub fn run(
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
+    // In every build: the upscaler's kind and render scale (the Series S
+    // picture), read from the environment before the title runs.
+    #[cfg(windows)]
+    {
+        upscaler_override(&image);
+        ffx_scale(&image);
+    }
     #[cfg(feature = "diagnostics")]
     diagnostics(&image, &cfg);
     let late = LateDlls {
@@ -166,8 +173,6 @@ fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) 
     victory_loader::dump_stacks_on_schedule();
     victory_hle::modules::audio::capture::start();
     watch(image.base(), image.info().size_of_image as usize);
-    upscaler_override(image);
-    ffx_scale(image);
     // Debugging aid: `VICTORY_CRASH_SAVE=<rva>:<len>,...` (hex) writes those
     // title ranges to `crash-<rva>.bin` in the cache dir on a crash.
     let size = image.info().size_of_image as usize;
@@ -193,7 +198,7 @@ fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) 
 /// only on Series S and 6 (the title's own upscaler) otherwise. The count of
 /// direct calls and jumps to the rva is logged; with none it is the wrong rva
 /// for this executable and nothing is patched.
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 fn upscaler_override(image: &victory_loader::LoadedImage) {
     use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
     const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
@@ -252,7 +257,7 @@ fn upscaler_override(image: &victory_loader::LoadedImage) {
 /// Both of its scale loads (`vmovss xmm0, [rip+d]`) are pointed at our
 /// constant, kept in the padding after the method; with other code there,
 /// nothing is patched.
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 fn ffx_scale(image: &victory_loader::LoadedImage) {
     use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
     let Ok(spec) = std::env::var("VICTORY_FFX_SCALE") else {
@@ -293,13 +298,13 @@ fn ffx_scale(image: &victory_loader::LoadedImage) {
 }
 
 /// The bytes of the scale method `patch_ffx_scale` reads and writes.
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 const FFX_SCALE_SPAN: usize = 0x68;
 
 /// Points both scale loads of the method `code` starts with
 /// (`vmovss xmm0, [rip+d]` at +0x28 and +0x32) at `scale`, written into the
 /// method's padding at +0x64. False, with nothing written, for other code.
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 fn patch_ffx_scale(code: &mut [u8], scale: f32) -> bool {
     const LOADS: [usize; 2] = [0x28, 0x32];
     const SLOT: usize = 0x64;
@@ -480,7 +485,6 @@ impl LoaderLock {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    #[cfg(feature = "diagnostics")]
     #[test]
     fn ffx_scale_points_both_loads_at_the_constant() {
         // Synthetic code: the two loads, filler, and int3 padding.
