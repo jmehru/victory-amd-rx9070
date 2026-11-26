@@ -686,6 +686,55 @@ struct Guards {
     /// (first → end): memory that takes views and nothing else
     /// ([`title_memory_placeholder`]).
     placeholders: BTreeMap<usize, usize>,
+    /// Blocks a write fault opened, and when ([`rest`]).
+    opened: BTreeMap<usize, std::time::Instant>,
+}
+
+/// How long a block the title has just opened by a write is left open by
+/// those that take it (`VICTORY_GUARD_REST=<microseconds>`; not at all unless
+/// given: 3,000, the default of avatarmanz/VIctory-7900XTX 7bc7c07 where this
+/// is from, made 237 runs read-only a frame against 303 in one cell run each
+/// (r1, lv1), too little to tell in the frame). Written for this tree.
+///
+/// A block the title writes while a submission's refreshes take it is made
+/// read-only, written (a fault, with the guards' lock), opened and made
+/// read-only again, several times a frame: 300 runs made read-only a frame,
+/// 4.7 ms of the submitting thread in the kernel's change of protection
+/// (profile lv1), and the faults on the title's threads. A block that rests
+/// counts as written at each asking, so nothing is missed; it is read-only
+/// again at the first asking after its rest, which sees the title's later
+/// writes.
+fn rest() -> std::time::Duration {
+    #[cfg(test)]
+    {
+        std::time::Duration::ZERO
+    }
+    #[cfg(not(test))]
+    {
+        static US: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        std::time::Duration::from_micros(*US.get_or_init(|| {
+            std::env::var("VICTORY_GUARD_REST").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+        }))
+    }
+}
+
+impl Guards {
+    /// Whether `block` is left open for now: the title has just written it.
+    fn rests(&self, block: usize, rest: std::time::Duration) -> bool {
+        !rest.is_zero() && self.opened.get(&block).is_some_and(|at| at.elapsed() < rest)
+    }
+
+    /// A write fault opened `block`.
+    fn note_opened(&mut self, block: usize) {
+        const MANY: usize = 1 << 13;
+        if self.opened.len() >= MANY {
+            self.opened.retain(|_, at| at.elapsed().as_millis() < 50);
+            if self.opened.len() >= MANY {
+                self.opened.clear();
+            }
+        }
+        self.opened.insert(block, std::time::Instant::now());
+    }
 }
 
 /// The runtime reserved `[at, at + len)` as a placeholder (a reservation of
@@ -772,6 +821,7 @@ pub(crate) static ABSENT_ASKS: std::sync::atomic::AtomicU64 = std::sync::atomic:
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     placeholders: BTreeMap::new(),
+    opened: BTreeMap::new(),
     protected: Blocks::new(),
     clean: Blocks::new(),
     absent: Blocks::new(),
@@ -863,6 +913,7 @@ fn guard_walk(g: &mut Guards, first: usize, last: usize) -> Vec<usize> {
     let mut placeholder = (0, 0);
     let every = placeholder_ask_every();
     let turn = if every > 1 { crate::frame::current() % every } else { 0 };
+    let rest = rest();
     for block in first..=last {
         while next_clean < clean.len() && clean[next_clean] < block {
             next_clean += 1;
@@ -907,10 +958,11 @@ fn guard_walk(g: &mut Guards, first: usize, last: usize) -> Vec<usize> {
             if g.protected.contains(&block) {
                 // Written through the runtime, still read-only.
                 g.clean.insert(block);
-            } else {
+            } else if !g.rests(block, rest) {
                 run.get_or_insert(block);
                 continue;
             }
+            // (One that rests is left open, and told written again next time.)
         }
         if let Some(from) = run.take() {
             guard_stat(6, 1);
@@ -994,6 +1046,7 @@ fn guard_walk_bits(g: &mut Guards, first: usize, last: usize) -> Vec<usize> {
     let mut placeholder = (0, 0);
     let every = placeholder_ask_every();
     let turn = if every > 1 { crate::frame::current() % every } else { 0 };
+    let rest = rest();
     let mut block = first;
     loop {
         // The clean blocks from here on (or the range's end) close a run.
@@ -1043,11 +1096,12 @@ fn guard_walk_bits(g: &mut Guards, first: usize, last: usize) -> Vec<usize> {
             if g.protected.contains(&block) {
                 // Written through the runtime, still read-only.
                 g.clean.insert(block);
-            } else {
+            } else if !g.rests(block, rest) {
                 run.get_or_insert(block);
                 block += 1;
                 continue;
             }
+            // (One that rests is left open, and told written again next time.)
         }
         if let Some(from) = run.take() {
             guard_stat(6, 1);
@@ -1530,6 +1584,9 @@ fn install() {
             // (then it is ours again, not read-only for some other reason).
             let mut g = guards();
             if open(&mut g, at, at + 1) {
+                if !rest().is_zero() {
+                    g.note_opened(at / BLOCK);
+                }
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::GuardFaults, 1);
                 return EXCEPTION_CONTINUE_EXECUTION;
