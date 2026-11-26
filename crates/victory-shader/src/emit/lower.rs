@@ -218,6 +218,11 @@ struct Lower<'a> {
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
+    /// While [`Lower::handle`] makes a constant buffer's handle; and whether
+    /// this program's constant buffers are taken from slots the host names
+    /// ([`Lower::cbv_redirect`]), once asked.
+    want_cbv: bool,
+    cbv_ok: Option<bool>,
     /// Element strides read from the host's table by heap slot
     /// ([`super::shader::SLOT_STRIDES`]), by block and descriptor load.
     strides: HashMap<(usize, Site, u8), V>,
@@ -1623,6 +1628,8 @@ impl<'a> Lower<'a> {
                 m
             },
             handles: HashMap::new(),
+            want_cbv: false,
+            cbv_ok: None,
             strides: HashMap::new(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
@@ -6623,8 +6630,58 @@ impl<'a> Lower<'a> {
             .max_by_key(|u| u.table_offset_dwords)
     }
 
+    /// Whether the constant buffers of this program's tables are read from
+    /// slots the host names ([`super::cbv_slots`]): not where their dwords
+    /// would crowd the user data.
+    fn cbv_redirect(&mut self) -> bool {
+        if let Some(ok) = self.cbv_ok {
+            return ok;
+        }
+        let first = self.user_first();
+        let top = self
+            .x
+            .native
+            .layout
+            .iter()
+            .map(|e| u32::from(e.user_data) + e.sgprs)
+            .max()
+            .unwrap_or(0)
+            .saturating_sub(first);
+        let buffers = self
+            .x
+            .native
+            .used
+            .iter()
+            .filter(|u| u.root == RootType::Table && u.kind == ResourceType::Cbv)
+            .count() as u32;
+        let ok = super::cbv_slots() && top + buffers + 2 <= 40;
+        self.cbv_ok = Some(ok);
+        ok
+    }
+
     /// A handle for the descriptor `src` read at `site`.
     fn handle(
+        &mut self,
+        site: Site,
+        src: &Source,
+        sampler: bool,
+        props: (u32, u32),
+    ) -> Result<V, Why> {
+        let before = self.want_cbv;
+        self.want_cbv = !sampler && props.0 & 0xff == 13;
+        if self.want_cbv
+            && matches!(src, Source::Fetched { .. } | Source::Lanes { .. } | Source::LanePhi { .. })
+            && self.cbv_redirect()
+        {
+            // Each lane's own constant buffer: every table as before.
+            self.host_word(RootType::Other(super::shader::USER_CBV_FRESH), 0xff, 0);
+        }
+        let made = self.handle_as(site, src, sampler, props);
+        self.want_cbv = before;
+        made
+    }
+
+    fn handle_as(
         &mut self,
         site: Site,
         src: &Source,
@@ -7104,6 +7161,33 @@ impl<'a> Lower<'a> {
         match self.x.native.layout.get(a.param).map(|p| p.root) {
             Some(RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap) => {}
             _ => return Err("a descriptor outside the heaps"),
+        }
+        // A table's constant buffer: from the slot the host names for it
+        // ([`super::cbv_slots`]), if it is at a place known here.
+        if self.want_cbv
+            && !sampler
+            && self.cbv_redirect()
+            && let Some(rp) = self.x.native.layout.get(a.param).copied().filter(|p| p.root == RootType::Table)
+        {
+            let dword = a.offset / 4 + u32::from(first);
+            let entry = self
+                .x
+                .native
+                .used
+                .iter()
+                .filter(|u| u.root == RootType::Table && u.user_data == rp.user_data && u.table_offset_dwords <= dword)
+                .max_by_key(|u| u.table_offset_dwords);
+            if entry.is_some_and(|u| u.kind == ResourceType::Cbv) {
+                let plain = a.dynamic.is_none()
+                    && matches!(
+                        &self.x.p.blocks[load.0].insts[load.1].fields,
+                        Fields::Smem { soffset: Operand::Scalar { code: NULL, .. }, .. }
+                    );
+                if plain {
+                    return Ok(self.host_word(RootType::Other(super::shader::USER_CBV_SLOT), rp.slot, dword));
+                }
+                self.host_word(RootType::Other(super::shader::USER_CBV_FRESH), rp.slot, 0);
+            }
         }
         let li: &Inst = &self.x.p.blocks[load.0].insts[load.1];
         let Fields::Smem {

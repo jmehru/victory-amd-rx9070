@@ -1644,9 +1644,17 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     let n = now.len().min(was.len());
     let mut runs = Vec::new();
     let mut i = 0;
+    // Eight bytes of each at `i`, as one word.
+    let word = |of: &[u8], i: usize| u64::from_le_bytes(of[i..i + 8].try_into().unwrap_or([0; 8]));
     while i < n {
-        // Equal bytes, eight at a time while they last.
-        while i + 8 <= n && now[i..i + 8] == was[i..i + 8] {
+        // Equal bytes, eight at a time while they last, then the bytes
+        // before the first that differs (its place in the word that does).
+        while i + 8 <= n {
+            let differ = word(now, i) ^ word(was, i);
+            if differ != 0 {
+                i += differ.trailing_zeros() as usize / 8;
+                break;
+            }
             i += 8;
         }
         while i < n && now[i] == was[i] {
@@ -2037,6 +2045,11 @@ impl Shadow {
     /// The copy's own number (see the field).
     pub(crate) fn id(&self) -> u64 {
         self.id
+    }
+
+    /// Where its title memory starts.
+    pub(crate) fn start_address(&self) -> u64 {
+        self.start
     }
 
     /// Offset of a title address from the buffer's start.
@@ -2664,14 +2677,13 @@ impl Shadow {
                         MASKED[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
                         // The runs are told by the mask alone: thousands of
                         // ranges a piece are not kept, sent and searched.
-                        let mut bytes = 0;
-                        for &(r, m) in &runs {
-                            held[r..r + m].copy_from_slice(&title[r..r + m]);
-                            bytes += m;
-                        }
+                        // (All of the piece in one copy: outside the
+                        // runs the two hold the same bytes.)
+                        let bytes: usize = runs.iter().map(|r| r.1).sum();
+                        let mask = Arc::new(mask_of(at, n, &runs));
+                        held.copy_from_slice(title);
                         MERGED[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
                         MERGED[2].fetch_add(bytes as u64, Ordering::Relaxed);
-                        let mask = Arc::new(mask_of(at, n, &runs));
                         let _dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
                         card.masked.lock().unwrap_or_else(|e| e.into_inner()).push((at, n, mask));
                         runs.clear();
@@ -2812,11 +2824,13 @@ impl Shadow {
     /// The second half of [`Shadow::update`]: copies what `asked` found
     /// stale. Returns the bytes copied.
     pub(crate) fn update_copy(&self, asked: Asked) -> usize {
-        asked
+        let bytes = asked
             .0
             .into_iter()
             .map(|(from, to, answer)| self.copy_free(from, to, answer))
-            .sum()
+            .sum();
+        crate::profile::refreshed(self.start, self.len, self.card.is_some(), bytes);
+        bytes
     }
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
@@ -2907,7 +2921,7 @@ impl Shadow {
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
-        let (mut bytes, mut run) = (0, None);
+        let (mut bytes, mut run) = (0, None::<usize>);
         let last = (to - 1) / PAGE;
         for page in from / PAGE..=last {
             let write = match writes.peek() {
@@ -2919,11 +2933,37 @@ impl Shadow {
             };
             let at = &mut copied[page - base];
             if *at == 0 || write > *at {
+                // By the part (`crate::watch::fine`): the parts written since
+                // the copy last took the page, each run of them a copy. A
+                // page all of whose parts were is taken as before.
+                let parts = if crate::watch::fine() { crate::watch::parts_since(page, *at) } else { u16::MAX };
                 // A page only partly in the range is copied in part: it
                 // stays stale for the rest.
                 let (start, end) = (self.start as usize, (self.start + self.len) as usize);
                 if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
                     *at = now;
+                }
+                if parts != u16::MAX {
+                    if let Some(first) = run.take() {
+                        bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                    }
+                    const PART: usize = PAGE / 16;
+                    let mut k = 0;
+                    while k < 16 {
+                        if parts >> k & 1 == 0 {
+                            k += 1;
+                            continue;
+                        }
+                        let first = k;
+                        while k < 16 && parts >> k & 1 != 0 {
+                            k += 1;
+                        }
+                        let (a, e) = ((page * PAGE + first * PART).max(from), (page * PAGE + k * PART).min(to));
+                        if a < e {
+                            bytes += self.copy(a, e);
+                        }
+                    }
+                    continue;
                 }
                 run.get_or_insert(page);
             } else if let Some(first) = run.take() {

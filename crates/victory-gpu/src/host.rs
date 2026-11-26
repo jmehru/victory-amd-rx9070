@@ -237,7 +237,9 @@ fn spin_for(fence: &ID3D12Fence, value: u64) {
 /// Drops `object` once every submission running now has finished: at once
 /// if none is.
 pub(crate) fn retire<T: 'static>(object: T) {
-    let started = STARTED.load(Ordering::Acquire);
+    // (Those the title made and the host has not begun get the next numbers.)
+    let queued = crate::queue::queued();
+    let started = STARTED.load(Ordering::Acquire) + queued;
     if started <= FINISHED.load(Ordering::Acquire) {
         RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
         drop(object);
@@ -248,6 +250,38 @@ pub(crate) fn retire<T: 'static>(object: T) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push((started, Retired(Box::new(object))));
+}
+
+/// What is let go by a thread of its own when it is dropped
+/// (`VICTORY_FAR_DROPS=0`: by the thread that drops it).
+///
+/// The sweep that lets idle host copies of textures go runs before a
+/// submission, on the thread that submits, and at a cut of the boat save's
+/// opening it let so many go that giving their memory back to the system was
+/// 38 ms a frame of that thread, averaged over the half minute around the
+/// cut (profile boatC).
+pub(crate) struct Far<T: Send + 'static>(pub(crate) Option<T>);
+
+impl<T: Send + 'static> Drop for Far<T> {
+    fn drop(&mut self) {
+        let Some(object) = self.0.take() else { return };
+        static ON: OnceLock<bool> = OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_FAR_DROPS").is_none_or(|v| v != "0")) {
+            return;
+        }
+        static GRAVE: OnceLock<std::sync::mpsc::Sender<Box<dyn Send>>> = OnceLock::new();
+        let grave = GRAVE.get_or_init(|| {
+            let (to, from) = std::sync::mpsc::channel::<Box<dyn Send>>();
+            let _ = std::thread::Builder::new().name("victory-drops".into()).spawn(move || {
+                for object in from {
+                    drop(object);
+                }
+            });
+            to
+        });
+        // (If the thread is not there, dropped here.)
+        let _ = grave.send(Box::new(object));
+    }
 }
 
 /// As [`retire`], but kept for `more` submissions past the ones running
@@ -862,10 +896,83 @@ mod tests {
     }
 }
 
+/// A host command list that knows whether anything was recorded into it:
+/// whoever takes the list to record takes it through this.
+pub(crate) struct Recorded {
+    inner: ID3D12GraphicsCommandList,
+    touched: std::sync::atomic::AtomicBool,
+}
+
+impl std::ops::Deref for Recorded {
+    type Target = ID3D12GraphicsCommandList;
+    fn deref(&self) -> &ID3D12GraphicsCommandList {
+        self.touched.store(true, Ordering::Relaxed);
+        &self.inner
+    }
+}
+
+/// Whether a list of the title's that nothing was recorded into is left out
+/// of its submission (`VICTORY_SKIP_EMPTY_LISTS=0`: run too). What the list
+/// defers to its submission (waits, values written when it has run, fills)
+/// is done all the same.
+///
+/// The title closes and submits some 330 lists a frame that hold no draw,
+/// dispatch, clear, copy or barrier (run y1), and each costs the card about
+/// 25 us between its two timestamps, 8 ms a frame: what a list costs the card
+/// by being one (the bare cost test: 100 lists of 100 draws take 0.2 us a
+/// draw more than one list of 10,000).
+fn skip_empty() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SKIP_EMPTY_LISTS").is_none_or(|v| v != "0"))
+}
+
+/// Lists of the title's closed since the last frame line: all, and those
+/// nothing was recorded into.
+static CLOSED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// The batches of clamped records in one scratch buffer
+/// ([`HostList::batch_place`]).
+const BATCHES: u32 = 8;
+
+/// Scratch buffers made since the last frame line: for batches of clamped
+/// records, and for records clamped alone.
+static SCRATCH_MADE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Scratch buffers of batched clamps (all of one size, in the common state)
+/// that lists let go of with themselves: taken by the next list that needs
+/// one (`VICTORY_BUFFER_POOL=0`: made anew). A frame has some 410 lists and
+/// 128 are kept idle at most, so the rest were made with new buffers: 7 a
+/// frame (run r1), 5 thread-ms a frame of the recording threads.
+static SCRATCH_FREE: Mutex<Vec<ID3D12Resource>> = Mutex::new(Vec::new());
+
+impl Drop for HostList {
+    fn drop(&mut self) {
+        if !crate::texture::buffers_pooled() {
+            return;
+        }
+        // (A list is let go when it has run, or was never sent: its last
+        // recording left the buffers in the common state.)
+        let args = self.batch_args.get_mut().unwrap_or_else(|e| e.into_inner());
+        if args.1 == 0 && !args.0.is_empty() {
+            let mut free = SCRATCH_FREE.lock().unwrap_or_else(|e| e.into_inner());
+            while free.len() < 256
+                && let Some(buffer) = args.0.pop()
+            {
+                free.push(buffer);
+            }
+        }
+    }
+}
+
+/// Batched clamp passes recorded since the last frame line.
+pub(crate) static BATCH_PASSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
-    pub(crate) list: ID3D12GraphicsCommandList,
+    pub(crate) list: Recorded,
+    /// Closed with nothing recorded into it ([`skip_empty`]): not run.
+    empty: std::sync::atomic::AtomicBool,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
     /// Upload memory for data the list's draws make (expanded vertices),
@@ -894,6 +1001,9 @@ pub(crate) struct HostList {
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// Scratch buffers of the batched clamps (`crate::indirect::batch`), and
+    /// how many batches of this recording have a place in them.
+    batch_args: Mutex<(Vec<ID3D12Resource>, u32)>,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -1734,6 +1844,42 @@ const TIME_KINDS: [&str; 10] = [
 /// The next pair of timestamps to hand out, and the next to read.
 static TIME_NEXT: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 static TIME_KIND: [std::sync::atomic::AtomicU8; TIME_PAIRS as usize] = [const { std::sync::atomic::AtomicU8::new(0) }; TIME_PAIRS as usize];
+/// Of a list of the title's: the number of what it is ([`PASSES`]), or 0.
+static TIME_PASS: [std::sync::atomic::AtomicU32; TIME_PAIRS as usize] = [const { std::sync::atomic::AtomicU32::new(0) }; TIME_PAIRS as usize];
+/// What the title's lists are, by the pipelines they bind (the first three
+/// by name and how many) and the size of the first target they draw to.
+static PASSES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Notes what the list timed as `pair` was: `text`.
+fn card_time_pass(pair: Option<u64>, text: String) {
+    let Some(pair) = pair else { return };
+    let mut passes = PASSES.lock().unwrap_or_else(|e| e.into_inner());
+    let n = match passes.iter().position(|p| *p == text) {
+        Some(n) => n,
+        None => {
+            passes.push(text);
+            passes.len() - 1
+        }
+    };
+    TIME_PASS[(pair % u64::from(TIME_PAIRS)) as usize].store(n as u32 + 1, Ordering::Relaxed);
+}
+
+/// The kinds of commands [`HostList::tally`] counts.
+pub(crate) const TALLIED: [&str; 8] = [
+    "target clears",
+    "depth clears",
+    "texture copies",
+    "buffer copies",
+    "resolves",
+    "texture uploads",
+    "barriers of the title",
+    "read-backs",
+];
+
+/// Whether the card's time is measured ([`card_times`]).
+pub(crate) fn card_times_on() -> bool {
+    card_times().is_some()
+}
 
 /// [`card_times`]: a timestamp where `list` stands, the start of a part of
 /// `kind` ([`TIME_KINDS`]); to be ended by [`card_time_end`].
@@ -1777,6 +1923,7 @@ fn card_times_line(frames: f64) {
     let mut sums = [0u64; TIME_KINDS.len()];
     let mut counts = [0u64; TIME_KINDS.len()];
     let mut spans: [Vec<(u64, u64)>; 2] = [Vec::new(), Vec::new()];
+    let mut by_pass: std::collections::HashMap<u32, (u64, u64)> = std::collections::HashMap::new();
     for pair in read..until {
         let slot = (pair % u64::from(TIME_PAIRS)) as usize;
         // SAFETY: inside the mapping; the card wrote these long ago.
@@ -1787,9 +1934,19 @@ fn card_times_line(frames: f64) {
         if b < a || b - a > times.frequency * 2 {
             continue;
         }
+        if TIME_KIND[slot].load(Ordering::Relaxed) == u8::MAX {
+            // A list that was not run.
+            continue;
+        }
         let kind = (TIME_KIND[slot].load(Ordering::Relaxed) as usize).min(TIME_KINDS.len() - 1);
         sums[kind] += b - a;
         counts[kind] += 1;
+        if kind == 0 {
+            let pass = TIME_PASS[slot].swap(0, Ordering::Relaxed);
+            let entry = by_pass.entry(pass).or_insert((0u64, 0u64));
+            entry.0 += b - a;
+            entry.1 += 1;
+        }
         // (The clamps run inside the title's lists: not a span of their own.)
         if kind != 8 {
             spans[usize::from(kind != 0)].push((a, b));
@@ -1817,6 +1974,23 @@ fn card_times_line(frames: f64) {
     for k in 0..TIME_KINDS.len() {
         if counts[k] > 0 {
             text.push_str(&format!(" {} {:.2} ms in {:.1};", TIME_KINDS[k], ms(sums[k]), counts[k] as f64 / frames.max(1.0)));
+        }
+    }
+    // The title's lists by what they are, the twelve that took longest.
+    {
+        let passes = PASSES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut by: Vec<(u32, (u64, u64))> = by_pass.into_iter().collect();
+        by.sort_unstable_by(|a, b| b.1.0.cmp(&a.1.0));
+        for (pass, (ticks, n)) in by.into_iter().take(12) {
+            let what = match pass {
+                0 => "(not named)",
+                n => passes.get(n as usize - 1).map_or("?", |p| p.as_str()),
+            };
+            tracing::info!(
+                "  the card's time by pass: {:.2} ms a frame in {:.1} lists: {what}",
+                ms(ticks),
+                n as f64 / frames.max(1.0)
+            );
         }
     }
     static MOVES_THEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2221,6 +2395,12 @@ struct Deferred {
     card_scratch: CardScratch,
     /// The list's pair of timestamps ([`card_times`]).
     card_time: Option<u64>,
+    /// With [`card_times`]: the size of the first colour target (or depth
+    /// target) the list drew to, and how many colour targets.
+    target: Option<(u64, u32, usize)>,
+    /// With [`card_times`]: commands of the list that need no pipeline, by
+    /// kind ([`TALLIED`]).
+    tally: [u32; TALLIED.len()],
 }
 
 impl Deferred {
@@ -3544,7 +3724,8 @@ impl Host {
             }
             Ok(HostList {
                 allocator,
-                list,
+                list: Recorded { inner: list, touched: std::sync::atomic::AtomicBool::new(false) },
+                empty: std::sync::atomic::AtomicBool::new(false),
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
@@ -3554,6 +3735,7 @@ impl Host {
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
+                batch_args: Mutex::default(),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -4527,6 +4709,8 @@ impl Host {
     /// Runs closed lists and waits for them, and with [`late`] for
     /// everything sent to the card before them, which is settled first.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        // Behind what the title's queues were given before it.
+        crate::queue::before_sync();
         let _ = self.submit(runs, false);
     }
 
@@ -4873,10 +5057,13 @@ impl Host {
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
+            if list.empty.load(Ordering::Relaxed) {
+                continue;
+            }
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
             }
-            lists.push(list.list.cast().ok());
+            lists.push(list.list.inner.cast().ok());
         }
         batch.flush();
         crate::watch::ask_once_end();
@@ -5333,6 +5520,7 @@ impl HostList {
     pub(crate) fn close(&self) {
         self.twins_to_depth();
         self.textures_back();
+        self.batches_common();
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -5357,9 +5545,44 @@ impl HostList {
             unsafe { self.list.ResourceBarrier(&back) };
         }
         let timed = self.deferred().card_time.take();
-        card_time_end(&self.list, timed);
+        if timed.is_some() {
+            let target = self.deferred().target.take();
+            let tally = std::mem::take(&mut self.deferred().tally);
+            let pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
+            let names: Vec<&str> = pipelines.iter().take(3).map(String::as_str).collect();
+            let text = if pipelines.is_empty() {
+                // By the kinds of commands it holds (how many: 1, 2-3, 4+).
+                let held: Vec<String> = TALLIED
+                    .iter()
+                    .zip(tally)
+                    .filter(|(_, n)| *n > 0)
+                    .map(|(what, n)| format!("{what} {}", if n == 1 { "1" } else if n < 4 { "2-3" } else { "4+" }))
+                    .collect();
+                format!("no pipeline: {}", if held.is_empty() { "none of the commands counted".into() } else { held.join(", ") })
+            } else {
+                format!(
+                    "{} pipelines, target {}: {}",
+                    pipelines.len(),
+                    target.map_or("none".into(), |(w, h, n)| format!("{w}x{h} x{n}")),
+                    names.join(" | ")
+                )
+            };
+            drop(pipelines);
+            card_time_pass(timed, text);
+        }
+        // Nothing recorded since the reset: said, and with the switch the
+        // list is not run (its timestamps then are not the card's).
+        let untouched = !self.list.touched.load(Ordering::Relaxed);
+        CLOSED[0].fetch_add(1, Ordering::Relaxed);
+        CLOSED[1].fetch_add(u64::from(untouched), Ordering::Relaxed);
+        let empty = untouched && skip_empty();
+        self.empty.store(empty, Ordering::Relaxed);
+        if empty && let Some(pair) = timed {
+            TIME_KIND[(pair % u64::from(TIME_PAIRS)) as usize].store(u8::MAX, Ordering::Relaxed);
+        }
+        card_time_end(&self.list.inner, timed);
         // SAFETY: our list.
-        if let Err(e) = unsafe { self.list.Close() } {
+        if let Err(e) = unsafe { self.list.inner.Close() } {
             fail(format_args!(
                 "a host command list did not close ({e}): a command recorded into it was invalid"
             ));
@@ -5397,8 +5620,9 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
-        let timed = card_time_begin(&self.list, 0);
+        let timed = card_time_begin(&self.list.inner, 0);
         self.deferred().card_time = timed;
+        self.list.touched.store(false, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
     }
@@ -6079,6 +6303,7 @@ impl HostList {
             .max(needed)
             .next_multiple_of(64 << 10);
         let buffer = host()?.uav_buffer(alloc)?;
+        SCRATCH_MADE[1].fetch_add(1, Ordering::Relaxed);
         name(&buffer, || format!("indirect arguments {alloc:#x}"));
         let old = slot.replace((buffer.clone(), alloc));
         drop(slot);
@@ -6086,6 +6311,71 @@ impl HostList {
             self.keep(&old_buf);
         }
         Some(buffer)
+    }
+
+    /// Where the next batch of clamped records goes: a device-local buffer
+    /// the list keeps from recording to recording, the batch's place in it
+    /// and the state the buffer is in. Every batch of a recording has a place
+    /// of its own: the executions before it may still read theirs.
+    pub(crate) fn batch_place(&self) -> Option<(ID3D12Resource, u32, D3D12_RESOURCE_STATES)> {
+        use crate::indirect::batch::{JOBS, SLOT};
+        let mut args = self.batch_args.lock().unwrap_or_else(|e| e.into_inner());
+        let (buffer, i) = ((args.1 / BATCHES) as usize, args.1 % BATCHES);
+        if buffer == args.0.len() {
+            let size = u64::from(BATCHES * JOBS * SLOT);
+            let free = SCRATCH_FREE.lock().unwrap_or_else(|e| e.into_inner()).pop();
+            let made = match free {
+                Some(free) => free,
+                None => {
+                    SCRATCH_MADE[0].fetch_add(1, Ordering::Relaxed);
+                    host()?.uav_buffer(size)?
+                }
+            };
+            name(&made, || format!("indirect batches {size:#x}"));
+            args.0.push(made);
+        }
+        args.1 += 1;
+        BATCH_PASSES.fetch_add(1, Ordering::Relaxed);
+        // (Its first batch finds it as the recording before left it:
+        // `batches_common`.)
+        let state = if i == 0 { D3D12_RESOURCE_STATE_COMMON } else { D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT };
+        Some((args.0[buffer].clone(), i * JOBS * SLOT, state))
+    }
+
+    /// Before the list closes: the scratch buffers of the batched clamps go
+    /// back to the common state, where the next recording expects them.
+    fn batches_common(&self) {
+        let mut args = self.batch_args.lock().unwrap_or_else(|e| e.into_inner());
+        let used = std::mem::take(&mut args.1).div_ceil(BATCHES) as usize;
+        let barriers: Vec<D3D12_RESOURCE_BARRIER> = args.0[..used]
+            .iter()
+            .map(|b| transition(b, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COMMON))
+            .collect();
+        if !barriers.is_empty() {
+            // SAFETY: an open list and live buffers this recording left in
+            // `INDIRECT_ARGUMENT`.
+            unsafe { self.list.ResourceBarrier(&barriers) };
+        }
+    }
+
+    /// With [`card_times`]: the list holds another command of kind `kind`
+    /// ([`TALLIED`]).
+    pub(crate) fn tally(&self, kind: usize) {
+        if card_times_on() {
+            let mut deferred = self.deferred();
+            if deferred.card_time.is_some() {
+                deferred.tally[kind] += 1;
+            }
+        }
+    }
+
+    /// With [`card_times`]: the list draws to a target of this size (the
+    /// first one said stays).
+    pub(crate) fn note_target(&self, size: impl FnOnce() -> Option<(u64, u32, usize)>) {
+        let mut deferred = self.deferred();
+        if deferred.card_time.is_some() && deferred.target.is_none() {
+            deferred.target = size();
+        }
     }
 
     /// Keeps `object` alive until the list is reset.
@@ -6320,6 +6610,7 @@ struct Batch {
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
+        crate::profile::bound(shadow.start_address(), address, end);
         let key = std::sync::Arc::as_ptr(shadow) as usize;
         match self.index.get(&key) {
             Some(&at) => {
@@ -6372,6 +6663,7 @@ impl Batch {
     }
 
     fn flush(&mut self) {
+        crate::profile::bound_flush();
         self.index.clear();
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
@@ -6866,6 +7158,48 @@ impl Meter {
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
         );
         late_line(frames);
+        crate::queue::behind_line(frames);
+        {
+            let [marks, resolved] = [0, 1].map(|i| crate::queue::TIMESTAMPS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if marks + resolved > 0.0 {
+                tracing::info!(
+                    "GPU timestamps the title asks for, per frame: {marks:.1} written at the bottom of the pipe, {resolved:.1} resolved from queries \
+                     (each is the clock when its list has landed, not a time on the card)"
+                );
+            }
+        }
+        {
+            let [all, untouched] = [0, 1].map(|i| CLOSED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            tracing::info!(
+                "lists of the title's closed per frame: {all:.1}, {untouched:.1} of them with nothing recorded into them (left out of their submissions; VICTORY_SKIP_EMPTY_LISTS=0 runs them)"
+            );
+        }
+        {
+            let [first, more] = [0, 1].map(|i| crate::watch::FAULTS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            tracing::info!(
+                "write faults on guarded title memory per frame: {first:.0} that opened a page{}",
+                if crate::watch::fine() {
+{
+                        let r: [f64; 5] = std::array::from_fn(|i| crate::watch::REPORTED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                        let w: [f64; 5] = std::array::from_fn(|i| crate::watch::WHOLE[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                        format!(
+                            " or its first 4 KiB part, {more:.0} that opened a further part or the rest (VICTORY_GUARD_PAGE=4096); pages the guards reported: {:.0} open in part with {:.0} parts, {:.0} opened whole by a second fault or as lately, {:.0} written through another view, {:.0} open whole otherwise (never guarded or not known {:.0}, mapping changed {:.0}, a fault at a page shown at several addresses {:.0}, a write of ours or the kernel's {:.0}, was absent {:.0})",
+                            r[0], r[1], r[4], r[3], r[2], w[0], w[1], w[2], w[3], w[4]
+                        )
+                    }
+                } else {
+                    String::new()
+                }
+            );
+        }
+        let passes = BATCH_PASSES.swap(0, Ordering::Relaxed);
+        if passes > 0 {
+            let [batches, alone] = [0, 1].map(|i| SCRATCH_MADE[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            tracing::info!(
+                "argument clamps in batches (VICTORY_INDIRECT_BATCH): {:.1} passes a frame; scratch buffers made a frame: {batches:.1} for batches, {alone:.1} for records clamped alone",
+                passes as f64 / frames
+            );
+        }
         card_clock_line(frames, ms);
         crate::shadow::back_line(frames);
         {

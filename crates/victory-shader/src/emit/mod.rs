@@ -115,6 +115,7 @@ pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
     SLOT_STRIDES_COUNT, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    USER_CBV_FRESH, USER_CBV_SLOT,
     set_view_heap_limit, view_heap_limit,
 };
 
@@ -166,6 +167,26 @@ pub fn group_sync() -> u8 {
         Some("1") => 1,
         _ => 2,
     })
+}
+
+/// Whether a program takes the constant buffers of its descriptor tables
+/// from view heap slots the host names one by one
+/// ([`shader::USER_CBV_SLOT`]), not from the table (`VICTORY_CBV_SLOTS=0`: from
+/// the table, as before).
+///
+/// The host wants constant buffers on 256 bytes and the console's are on 16,
+/// so the host cannot show a table's constant buffer in the title's own
+/// slot: it made the whole table afresh for every draw, with every other
+/// view in it, though the draws' tables differ in their constant buffer
+/// alone (8,000 tables and 55,000 views a frame, profile p4). With this a
+/// draw reads the other views from the title's table and the host makes one
+/// slot for a constant buffer.
+///
+/// Part of the translation: the shader cache keys on it (`victory-gpu`'s
+/// does).
+pub fn cbv_slots() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CBV_SLOTS").is_none_or(|v| v != "0"))
 }
 
 /// The clean-up passes that run over a translated program before it is

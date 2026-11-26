@@ -27,6 +27,8 @@ use windows::core::s;
 
 use crate::host::{BUFFER_READ, HostList, host, transition};
 
+pub(crate) mod batch;
+
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
 cbuffer Record : register(b0) {
@@ -179,13 +181,18 @@ fn make() -> windows::core::Result<Clamp> {
 }
 
 fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
+    make_from(device, SOURCE)
+}
+
+/// The clamp pipeline of `source` on `device`.
+fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
     let compiled = unsafe {
         D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
+            source.as_ptr().cast(),
+            source.len(),
             s!("clamp"),
             None,
             None,
@@ -507,6 +514,63 @@ fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
             D3D12_RESOURCE_STATE_COMMON,
         )])
     };
+}
+
+/// The batched clamp's pipeline ([`batch`]).
+fn batch_clamp() -> Option<&'static Clamp> {
+    static CLAMP: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
+    CLAMP
+        .get_or_init(|| {
+            let made = host().ok_or_else(windows::core::Error::empty).and_then(|h| make_from(&h.device, batch::SOURCE));
+            match made {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::warn!(error = %e, "no batched argument clamp: records are clamped one at a time");
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+/// Opens a batch in `list` ([`batch`]): a pass that clamps the records of
+/// the executions recorded after it, of `source` (a host copy's number and
+/// buffer) and of the `recent` ones after it. The table to add them to,
+/// and the scratch buffer its places are in. Replaces the list's compute
+/// root signature and pipeline (callers bind theirs after). `None` if the
+/// clamp is not available.
+pub(crate) fn open_batch(
+    list: &HostList,
+    source: (u64, &ID3D12Resource),
+    recent: &[(u64, ID3D12Resource)],
+) -> Option<(batch::Table, ID3D12Resource)> {
+    let c = batch_clamp()?;
+    let budget = list.budget()?;
+    let (jobs, at) = list.scratch(batch::TABLE)?;
+    let (dst, base, before) = list.batch_place()?;
+    let gpu = |b: &ID3D12Resource| {
+        // SAFETY: a live buffer.
+        Some(unsafe { b.GetGPUVirtualAddress() }).filter(|at| at.is_multiple_of(4))
+    };
+    // A source there is none of is the first again, which no job names.
+    let mut ids = [0u64; batch::SOURCES];
+    let mut sources = [gpu(source.1)?; batch::SOURCES];
+    ids[0] = source.0;
+    let others = recent.iter().filter(|r| r.0 != source.0).take(batch::SOURCES - 1);
+    for (i, (id, buffer)) in others.enumerate() {
+        if let Some(at) = gpu(buffer) {
+            // Bound, and read only if a job names it: kept alive like the
+            // copies draws read (`Shadow::refresh`).
+            list.keep(buffer);
+            (ids[i + 1], sources[i + 1]) = (*id, at);
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
+    batch::record(c, &list.list, (&dst, before), budget, sources, jobs);
+    // SAFETY: the list's own upload memory of that many bytes, 256-byte
+    // aligned, until it is reset.
+    Some((unsafe { batch::Table::new(at, base, ids) }, dst))
 }
 
 /// `VICTORY_BARRIER_TEST` in every build (the diagnostics' report reads the same

@@ -1391,7 +1391,27 @@ pub(crate) fn room() -> bool {
         return true;
     }
     match crate::host::host().and_then(|h| h.video_memory()) {
-        Some([budget, used, ..]) => used < budget / 100 * room_percent(),
+        Some([budget, used, ..]) => {
+            let room = used < budget / 100 * room_percent();
+            // The answer changed: said, with what it was made from.
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(room), Relaxed) != u8::from(room) {
+                let [heaps, live, free, kept] = blocks::census();
+                tracing::info!(
+                    "room on the card for more textures picked by index: {} (frame {}): {} MB of the card's memory in use, budget {} MB, host copies of textures the title fills {} MB; blocks of card memory for them (VICTORY_TEXTURE_BLOCKS): {} of 64 MiB, {} MB in textures, {} MB in pieces let go, {} MB in pieces whose texture something still held",
+                    if room { "yes" } else { "no" },
+                    crate::frame::current(),
+                    used >> 20,
+                    budget >> 20,
+                    filled >> 20,
+                    heaps,
+                    live >> 20,
+                    free >> 20,
+                    kept >> 20
+                );
+            }
+            room
+        }
         None => filled < WITHOUT_BUDGET,
     }
 }
@@ -1686,7 +1706,7 @@ pub(crate) fn let_go_idle() {
             if first.is_none() {
                 first = Some(at);
             }
-            crate::host::retire(host);
+            crate::host::retire(crate::host::Far(Some(host)));
         }
     }
     if went > 0 {
@@ -1792,6 +1812,7 @@ impl HostTexture {
 impl Drop for HostTexture {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
+        blocks::let_go(&self.texture);
         HOST_TEXTURES[0].fetch_sub(1, Relaxed);
         HOST_TEXTURES[1].fetch_sub(self.bytes, Relaxed);
         if self.filled {
@@ -1875,6 +1896,169 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     hosted(this, true).map(|made| made.0)
 }
 
+/// Card memory for the host copies of textures the title fills, in blocks
+/// made ahead (`VICTORY_TEXTURE_BLOCKS=1`; off, see below): a texture is placed in a
+/// piece of a block, and a piece let go is taken by the next texture of the
+/// same bytes. The idea is avatarmanz/VIctory-7900XTX's ("textures are cut
+/// from blocks"), written for this tree.
+///
+/// Made each on its own, a texture is an allocation the system makes and
+/// takes back: across a cut of the boat save's opening the pass that uploads
+/// textures picked by index spent 121 of its 144 thread-ms a frame creating
+/// them, on the recording threads, and the title's frame waited for it
+/// (profiles boatC, boatD).
+///
+/// Off: a texture let go gives the card no memory back (its piece waits for
+/// a texture of the same bytes), so the card's memory in use only grows, and
+/// once it is at nine tenths of the budget [`room`] says no for the rest of
+/// the run: the textures picked by index that were not made by then never
+/// are. In the cell that was at frame 1,600 of some 4,500 (run tb1: 12,491
+/// MB in use of a budget of 13,879, 156 blocks, 1,173 MB of them in pieces
+/// let go; 7,316 textures still waiting at the end against 137 without),
+/// and the room came out black, without the window's glass or with broken
+/// posters, in 13 of 14 runs. Made each on its own the textures in use stay
+/// near 10,200 MB of the card's memory and the system keeps as much again
+/// in the PC's.
+#[cfg(windows)]
+mod blocks {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::core::Interface;
+
+    /// The bytes of a block, and the most a texture placed in one has.
+    const BLOCK: u64 = 64 << 20;
+    const MOST: u64 = 16 << 20;
+
+    struct Blocks {
+        heaps: Vec<ID3D12Heap>,
+        /// Where the newest block is filled to.
+        top: u64,
+        /// Pieces let go, by their bytes: (block, offset).
+        free: HashMap<u64, Vec<(usize, u64)>>,
+        /// The piece of each texture placed (by its address).
+        placed: HashMap<usize, (usize, u64, u64)>,
+        /// Bytes in pieces let go, and in pieces whose texture something
+        /// still held when its host copy went.
+        free_bytes: u64,
+        kept: u64,
+    }
+
+    /// Blocks made, and the bytes in textures placed, in pieces let go and
+    /// in pieces kept for good.
+    pub(super) fn census() -> [u64; 4] {
+        let blocks = BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
+        blocks.as_ref().map_or([0; 4], |b| {
+            [b.heaps.len() as u64, b.placed.values().map(|p| p.2).sum(), b.free_bytes, b.kept]
+        })
+    }
+
+    // SAFETY: Direct3D 12 heaps are free-threaded.
+    unsafe impl Send for Blocks {}
+
+    static BLOCKS: Mutex<Option<Blocks>> = Mutex::new(None);
+
+    fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_BLOCKS").is_some_and(|v| v != "0"))
+    }
+
+    /// `VICTORY_TEXTURE_BLOCKS=fresh`: a piece let go is not taken again (a
+    /// test: every texture then starts as zeros, as one made on its own
+    /// does), up to 6 GiB of blocks.
+    fn fresh() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_BLOCKS").is_some_and(|v| v == "fresh"))
+    }
+
+    /// A texture of `desc` (the host's layout) placed in a block, in `state`;
+    /// `None`: to be made on its own (off, too big, or the host refused).
+    pub(super) fn place(device: &ID3D12Device, desc: &super::ResourceDesc, state: u32) -> Option<ID3D12Resource> {
+        if !on() {
+            return None;
+        }
+        // SAFETY: the description has the host's layout.
+        let d = unsafe { &*std::ptr::from_ref(desc).cast::<D3D12_RESOURCE_DESC>() };
+        // SAFETY: a plain query.
+        let info = unsafe { device.GetResourceAllocationInfo(0, &[*d]) };
+        if info.SizeInBytes == 0 || info.SizeInBytes > MOST || info.Alignment > 65536 {
+            return None;
+        }
+        let bytes = info.SizeInBytes.next_multiple_of(65536);
+        let mut blocks = BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
+        let b = blocks.get_or_insert_with(|| Blocks { heaps: Vec::new(), top: BLOCK, free: HashMap::new(), placed: HashMap::new(), free_bytes: 0, kept: 0 });
+        let (block, offset) = match b.free.get_mut(&bytes).and_then(Vec::pop) {
+            Some(piece) => {
+                b.free_bytes -= bytes;
+                piece
+            }
+            None => {
+                if b.top + bytes > BLOCK {
+                    if fresh() && b.heaps.len() >= 96 {
+                        return None;
+                    }
+                    let mut heap: Option<ID3D12Heap> = None;
+                    // SAFETY: plain creation of a heap for textures that are
+                    // neither targets nor depth.
+                    unsafe {
+                        device
+                            .CreateHeap(
+                                &D3D12_HEAP_DESC {
+                                    SizeInBytes: BLOCK,
+                                    Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                                    Alignment: 0,
+                                    Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES,
+                                },
+                                &mut heap,
+                            )
+                            .ok()?;
+                    }
+                    b.heaps.push(heap?);
+                    b.top = 0;
+                }
+                let at = b.top;
+                b.top += bytes;
+                (b.heaps.len() - 1, at)
+            }
+        };
+        let mut texture: Option<ID3D12Resource> = None;
+        // SAFETY: a piece of a live heap that no texture in use lies in.
+        let made = unsafe {
+            device.CreatePlacedResource(&b.heaps[block], offset, d, D3D12_RESOURCE_STATES(state as i32), None, &mut texture)
+        };
+        match (made, texture) {
+            (Ok(()), Some(texture)) => {
+                b.placed.insert(texture.as_raw() as usize, (block, offset, bytes));
+                Some(texture)
+            }
+            _ => {
+                b.free.entry(bytes).or_default().push((block, offset));
+                b.free_bytes += bytes;
+                None
+            }
+        }
+    }
+
+    /// The host copy that holds `texture` goes: its piece is free for the
+    /// next, unless something else still holds the texture (a slot, a list):
+    /// then the piece stays with it for good.
+    pub(super) fn let_go(texture: &ID3D12Resource) {
+        if !on() {
+            return;
+        }
+        let mut blocks = BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(b) = blocks.as_mut() else { return };
+        if let Some((block, offset, bytes)) = b.placed.remove(&(texture.as_raw() as usize)) {
+            if crate::host::references(texture) == 1 && !fresh() {
+                b.free.entry(bytes).or_default().push((block, offset));
+                b.free_bytes += bytes;
+            } else {
+                b.kept += bytes;
+            }
+        }
+    }
+}
+
 /// A host texture like the title's: same description, in GPU memory,
 /// without the console's layout and flags.
 #[cfg(windows)]
@@ -1939,6 +2123,14 @@ fn host_texture(
         ..Default::default()
     };
     let allocate = |d: &ResourceDesc, clear: Option<&[u32; 5]>| {
+        // A texture the title fills (no target, depth or unordered access):
+        // cut from a block of card memory kept for such ([`blocks`]).
+        if d.flags & 7 == 0
+            && clear.is_none()
+            && let Some(texture) = blocks::place(&host.device, d, crate::host::legal_for(d.flags, crate::host::texture_state(state)))
+        {
+            return Ok(Some(texture));
+        }
         let mut texture: Option<ID3D12Resource> = None;
         // SAFETY: the description and clear value have the host layout.
         unsafe {

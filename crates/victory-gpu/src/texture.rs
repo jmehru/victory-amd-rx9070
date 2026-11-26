@@ -438,7 +438,44 @@ impl Drop for Staging {
         use std::sync::atomic::Ordering::Relaxed;
         STAGED[0].fetch_sub(1, Relaxed);
         STAGED[1].fetch_sub(self.bytes, Relaxed);
+        // No list holds it any more (each that copies from it holds the
+        // staging until its reset): the buffer can stage another texture.
+        if buffers_pooled() {
+            let mut free = FREE.lock().unwrap_or_else(|e| e.into_inner());
+            if free.1 + self.bytes <= FREE_MOST {
+                free.1 += self.bytes;
+                free.0.entry(self.bytes).or_default().push((self.buffer.clone(), self.data as usize));
+            }
+        }
     }
+}
+
+/// Staging buffers let go, by their bytes, and the bytes of them all: taken
+/// again for textures of the same bytes ([`buffers_pooled`]).
+static FREE: Mutex<(std::collections::BTreeMap<u64, Vec<(ID3D12Resource, usize)>>, u64)> =
+    Mutex::new((std::collections::BTreeMap::new(), 0));
+/// The bytes of them kept at most.
+const FREE_MOST: u64 = 256 << 20;
+
+/// Whether staging buffers and read-back buffers that are let go are kept
+/// for the next texture of the same bytes (`VICTORY_BUFFER_POOL=0`: each is
+/// made anew, as before). While the title streams (the cutscene a save opens
+/// with), making them was 35 of 57 thread-ms a frame that the recording
+/// threads spent creating resources (profile cs2).
+pub(crate) fn buffers_pooled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BUFFER_POOL").is_none_or(|v| v != "0"))
+}
+
+/// A staging buffer of `total` bytes let go before, if there is one.
+fn free_staging(total: u64) -> Option<(ID3D12Resource, *mut u8)> {
+    if !buffers_pooled() {
+        return None;
+    }
+    let mut free = FREE.lock().unwrap_or_else(|e| e.into_inner());
+    let (buffer, data) = free.0.get_mut(&total)?.pop()?;
+    free.1 -= total;
+    Some((buffer, data as *mut u8))
 }
 
 /// For the memory line: staging buffers alive, their bytes, and how many
@@ -697,6 +734,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
         // SAFETY: an open list; both locations name live resources.
         unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
+    list.tally(5);
     // When the list is submitted, its copy takes what the staging buffer
     // holds by then: noted before the check below, which sets `dirty`
     // again if it detiles (the next list then uploads once more).
@@ -1358,7 +1396,10 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
             Some(&mut total),
         );
     }
-    let (buffer, data) = host.upload_buffer(total)?;
+    let (buffer, data) = match free_staging(total) {
+        Some(free) => free,
+        None => host.upload_buffer(total)?,
+    };
     crate::host::name(&buffer, || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",

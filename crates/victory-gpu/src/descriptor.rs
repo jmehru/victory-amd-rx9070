@@ -371,10 +371,14 @@ struct Views {
 /// resources kept are locked slot by slot.
 pub(crate) fn record_shared() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    // Off by default: two runs each way in the first scene gave 60.3 and
-    // 57.4 ms a frame with it against 61.9 and 60.9 without (RA1, RA2, RB1,
-    // RB2), inside what runs of one setting differ by.
-    *ON.get_or_init(|| std::env::var_os("VICTORY_RECORD_SHARED").is_some_and(|v| v == "1"))
+    // On unless `VICTORY_RECORD_SHARED=0`. Alone it was inside what runs of
+    // one setting differ by (60.3 and 57.4 ms a frame against 61.9 and 60.9:
+    // RA1, RA2, RB1, RB2), though the recorders' waits for our locks went
+    // from 59 to 27 thread-ms a frame and the submitting thread's wait for
+    // them from 12.7 to 6.9 ms (profiles p4, p5). Together with the guards'
+    // bit sets and the batched clamps: 55.1 and 55.9 ms a frame (hA1, hA2)
+    // against 57.0 to 61.3 with all three off (b0a, b0b, b0c, hN2).
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RECORD_SHARED").is_none_or(|v| v != "0"))
 }
 
 static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {

@@ -232,9 +232,68 @@ fn windows() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
 }
 
+/// Whether indirect executions of one record are clamped in batches
+/// (`crate::indirect::batch`; `VICTORY_INDIRECT_BATCH=0`: each on its own, or
+/// in windows ([`windows`]); `2`: see below). A hand port of
+/// avatarmanz/VIctory-7900XTX 0375962.
+///
+/// A batch is opened by the first execution after a point where arguments
+/// may have changed, and all executions up to the next such point read
+/// theirs from it, each exactly the record it asks for (windows guess which
+/// are next, and clamp what they do not know). Arguments in buffers change
+/// by dispatches and by draws whose shaders store to buffers; those end the
+/// batch, so the record an execution reads is clamped after all that was
+/// recorded before it, and the pass waits for all of it, exactly as the
+/// clamp of its own did. Between two executions of a batch is no wait of
+/// ours: there is nothing between them to wait for but draws that store to
+/// no buffer.
+///
+/// `VICTORY_INDIRECT_BATCH=2`: a dispatch does not end the batch before the
+/// title waits for it (a barrier, or a pipeline sync) or draws: what a
+/// dispatch writes is not there for a later command without a wait, and
+/// dispatches the title runs side by side are not held up by waits of ours.
+/// Whether the title has ways to wait that do not pass through its lists'
+/// methods is not known.
+fn batches() -> u8 {
+    static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_INDIRECT_BATCH").as_deref() {
+        Ok("0") => 0,
+        Ok("2") => 2,
+        _ => 1,
+    })
+}
+
+/// The records clamped by the pass opened last ([`batches`]).
+struct Batch {
+    table: crate::indirect::batch::Table,
+    scratch: ID3D12Resource,
+    /// Dispatches since, which may have written arguments
+    /// (`VICTORY_INDIRECT_BATCH=2`).
+    wrote: bool,
+}
+
+/// The host copies arguments were read from last: what a batch opens with,
+/// as the executions after the first may read theirs from another one.
+static ARGUMENT_COPIES: std::sync::Mutex<Vec<std::sync::Weak<crate::shadow::Shadow>>> = std::sync::Mutex::new(Vec::new());
+
+/// [`ARGUMENT_COPIES`] that live, and `first` put in front of them.
+fn argument_copies(first: &std::sync::Arc<crate::shadow::Shadow>) -> Vec<(u64, ID3D12Resource)> {
+    let mut copies = ARGUMENT_COPIES.lock().unwrap_or_else(|e| e.into_inner());
+    let live: Vec<_> = copies.iter().filter_map(std::sync::Weak::upgrade).filter(|s| s.id() != first.id()).collect();
+    *copies = std::iter::once(first)
+        .chain(&live)
+        .take(crate::indirect::batch::SOURCES)
+        .map(std::sync::Arc::downgrade)
+        .collect();
+    live.iter().map(|s| (s.id(), s.buffer.clone())).collect()
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
+    /// The records clamped in a batch, if later executions may still read
+    /// them ([`batches`]).
+    batch: Option<Batch>,
     pipeline: usize,
     /// View heap, sampler heap.
     heaps: [usize; 2],
@@ -276,6 +335,12 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
+    /// Constant buffers given a slot of their own in this list
+    /// (`victory_shader::emit::cbv_slots`): (heap, address, size) → slot.
+    cbv_made: std::collections::HashMap<(usize, u64, u32), u32>,
+    /// The slots of the constant buffers the stage being bound asked for,
+    /// by (root parameter, dword).
+    cbv_words: Vec<((u8, u32), u32)>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -318,6 +383,7 @@ impl State {
             crate::descriptor::release_dynamic(heap, first, n);
         }
         self.fresh_tables.clear();
+        self.cbv_made.clear();
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
         self.tables_gone = true;
@@ -987,6 +1053,16 @@ impl State {
         for &t in &self.targets {
             crate::list::ensure_state(list, t as This, RENDER_TARGET);
         }
+        if crate::host::card_times_on() {
+            list.note_target(|| {
+                let colours = self.targets.iter().filter(|&&t| t != 0).count();
+                let first = self.targets.iter().copied().find(|&t| t != 0).unwrap_or(self.depth);
+                let texture = crate::resource::host_resource(first as This)?;
+                // SAFETY: a live texture.
+                let desc = unsafe { texture.GetDesc() };
+                Some((desc.Width, desc.Height, colours))
+            });
+        }
         if self.depth != 0 {
             // A depth texture shaders also write: what they wrote, first.
             list.twin_use(self.depth as This, false, true);
@@ -1076,7 +1152,7 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
-            let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
+            let made = self.tables(list, &t.used, &t.host.root_indexed_views, &t.host.user_data, compute);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -1102,6 +1178,14 @@ impl State {
             if let Some((param, dwords)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
                 for u in &t.host.user_data {
+                    if u.root == RootType::Other(victory_shader::emit::USER_CBV_SLOT) {
+                        values[u.index as usize] =
+                            self.cbv_words.iter().find(|w| w.0 == (u.slot, u.dword)).map_or(0, |w| w.1);
+                        continue;
+                    }
+                    if u.root == RootType::Other(victory_shader::emit::USER_CBV_FRESH) {
+                        continue;
+                    }
                     if let RootType::Other(kind) = u.root {
                         values[u.index as usize] =
                             self.host_word(compute, kind, u.slot, u.dword, memory.as_ref());
@@ -1856,9 +1940,16 @@ impl State {
         // records the frame, and making and staging 192 MB of textures took
         // 1.6-2.2 s of each of the world's first twenty frames (run 20).
         // The rest waits for the next frames, as it does past the bytes.
+        // 40 ms (`VICTORY_TEXTURE_STAGE_MS=250`: as before): while the title
+        // streams (the cutscene a save opens with) the queue holds 900 to
+        // 7,000 slots and the pass took its 250 ms in every frame, which is
+        // what made those frames 260 to 370 ms (run boat3: textures 251 to
+        // 253 ms a frame). With 40 they are 85 to 130 ms and as many MB are
+        // uploaded by the same second of the run (cs1, cs2); the queue's
+        // peaks are longer (8,000 to 10,000 slots against 5,000 to 7,000).
         static SPAN_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let plain_span = std::time::Duration::from_millis(*SPAN_MS.get_or_init(|| {
-            std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(250)
+            std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(40)
         }));
         const SPAN_CATCHING_UP: std::time::Duration = std::time::Duration::from_millis(1500);
         // One catch-up rule (`catching_up`, `VICTORY_TEXTURE_GATE_S`):
@@ -2148,6 +2239,7 @@ impl State {
             // SAFETY: an open list with everything set.
             _ => unsafe { list.list.Dispatch(x, y, z) },
         }
+        self.buffers_written();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -2418,6 +2510,7 @@ impl State {
                     self.mesh_scissor(list, true);
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
+                    self.drew();
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
@@ -2518,7 +2611,12 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
-        if let Some(view) = host.mirror(index, handle, true) {
+        let view = if victory_shader::emit::cbv_slots() {
+            host.mirror_tabled(index, handle)
+        } else {
+            host.mirror(index, handle, true)
+        };
+        if let Some(view) = view {
             readable(list, u.kind, &view);
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
@@ -2543,13 +2641,27 @@ impl State {
         list: &HostList,
         used: &[UsedResource],
         indexed: &[RootIndexedView],
+        user: &[victory_shader::emit::UserData],
         compute: bool,
     ) -> Vec<(u8, u32)> {
+        use victory_shader::emit::{USER_CBV_FRESH, USER_CBV_SLOT};
         let tables = |u: &&UsedResource| u.root == RootType::Table;
+        // The constant buffers the shader takes from slots of their own
+        // (`victory_shader::emit::cbv_slots`): a table whose constant
+        // buffers are all taken so is the title's own, not made afresh.
+        self.cbv_words.clear();
+        let words: Vec<(u8, u32)> = user
+            .iter()
+            .filter(|u| u.root == RootType::Other(USER_CBV_SLOT))
+            .map(|u| (u.slot, u.dword))
+            .collect();
+        let whole =
+            |slot: u8| user.iter().any(|u| u.root == RootType::Other(USER_CBV_FRESH) && (u.slot == slot || u.slot == 0xff));
         let mut fresh: Vec<u8> = used
             .iter()
             .filter(tables)
             .filter(|u| u.kind == ResourceType::Cbv)
+            .filter(|u| whole(u.slot) || !words.contains(&(u.slot, u.table_offset_dwords)))
             .map(|u| u.slot)
             .collect();
         // Tables reaching past a host heap smaller than the title's (the
@@ -2576,12 +2688,100 @@ impl State {
         fresh.sort_unstable();
         fresh.dedup();
         for u in used.iter().filter(tables) {
-            if !fresh.contains(&u.slot) {
+            if !fresh.contains(&u.slot) && u.kind != ResourceType::Cbv {
                 crate::profile::tables(5, 1);
                 self.table_entry(list, u, compute);
             }
         }
         let mut made = Vec::new();
+        // Views picked by an index out of a table that is the title's own
+        // now (made afresh, it brought them up to date itself).
+        for index in indexed {
+            let slot = index.table_slot;
+            if fresh.contains(&slot) || !words.iter().any(|w| w.0 == slot) {
+                continue;
+            }
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+                continue;
+            };
+            let constant = self.user_value(compute, index.constant_slot, RootType::Constants, index.constant_dword);
+            let k = index.byte_offset.wrapping_add(constant << index.shift) / 32;
+            if used.iter().filter(tables).any(|u| u.slot == slot && u.table_offset_dwords / 8 == k) {
+                continue;
+            }
+            let handle = table + u64::from(k) * 32;
+            let Some(heap) = self.heap_of(handle) else {
+                continue;
+            };
+            let (Some(host), Some(own)) = (heap.host(), heap.index(handle)) else {
+                continue;
+            };
+            if let Some(view) = host.mirror_tabled(own, handle)
+                && let Some(kind) = view_kind(&view)
+            {
+                readable(list, kind, &view);
+            }
+        }
+        // And a slot for each constant buffer the shader takes by itself.
+        for &(slot, dword) in &words {
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+                continue;
+            };
+            let handle = table + u64::from(dword) * 4;
+            let Some(heap) = self.heap_of(handle) else {
+                continue;
+            };
+            let (Some(host), Some(own)) = (heap.host(), heap.index(handle)) else {
+                continue;
+            };
+            let index = match crate::descriptor::view(handle) {
+                Some(View::Constant(address, size)) => {
+                    let key = (std::ptr::from_ref(heap) as usize, address, size);
+                    match self.cbv_made.get(&key) {
+                        Some(&index) => index,
+                        None => {
+                            let Some(index) = host.dynamic(1) else {
+                                // No room: `bind` drops the draw.
+                                made.push((slot, u32::MAX));
+                                continue;
+                            };
+                            self.dynamic.push((key.0, index, 1));
+                            self.cbv_made.insert(key, index);
+                            crate::profile::tables(4, 1);
+                            // As a table made afresh takes its constant
+                            // buffers (below).
+                            let aligned_size = size.next_multiple_of(256);
+                            if aligned_size > 0
+                                && aligned_size <= 65536
+                                && let Some(shadow) = crate::shadow::find(address, u64::from(aligned_size))
+                                && shadow.gpu(address) % 256 == 0
+                                && shadow.left(address) >= u64::from(aligned_size)
+                            {
+                                shadow.refresh(list, address, u64::from(aligned_size));
+                                list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
+                                host.constant_at(index, shadow.gpu(address), size);
+                            } else if let Some(gpu) = crate::shadow::existing(address, u64::from(size))
+                                .and_then(|shadow| list.card_fill(&shadow, address, u64::from(size)))
+                            {
+                                host.constant_at(index, gpu, size);
+                            } else if let Some((gpu, to)) = list.scratch(u64::from(size)) {
+                                list.defer_fill(to, address as *const u8, size as usize);
+                                host.constant_at(index, gpu, size);
+                            } else {
+                                host.make_null(index);
+                            }
+                            index
+                        }
+                    }
+                }
+                // Not a constant buffer after all: what the title's slot shows.
+                _ => {
+                    host.mirror_tabled(own, handle);
+                    own
+                }
+            };
+            self.cbv_words.push(((slot, dword), index));
+        }
         for slot in fresh {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
@@ -2673,6 +2873,25 @@ impl State {
             self.fresh_tables.insert(key, first);
             crate::profile::tables(3, 1);
             crate::profile::tables(4, u64::from(n));
+            // While a profile is taken: how many of the tables made new held
+            // the very records a table made in one of the eight frames before
+            // held (what keeping tables from frame to frame could find).
+            if crate::profile::on() {
+                static SEEN: std::sync::Mutex<Option<std::collections::HashMap<(u64, u32, u64), u64>>> =
+                    std::sync::Mutex::new(None);
+                let frame = crate::frame::current();
+                let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+                let seen = seen.get_or_insert_with(Default::default);
+                if seen.len() > 200_000 {
+                    seen.retain(|_, at| *at + 8 >= frame);
+                }
+                if let Some(at) = seen.insert(key, frame)
+                    && at != frame
+                    && at + 8 >= frame
+                {
+                    crate::profile::tables(6, 1);
+                }
+            }
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
             // The title's own slots of this table: what the draw reads of
@@ -2848,6 +3067,7 @@ impl State {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
+            self.drew();
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -2949,6 +3169,7 @@ impl State {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
+            self.drew();
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -2966,6 +3187,69 @@ impl State {
     /// record count at `count` if the title gives one: the GPU reads them
     /// from the buffer's host copy, where earlier dispatches may have
     /// written them. False if it cannot run on the host.
+    /// Shaders that can write buffers were recorded: arguments may be others
+    /// from here on.
+    fn buffers_written(&mut self) {
+        match &mut self.batch {
+            Some(batch) if batches() == 2 => batch.wrote = true,
+            batch => *batch = None,
+        }
+    }
+
+    /// A draw with the list's pipeline was recorded (as
+    /// [`State::buffers_written`] if its shaders can store to buffers).
+    fn drew(&mut self) {
+        if self.batch.is_none() {
+            return;
+        }
+        let p = crate::pipeline::host_pipeline(self.pipeline as This);
+        if p.is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores)) {
+            self.batch = None;
+        }
+    }
+
+    /// The title waits for earlier work (a barrier or a pipeline sync).
+    pub(crate) fn synced(&mut self) {
+        if self.batch.as_ref().is_some_and(|b| b.wrote) {
+            self.batch = None;
+        }
+    }
+
+    /// Where the clamped record of `kind` at `arguments` of the copy `args`
+    /// is, from the open batch or a new one ([`batches`]). `None` if it
+    /// cannot be clamped in one.
+    fn batched(
+        &mut self,
+        list: &HostList,
+        args: &std::sync::Arc<crate::shadow::Shadow>,
+        arguments: u64,
+        kind: u32,
+    ) -> Option<(ID3D12Resource, u64)> {
+        const BATCH_USE: usize = usize::MAX - 0x78;
+        const DISPATCH: u32 = 2;
+        // Another host list, or this one after its reset ([`windows`]).
+        if list.first_use(BATCH_USE) {
+            self.batch = None;
+        }
+        // A draw after dispatches waits for them.
+        if kind != DISPATCH {
+            self.synced();
+        }
+        let (id, offset) = (args.id(), args.offset(arguments));
+        if let Some(b) = &mut self.batch
+            && let Some(at) = b.table.place(id, offset, kind)
+        {
+            return Some((b.scratch.clone(), at));
+        }
+        self.batch = None;
+        let (mut table, scratch) = crate::indirect::open_batch(list, (id, &args.buffer), &argument_copies(args))?;
+        self.host_pipeline = 0;
+        self.host_roots[1] = 0;
+        let at = table.place(id, offset, kind)?;
+        self.batch = Some(Batch { table, scratch: scratch.clone(), wrote: false });
+        Some((scratch, at))
+    }
+
     pub(crate) fn execute_indirect(
         &mut self,
         list: &HostList,
@@ -3067,7 +3351,17 @@ impl State {
         } else {
             None
         };
-        let windowed = windows()
+        // One record without a count: clamped in a batch (`batches`). Not a
+        // dispatch run in parts, which the clamp of one writes.
+        let batch = if batches() > 0 && max == 1 && count.is_none() && parts.is_none() {
+            args.refresh(list, arguments, len);
+            self.batched(list, &args, arguments, kind)
+        } else {
+            None
+        };
+        let batched = batch.is_some();
+        let windowed = !batched
+            && windows()
             && kind != DISPATCH
             && max == 1
             && count.is_none()
@@ -3123,7 +3417,7 @@ impl State {
                 }
             }
         }
-        let (bounded, at) = match hit {
+        let (bounded, at) = match batch.or(hit) {
             Some(hit) => hit,
             None => {
                 // A record a short step after the last window's last one
@@ -3215,7 +3509,9 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &bounded);
+            if !batched {
+                crate::indirect::done(list, &bounded);
+            }
             why("prepare failed");
             return false;
         }
@@ -3255,7 +3551,16 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
-        crate::indirect::done(list, &bounded);
+        // (A batch's records stay readable as arguments until the list
+        // closes: `HostList::batches_common`.)
+        if !batched {
+            crate::indirect::done(list, &bounded);
+        }
+        if kind == DISPATCH {
+            self.buffers_written();
+        } else {
+            self.drew();
+        }
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {

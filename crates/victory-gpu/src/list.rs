@@ -751,6 +751,9 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     if let Some(list) = host_list(this)
         && !barriers.is_null()
     {
+        if count > 0 {
+            with_state(this, |_, state| state.synced());
+        }
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
         let mut host: Vec<Barrier> = barriers
@@ -777,6 +780,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
                     host.len(),
                 )
             };
+            list.tally(6);
             // SAFETY: an open list and live resources.
             unsafe { list.list.ResourceBarrier(host) };
         }
@@ -916,6 +920,7 @@ fn copy_on_the_card(list: &crate::host::HostList, to: u64, from: u64, len: u64) 
     list.note_op(|| format!("title buffer copy on the card, {len} bytes from {from:#x} to {to:#x}"));
     // SAFETY: an open list; live buffers the list holds (their states are
     // noted in it), and the ranges lie in them.
+    list.tally(3);
     unsafe {
         list.list.CopyBufferRegion(&target.buffer, target.offset(to), &source.buffer, source.offset(from), len);
     }
@@ -997,6 +1002,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
+            list.tally(2);
             unsafe { list.list.CopyResource(to, from) };
         } else if let (Some((to, a)), Some((from, b))) = (
             crate::resource::buffer_bytes(dst),
@@ -1155,6 +1161,7 @@ extern "system" fn copy_texture_region(
             assert!(size_of::<CopyLocation>() == size_of::<D3D12_TEXTURE_COPY_LOCATION>());
         // SAFETY: an open list; both locations in the host's layout, naming
         // live resources; the box is the title's (same layout).
+        list.tally(2);
         unsafe {
             list.list.CopyTextureRegion(
                 (&raw const to_location).cast(),
@@ -1226,6 +1233,7 @@ fn read_back(
     // SAFETY: an open list; both locations in the host's layout (asserted
     // in `copy_texture_region`), naming a live texture and our buffer, which
     // the list keeps until it is reset; the box is the title's.
+    list.tally(7);
     unsafe {
         list.list
             .CopyTextureRegion((&raw const to).cast(), 0, 0, 0, (&raw const from).cast(), host_box)
@@ -1368,6 +1376,7 @@ extern "system" fn clear_rtv(
                     State(RENDER_TARGET as i32),
                 )]);
             }
+            list.tally(0);
             list.list.ClearRenderTargetView(rtv, color, rects);
         }
     }
@@ -1413,6 +1422,7 @@ extern "system" fn clear_dsv(
         }
         let dsv = host.dsv(texture, record.depth_desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
+        list.tally(1);
         unsafe {
             list.list
                 .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAGS(flags as i32 & 3), depth, stencil, rects)
@@ -1491,7 +1501,10 @@ extern "system" fn resolve_queries(
     let (what, bytes) = match kind {
         OCCLUSION => (Written::Value(1 << 20), 8),
         BINARY => (Written::Value(1), 8),
-        TIMESTAMP => (Written::GpuTimestamp, 8),
+        TIMESTAMP => {
+            crate::queue::TIMESTAMPS[1].fetch_add(u64::from(count), std::sync::atomic::Ordering::Relaxed);
+            (Written::GpuTimestamp, 8)
+        }
         PIPELINE_STATISTICS => (Written::Value(0), 88),
         _ => (Written::Value(0), 16),
     };
@@ -1532,7 +1545,14 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
 /// bottom of the pipe `(flags, control, address, size)`. Host lists order
 /// their own work and every submission is waited for, so there is nothing
 /// to do.
-extern "system" fn sync(_: This, _flags: u32, _control: u32, _address: u64, _size: u64) {}
+/// (Arguments may be what earlier shaders wrote from here on:
+/// `State::synced`.)
+extern "system" fn sync(this: This, _flags: u32, _control: u32, _address: u64, _size: u64) {
+    #[cfg(windows)]
+    with_state(this, |_, state| state.synced());
+    #[cfg(not(windows))]
+    let _ = this;
+}
 
 /// Reset with console flags `(allocator, pipeline, flags)`; the flags only
 /// tune the console's command memory.
@@ -2080,6 +2100,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         && let Some(list) = host_list(this)
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+        with_state(this, |_, state| state.synced());
         // SAFETY: the same layout; no resource named.
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
@@ -2100,7 +2121,10 @@ extern "system" fn write64(this: This, address: u64, value: u64, _flush: u32, fl
     const GPU_TIMESTAMP: u32 = 1;
     const SYSTEM_TIMESTAMP: u32 = 2;
     let what = match flags {
-        GPU_TIMESTAMP => Written::GpuTimestamp,
+        GPU_TIMESTAMP => {
+            crate::queue::TIMESTAMPS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Written::GpuTimestamp
+        }
         SYSTEM_TIMESTAMP => Written::SystemTimestamp,
         _ => Written::Value(value),
     };
