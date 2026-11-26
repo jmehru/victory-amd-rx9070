@@ -249,8 +249,14 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         super::library::note_used(&p.key);
     }
     if p.made.get().is_none() {
-        start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        if bakes(&p.shaders) {
+            // A one-shot bake is never drawn again: made here, whatever
+            // the frame's budget (cool_fox f4b48ad's scene inputs).
+            p.make();
+        } else {
+            start(p, REQUESTED);
+            wait(p, crate::frame::current());
+        }
         if p.made.get().is_none() {
             not_ready(p, if slow(p) { "too long at the driver to wait for" } else { "not made yet" });
         }
@@ -356,6 +362,20 @@ pub(crate) fn not_ready_line() -> Option<String> {
 /// second is the compute pipelines'.
 static LOADINGS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// Whether a pipeline is one of the title's texture bakes (ped skin and
+/// decoration compositors, `crate::draw::BAKE_PIXEL_SHADERS` and
+/// `BAKE_GEOMETRY_SHADERS`): drawn once, and what it draws stays in the
+/// character's textures; dropped for want of its pipeline, the skin it
+/// makes is never made. `VICTORY_BAKE_WAIT=0`: as other pipelines.
+fn bakes(shaders: &[Arc<Shader>]) -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BAKE_WAIT").is_none_or(|v| v != "0"))
+        && shaders.iter().any(|s| {
+            let h = s.hash.as_str();
+            crate::draw::BAKE_PIXEL_SHADERS.contains(&h) || crate::draw::BAKE_GEOMETRY_SHADERS.contains(&h)
+        })
+}
+
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
 /// that is making it); whether it has a host pipeline.
 pub(crate) fn now(p: &Arc<Pending>) -> bool {
@@ -379,7 +399,7 @@ pub(crate) fn warm(shaders: Vec<Arc<Shader>>) -> Option<bool> {
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
-    if p.left_out.is_none() && !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
+    if p.left_out.is_none() && !p.shaders.is_empty() && (super::library::wanted_early(&p.key) || bakes(&p.shaders)) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, EARLY);
     }
