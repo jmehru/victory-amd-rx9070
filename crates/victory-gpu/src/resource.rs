@@ -1391,7 +1391,27 @@ pub(crate) fn room() -> bool {
         return true;
     }
     match crate::host::host().and_then(|h| h.video_memory()) {
-        Some([budget, used, ..]) => used < budget / 100 * room_percent(),
+        Some([budget, used, ..]) => {
+            let room = used < budget / 100 * room_percent();
+            // The answer changed: said, with what it was made from.
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(room), Relaxed) != u8::from(room) {
+                let [heaps, live, free, kept] = blocks::census();
+                tracing::info!(
+                    "room on the card for more textures picked by index: {} (frame {}): {} MB of the card's memory in use, budget {} MB, host copies of textures the title fills {} MB; blocks of card memory for them (VICTORY_TEXTURE_BLOCKS): {} of 64 MiB, {} MB in textures, {} MB in pieces let go, {} MB in pieces whose texture something still held",
+                    if room { "yes" } else { "no" },
+                    crate::frame::current(),
+                    used >> 20,
+                    budget >> 20,
+                    filled >> 20,
+                    heaps,
+                    live >> 20,
+                    free >> 20,
+                    kept >> 20
+                );
+            }
+            room
+        }
         None => filled < WITHOUT_BUDGET,
     }
 }
@@ -1887,6 +1907,18 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
 /// textures picked by index spent 121 of its 144 thread-ms a frame creating
 /// them, on the recording threads, and the title's frame waited for it
 /// (profiles boatC, boatD).
+///
+/// Off: a texture let go gives the card no memory back (its piece waits for
+/// a texture of the same bytes), so the card's memory in use only grows, and
+/// once it is at nine tenths of the budget [`room`] says no for the rest of
+/// the run: the textures picked by index that were not made by then never
+/// are. In the cell that was at frame 1,600 of some 4,500 (run tb1: 12,491
+/// MB in use of a budget of 13,879, 156 blocks, 1,173 MB of them in pieces
+/// let go; 7,316 textures still waiting at the end against 137 without),
+/// and the room came out black, without the window's glass or with broken
+/// posters, in 14 of 15 runs. Made each on its own the textures in use stay
+/// near 10,200 MB of the card's memory and the system keeps as much again
+/// in the PC's.
 #[cfg(windows)]
 mod blocks {
     use std::collections::HashMap;
@@ -1906,6 +1938,19 @@ mod blocks {
         free: HashMap<u64, Vec<(usize, u64)>>,
         /// The piece of each texture placed (by its address).
         placed: HashMap<usize, (usize, u64, u64)>,
+        /// Bytes in pieces let go, and in pieces whose texture something
+        /// still held when its host copy went.
+        free_bytes: u64,
+        kept: u64,
+    }
+
+    /// Blocks made, and the bytes in textures placed, in pieces let go and
+    /// in pieces kept for good.
+    pub(super) fn census() -> [u64; 4] {
+        let blocks = BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
+        blocks.as_ref().map_or([0; 4], |b| {
+            [b.heaps.len() as u64, b.placed.values().map(|p| p.2).sum(), b.free_bytes, b.kept]
+        })
     }
 
     // SAFETY: Direct3D 12 heaps are free-threaded.
@@ -1941,9 +1986,12 @@ mod blocks {
         }
         let bytes = info.SizeInBytes.next_multiple_of(65536);
         let mut blocks = BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
-        let b = blocks.get_or_insert_with(|| Blocks { heaps: Vec::new(), top: BLOCK, free: HashMap::new(), placed: HashMap::new() });
+        let b = blocks.get_or_insert_with(|| Blocks { heaps: Vec::new(), top: BLOCK, free: HashMap::new(), placed: HashMap::new(), free_bytes: 0, kept: 0 });
         let (block, offset) = match b.free.get_mut(&bytes).and_then(Vec::pop) {
-            Some(piece) => piece,
+            Some(piece) => {
+                b.free_bytes -= bytes;
+                piece
+            }
             None => {
                 if b.top + bytes > BLOCK {
                     if fresh() && b.heaps.len() >= 96 {
@@ -1985,6 +2033,7 @@ mod blocks {
             }
             _ => {
                 b.free.entry(bytes).or_default().push((block, offset));
+                b.free_bytes += bytes;
                 None
             }
         }
@@ -1999,11 +2048,13 @@ mod blocks {
         }
         let mut blocks = BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
         let Some(b) = blocks.as_mut() else { return };
-        if let Some((block, offset, bytes)) = b.placed.remove(&(texture.as_raw() as usize))
-            && crate::host::references(texture) == 1
-            && !fresh()
-        {
-            b.free.entry(bytes).or_default().push((block, offset));
+        if let Some((block, offset, bytes)) = b.placed.remove(&(texture.as_raw() as usize)) {
+            if crate::host::references(texture) == 1 && !fresh() {
+                b.free.entry(bytes).or_default().push((block, offset));
+                b.free_bytes += bytes;
+            } else {
+                b.kept += bytes;
+            }
         }
     }
 }
