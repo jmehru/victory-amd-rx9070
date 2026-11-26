@@ -2142,20 +2142,6 @@ impl<'a> Lower<'a> {
         self.f16_nearest(f)
     }
 
-    /// The sum of the low halves of `x` over the lanes that run here, in
-    /// single precision, as a half.
-    fn half_sum_here(&mut self, x: V) -> V {
-        let c = self.cur;
-        let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
-        self.s.flags |= flags::WAVE_OPS;
-        let low = self.s.m.i32(0xFFFF);
-        let h = self.s.m.bin(c, Bin::And, x, low);
-        let f = self.s.op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
-        let k = self.s.m.i8(0);
-        let sum = self.s.op(c, "waveActiveOp.f32", Attr::NoUnwind, f32t, 119, &[f, k, k]);
-        self.s.op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[sum])
-    }
-
     /// `WaveActiveSum` of 16-bit floats (`x`: each lane's term in its low half, +0 in the
     /// lanes outside the mask), bit for bit as the console adds it: every addition rounds to
     /// 16 bits, so the order counts, and the compiler's is the balanced tree over the lanes
@@ -2195,11 +2181,13 @@ impl<'a> Lower<'a> {
             // One host wave of 64, some of its lanes elsewhere: their terms
             // are +0 on the console, so the sum of the lanes here is the
             // sum.
-            // shortcut: in single precision, rounded once; the console
-            // rounds every addition to 16 bits. (the title's
+            // Bit for bit as the console adds it, the lanes that are
+            // elsewhere +0, and the high half lane 0's (`half_sum_present`;
+            // as avatarmanz/VIctory-7900XTX does). It was summed in single
+            // precision and rounded once with a high half of 0 (the title's
             // neural networks, CS_TransposeVecMatMulAlignedOperation, in a
-            // block only the lanes inside the matrix reach.)
-            return Ok(self.half_sum_here(x));
+            // block only the lanes inside the matrix reach: the face rig).
+            return Ok(self.half_sum_present(x));
         }
         let c = self.cur;
         let i32t = self.s.t.i32;
