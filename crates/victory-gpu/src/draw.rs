@@ -70,6 +70,20 @@ thread_local! {
     /// milliseconds and the bytes that run may take, in place of the
     /// pass's own per frame.
     static PASS_BUDGET: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+    /// While the texture pass runs ahead of a bake draw ([`bake_ahead`]).
+    static BAKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Frames ahead the pass before a bake draw takes slots from that are due
+/// only then (`VICTORY_BAKE_AHEAD`, 12; 0: due now alone, as before), and
+/// up to 65,536 of them: slots whose memory was written or mapped a frame
+/// or two ago are looked at a little later, by when the rest has landed,
+/// and a bake in between took the bytes from before; what it bakes stays
+/// (avatarmanz/VIctory-7900XTX 8d79927, 7130d52: specks on the waitress's
+/// face for the whole diner scene).
+fn bake_ahead() -> u64 {
+    static AHEAD: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *AHEAD.get_or_init(|| std::env::var("VICTORY_BAKE_AHEAD").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(12))
 }
 
 /// The milliseconds of every frame the pass that uploads textures picked
@@ -1126,6 +1140,9 @@ impl State {
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
+        if !compute && self.is_bake_draw(p) {
+            self.bake_inputs(list, p);
+        }
         if crate::host::walls_trace() {
             self.walls_census(p, compute);
         }
@@ -1756,6 +1773,147 @@ impl State {
                 .is_some_and(|(w, h, _)| w >= 512 && w == u64::from(h))
     }
 
+    /// Brings a bake draw's inputs up to date before it is recorded. The
+    /// title's bakes pick their textures out of the whole heap by indices
+    /// they read from their constant buffer and from a structured buffer of
+    /// layers (the heap index at byte 0x20 of the constants, the layers' at
+    /// fixed offsets of 304-byte records), so every word of the buffers the
+    /// bake's tables hold that names a heap slot with a texture view is
+    /// taken as an input: a superset of what it reads. Each such texture
+    /// wholly in memory is made and uploaded now into the list ahead of the
+    /// draw, as a table read makes it, not in the texture pass's turn (grey
+    /// or a kept older texture until then, and what the bake drew stayed in
+    /// the character's skin). One not all mapped is left as it is and
+    /// counted. `VICTORY_BAKE_INPUTS=0`: not done; `VICTORY_BAKE_CENSUS=1`:
+    /// a line per bake.
+    fn bake_inputs(&self, list: &HostList, p: &HostPipeline) {
+        static ON: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
+        let (on, census) = *ON.get_or_init(|| {
+            (
+                std::env::var_os("VICTORY_BAKE_INPUTS").is_none_or(|v| v != "0"),
+                std::env::var_os("VICTORY_BAKE_CENSUS").is_some_and(|v| v == "1"),
+            )
+        });
+        if !on && !census {
+            return;
+        }
+        let Some(heap) = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())
+        else {
+            return;
+        };
+        let Some(host) = heap.host() else {
+            return;
+        };
+        // The words of the buffers the bake's tables hold.
+        let mut words: Vec<u32> = Vec::new();
+        for stage in &p.stages {
+            let t = stage.translated();
+            for u in t.used.iter().filter(|u| u.root == RootType::Table) {
+                let Some(&Root::Table(table)) = self.roots_ref(false).get(usize::from(u.slot)) else {
+                    continue;
+                };
+                let Some(view) = crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4) else {
+                    continue;
+                };
+                let Some((_, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+                    continue;
+                };
+                let len = len.min(64 << 10) & !3;
+                if len == 0 || address % 4 != 0 || crate::texture::mapped_bytes(address as *const u8, len as usize) < len {
+                    continue;
+                }
+                // SAFETY: title memory, all of it mapped (just asked).
+                let at = unsafe { std::slice::from_raw_parts(address as *const u32, (len / 4) as usize) };
+                words.extend_from_slice(at);
+            }
+        }
+        words.retain(|&w| w > 0 && w < host.count());
+        words.sort_unstable();
+        words.dedup();
+        words.truncate(4096);
+        // Textures: whole, partly mapped, unmapped, GPU-filled; made now.
+        let mut n = [0u32; 5];
+        let mut missing: Vec<String> = Vec::new();
+        for &index in &words {
+            let Some(handle) = heap.handle(index) else {
+                continue;
+            };
+            let Some(view) = crate::descriptor::view(handle) else {
+                continue;
+            };
+            let class = match &view {
+                View::Placed(false, resource, desc) if resource[0] != 1 => {
+                    let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                    let len = crate::resource::placed_bytes_from(resource, crate::resource::first_mip(desc)).unwrap_or(1);
+                    let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
+                    if mapped >= len {
+                        0
+                    } else if mapped > 0 {
+                        missing.push(format!("{index} placed {mapped}/{len}"));
+                        1
+                    } else {
+                        missing.push(format!("{index} placed unmapped"));
+                        2
+                    }
+                }
+                View::Shader(object, _) if crate::resource::buffer_bytes(*object as This).is_none() => {
+                    if !crate::resource::title_fills(*object as This) {
+                        3
+                    } else {
+                        match crate::resource::texture_memory(*object as This) {
+                            Some((at, desc)) => {
+                                // SAFETY: 56 bytes in the description's layout.
+                                let desc = unsafe { std::ptr::from_ref(&desc).cast::<[u32; 14]>().read_unaligned() };
+                                let len = crate::resource::placed_bytes(&desc).unwrap_or(1);
+                                let mapped = crate::texture::mapped_bytes(at, len as usize);
+                                if mapped >= len {
+                                    0
+                                } else if mapped > 0 {
+                                    missing.push(format!("{index} object {mapped}/{len}"));
+                                    1
+                                } else {
+                                    missing.push(format!("{index} object unmapped"));
+                                    2
+                                }
+                            }
+                            None => 0,
+                        }
+                    }
+                }
+                _ => continue,
+            };
+            n[class] += 1;
+            if on
+                && class == 0
+                && let Some(view) = host.mirror_tabled(index, handle)
+            {
+                readable(list, ResourceType::Srv, &view);
+                host.texture_slot_tabled(index, true);
+                n[4] += 1;
+            }
+        }
+        if census {
+            let names: Vec<&str> = p.stages.iter().map(|s| s.shader.hash.as_str()).collect();
+            tracing::info!(
+                frame = crate::frame::current(),
+                shaders = ?names,
+                candidates = words.len(),
+                whole = n[0],
+                partly = n[1],
+                unmapped = n[2],
+                gpu_filled = n[3],
+                made_now = n[4],
+                missing = ?missing,
+                "bake inputs"
+            );
+        }
+    }
+
     /// Runs the pass that uploads textures picked by index
     /// ([`State::heap_textures`]) where nothing has asked for it yet
     /// ([`early_budgets`]): once a frame for a few milliseconds, at the
@@ -1814,10 +1972,28 @@ impl State {
         }
         let began = std::time::Instant::now();
         PASS_BUDGET.set(Some(budget));
+        BAKING.set(bake);
         self.heap_textures(list, heap, host);
+        BAKING.set(false);
         PASS_BUDGET.set(None);
         if bake {
             BAKED_MS.fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
+            // What a bake may still find not up to date: its inputs are
+            // picked by index (from its constants) out of the whole heap.
+            static CENSUS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *CENSUS.get_or_init(|| std::env::var_os("VICTORY_BAKE_CENSUS").is_some_and(|v| v == "1")) {
+                let (_, [queued, due, waiting, partly, oldest]) = host.texture_slots_due(frame + bake_ahead(), 0);
+                tracing::info!(
+                    frame,
+                    ms = began.elapsed().as_millis() as u64,
+                    queued,
+                    due,
+                    waiting_for_memory = waiting,
+                    partly_mapped = partly,
+                    oldest_frames = oldest,
+                    "after the pass ahead of a bake"
+                );
+            }
         }
     }
 
@@ -1957,7 +2133,11 @@ impl State {
             HEAP_TEXTURES_RECHECKED[1].fetch_add(changed, Ordering::Relaxed);
             HEAP_TEXTURES_RECHECKED[2].store(waiting, Ordering::Relaxed);
         }
-        let (due, census) = host.texture_slots_due(frame, 8192);
+        let (due, census) = if BAKING.get() {
+            host.texture_slots_due(frame + bake_ahead(), 1 << 16)
+        } else {
+            host.texture_slots_due(frame, 8192)
+        };
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
             count.store(now, Ordering::Relaxed);
