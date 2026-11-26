@@ -7281,8 +7281,12 @@ impl Meter {
                 card_times_line((now - then) as f64);
             }
             tracing::info!(
-                "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
-                crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)
+                "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made), {} writes of a view of another texture (kept the old texture, VICTORY_KEEP_VIEWS=1: null), {} such made null at once; since the start {} slots made null because a newer view describes their memory and {} because their memory was found unmapped",
+                crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed),
+                crate::descriptor::host::REPLACED[0].load(Ordering::Relaxed),
+                crate::descriptor::host::REPLACED[1].load(Ordering::Relaxed),
+                crate::descriptor::host::STALE[0].load(Ordering::Relaxed),
+                crate::descriptor::host::STALE[4].load(Ordering::Relaxed)
             );
             {
                 let [same, changed, waiting] =

@@ -1942,6 +1942,26 @@ impl HostHeap {
                 KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Some(view);
             }
+            // A view of another placed texture (a title that streams a
+            // sharper copy of a texture into other memory writes the slot
+            // with it): the same, the slot shows the texture it showed
+            // until the new one is made and uploaded. Made null, what a
+            // shader picked from the slot read as nothing for as long as
+            // the new texture waited in the queue: one to two seconds while
+            // the camera turns (run pm1: 1,000 to 2,800 slots waiting, the
+            // pass at its 40 ms a frame), books and the character black
+            // meanwhile. `VICTORY_KEEP_VIEWS=1`: only for the same texture.
+            let shown = made[index as usize] != 0
+                && view_at(made[index as usize] as u32, (made[index as usize] >> 32) as u32)
+                    .is_some_and(|old| matches!(old, View::Placed(false, resource, _) if resource[0] != 1));
+            if later && shown {
+                let texture = matches!(&view, View::Placed(false, resource, _) if resource[0] != 1);
+                if texture && keep_other_views() {
+                    REPLACED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Some(view);
+                }
+                REPLACED[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             made[index as usize] = if later { 0 } else { key };
             // Not yet for a look without the lock: the slot is made below.
             self.made_now[index as usize].store(0, std::sync::atomic::Ordering::Release);
@@ -2706,6 +2726,19 @@ fn keep_views() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_VIEWS").is_none_or(|v| v != "0"))
 }
 
+/// Whether a slot that shows a placed texture and is written with a view of
+/// another keeps showing the old one too (`VICTORY_KEEP_VIEWS=0` or `1`:
+/// made null at once).
+fn keep_other_views() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_VIEWS").is_none_or(|v| v != "0" && v != "1"))
+}
+
+/// Since the start, writes of a slot that showed a placed texture with a
+/// view that waits to be made: of another placed texture and the slot kept
+/// showing the old one; and made null at once.
+pub(crate) static REPLACED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// Whether both are shader views of one texture the title placed in
 /// memory: the same address and the same resource description, whatever
 /// part of it each shows.
@@ -2735,15 +2768,32 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
 
 /// With `VICTORY_NULL_MAGENTA=1`, a 2D colour texture view that shows
 /// nothing yet shows magenta: on the screen, a texture that is not there is
-/// told from one whose contents are black. False if it is to be null.
-#[cfg(feature = "diagnostics")]
+/// told from one whose contents are black. Without it the view shows mid
+/// grey, and so do one- and two-channel block-compressed views (a flat
+/// normal): a texture that has not arrived is a grey surface, not a black
+/// one (`VICTORY_NULL_GREY=0`: null, it reads zeros). When the cell's
+/// gameplay begins some 4,000 textures wait for five to ten seconds; null,
+/// the room was black and the hair white for that long (run pk3, pictures
+/// pw-101 and pw-105), grey it is the room in flat colours (pg1, pw-057).
+/// False if the view is to be null.
 fn magenta_for(desc: &[u32; 16], at: D3D12_CPU_DESCRIPTOR_HANDLE) -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("VICTORY_NULL_MAGENTA").is_some_and(|v| v == "1")) {
+    static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| {
+        let set = |k: &str| std::env::var_os(k).is_some_and(|v| v == "1");
+        if set("VICTORY_NULL_MAGENTA") {
+            1
+        } else if std::env::var_os("VICTORY_NULL_GREY").is_none_or(|v| v != "0") {
+            2
+        } else {
+            0
+        }
+    });
+    if on == 0 {
         return false;
     }
-    // Block-compressed colour (BC1 to BC3, BC7) and 8-bit RGBA and BGRA.
-    let colour = matches!(desc[0], 27..=29 | 70..=78 | 87..=91 | 97..=99);
+    // Block-compressed colour (BC1 to BC3, BC7) and 8-bit RGBA and BGRA;
+    // for grey also BC4 and BC5.
+    let colour = matches!(desc[0], 27..=29 | 70..=78 | 87..=91 | 97..=99) || on == 2 && matches!(desc[0], 79..=84);
     if desc[1] != D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32 || !colour {
         return false;
     }
@@ -2755,8 +2805,8 @@ fn magenta_for(desc: &[u32; 16], at: D3D12_CPU_DESCRIPTOR_HANDLE) -> bool {
     true
 }
 
-/// One magenta texel, written by the processor.
-#[cfg(feature = "diagnostics")]
+/// One texel, mid grey or (`VICTORY_NULL_MAGENTA=1`) magenta, written by
+/// the processor.
 fn magenta() -> Option<&'static ID3D12Resource> {
     static TEXTURE: std::sync::OnceLock<Option<ID3D12Resource>> = std::sync::OnceLock::new();
     TEXTURE
@@ -2794,7 +2844,8 @@ fn magenta() -> Option<&'static ID3D12Resource> {
                     .ok()?;
                 let texture = texture?;
                 texture.Map(0, None, None).ok()?;
-                let texel = [255u8, 0, 255, 255];
+                let grey = std::env::var_os("VICTORY_NULL_MAGENTA").is_none_or(|v| v != "1");
+                let texel = if grey { [128u8, 128, 128, 255] } else { [255u8, 0, 255, 255] };
                 texture.WriteToSubresource(0, None, texel.as_ptr().cast(), 4, 4).ok()?;
                 texture.Unmap(0, None);
                 Some(texture)
@@ -2828,7 +2879,6 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         // cubes), not always 2D.
         View::Shader(_, Some(desc)) => return null_like(desc, at),
         View::Placed(false, _, desc) => {
-            #[cfg(feature = "diagnostics")]
             if magenta_for(desc, at) {
                 return;
             }
