@@ -1942,6 +1942,26 @@ impl HostHeap {
                 KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Some(view);
             }
+            // A view of another placed texture (a title that streams a
+            // sharper copy of a texture into other memory writes the slot
+            // with it): the same, the slot shows the texture it showed
+            // until the new one is made and uploaded. Made null, what a
+            // shader picked from the slot read as nothing for as long as
+            // the new texture waited in the queue: one to two seconds while
+            // the camera turns (run pm1: 1,000 to 2,800 slots waiting, the
+            // pass at its 40 ms a frame), books and the character black
+            // meanwhile. `VICTORY_KEEP_VIEWS=1`: only for the same texture.
+            let shown = made[index as usize] != 0
+                && view_at(made[index as usize] as u32, (made[index as usize] >> 32) as u32)
+                    .is_some_and(|old| matches!(old, View::Placed(false, resource, _) if resource[0] != 1));
+            if later && shown {
+                let texture = matches!(&view, View::Placed(false, resource, _) if resource[0] != 1);
+                if texture && keep_other_views() {
+                    REPLACED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Some(view);
+                }
+                REPLACED[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             made[index as usize] = if later { 0 } else { key };
             // Not yet for a look without the lock: the slot is made below.
             self.made_now[index as usize].store(0, std::sync::atomic::Ordering::Release);
@@ -2705,6 +2725,19 @@ fn keep_views() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_VIEWS").is_none_or(|v| v != "0"))
 }
+
+/// Whether a slot that shows a placed texture and is written with a view of
+/// another keeps showing the old one too (`VICTORY_KEEP_VIEWS=0` or `1`:
+/// made null at once).
+fn keep_other_views() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_VIEWS").is_none_or(|v| v != "0" && v != "1"))
+}
+
+/// Since the start, writes of a slot that showed a placed texture with a
+/// view that waits to be made: of another placed texture and the slot kept
+/// showing the old one; and made null at once.
+pub(crate) static REPLACED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Whether both are shader views of one texture the title placed in
 /// memory: the same address and the same resource description, whatever
