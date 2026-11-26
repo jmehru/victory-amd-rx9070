@@ -70,13 +70,30 @@ thread_local! {
     /// milliseconds and the bytes that run may take, in place of the
     /// pass's own per frame.
     static PASS_BUDGET: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+    /// While the texture pass runs ahead of a bake draw ([`bake_ahead`]).
+    static BAKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Frames ahead the pass before a bake draw takes slots from that are due
+/// only then (`VICTORY_BAKE_AHEAD`, 12; 0: due now alone, as before), and
+/// up to 65,536 of them: slots whose memory was written or mapped a frame
+/// or two ago are looked at a little later, by when the rest has landed,
+/// and a bake in between took the bytes from before; what it bakes stays
+/// (avatarmanz/VIctory-7900XTX 8d79927, 7130d52: specks on the waitress's
+/// face for the whole diner scene).
+fn bake_ahead() -> u64 {
+    static AHEAD: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *AHEAD.get_or_init(|| std::env::var("VICTORY_BAKE_AHEAD").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(12))
 }
 
 /// The milliseconds of every frame the pass that uploads textures picked
 /// by index takes before a shader that picks by index has asked for it
 /// (`VICTORY_EARLY_TEXTURES_MS`, 12; 0: never, as before), and the
 /// milliseconds it may take just before a draw of the title's decoration
-/// bake (`VICTORY_BAKE_TEXTURES_MS`, 1500; 0: nothing special).
+/// bake (`VICTORY_BAKE_TEXTURES_MS`, 8; 0: nothing special). It was 1,500:
+/// the pass met 3,000 to 11,000 due slots at each bake and took all of it,
+/// 1.5 s a bake frame; a bake's own inputs are made right before it now
+/// (`State::bake_inputs`).
 ///
 /// The pass ran only from the first world frame on, where it met some
 /// 24,000 slots at once and needed 60-80 frames for them. The title bakes
@@ -91,7 +108,7 @@ fn early_budgets() -> (u64, u64) {
         let ms = |name: &str, default: u64| {
             std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default)
         };
-        (ms("VICTORY_EARLY_TEXTURES_MS", 12), ms("VICTORY_BAKE_TEXTURES_MS", 1500))
+        (ms("VICTORY_EARLY_TEXTURES_MS", 12), ms("VICTORY_BAKE_TEXTURES_MS", 8))
     })
 }
 
@@ -99,8 +116,23 @@ fn early_budgets() -> (u64, u64) {
 /// `PS_BakeDecorations_*`), by the first 16 hex digits of their hash as the
 /// frame listings print it. They draw into a 256x256 corner of 2048x2048
 /// targets and name no texture in a table.
-const BAKE_PIXEL_SHADERS: [&str; 4] =
-    ["c0a7fe77b1862e10", "0d1575a396dfe513", "b7cfd8dda91ebb6b", "280967ad158cee0b"];
+/// (The last three from cool_fox f4b48ad, avatarmanz/VIctory-7900XTX's
+/// sister fork.)
+pub(crate) const BAKE_PIXEL_SHADERS: [&str; 7] = [
+    "c0a7fe77b1862e10",
+    "0d1575a396dfe513",
+    "b7cfd8dda91ebb6b",
+    "280967ad158cee0b",
+    "fa455c8a3c32577b",
+    "d126bcae5d5d8d26",
+    "fcee612943c008e0",
+];
+
+/// Geometry stages shared by the title's ped texture compositors and
+/// decoration bakes (vertex 089d6271be6650ef, the full-screen ped baker;
+/// mesh d4111a6e6ea49d91, the decoration projection), catching pixel
+/// shader variants beyond [`BAKE_PIXEL_SHADERS`] (cool_fox f4b48ad).
+pub(crate) const BAKE_GEOMETRY_SHADERS: [&str; 2] = ["089d6271be6650ef", "d4111a6e6ea49d91"];
 
 /// Since the start: early runs of the texture pass, and those of them
 /// made for a bake draw.
@@ -327,6 +359,10 @@ pub(crate) struct State {
     window: Vec<Window>,
     /// Local: the first scratch byte no window of the list has taken.
     window_top: u64,
+    /// The tables the last bind made afresh for a program the stand-in for
+    /// the indirect light follows (`crate::ambient`): root parameter, bytes
+    /// into the view heap.
+    ambient_tables: Vec<(u8, u32)>,
     /// What the host list has: pipeline, root signature, heaps.
     host_pipeline: usize,
     /// Graphics, compute.
@@ -1107,6 +1143,9 @@ impl State {
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
+        if !compute && self.is_bake_draw(p) {
+            self.bake_inputs(list, p);
+        }
         if crate::host::walls_trace() {
             self.walls_census(p, compute);
         }
@@ -1165,6 +1204,10 @@ impl State {
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
+            }
+            if stage.shader.ambient.is_some() {
+                self.ambient_tables.clear();
+                self.ambient_tables.extend(made.iter().copied());
             }
             // What the shader stores through root views and raw addresses is
             // copied back into title memory afterwards.
@@ -1712,6 +1755,168 @@ impl State {
         Some(gpu)
     }
 
+    /// Whether a draw is one of the title's one-shot texture compositors or
+    /// decoration bakes, whose inputs must be up to date before it runs:
+    /// what it bakes stays in the character's textures for good. By its
+    /// shaders, or by its form: no depth, four targets or more, the first
+    /// square and 512 texels or more (cool_fox f4b48ad).
+    fn is_bake_draw(&self, p: &HostPipeline) -> bool {
+        if p.stages.iter().any(|s| {
+            let h = s.shader.hash.as_str();
+            BAKE_PIXEL_SHADERS.contains(&h) || BAKE_GEOMETRY_SHADERS.contains(&h)
+        }) {
+            return true;
+        }
+        self.depth == 0
+            && self.targets.len() >= 4
+            && self
+                .targets
+                .first()
+                .and_then(|&t| crate::resource::texture_kind(t as This))
+                .is_some_and(|(w, h, _)| w >= 512 && w == u64::from(h))
+    }
+
+    /// Brings a bake draw's inputs up to date before it is recorded. The
+    /// title's bakes pick their textures out of the whole heap by indices
+    /// they read from their constant buffer and from a structured buffer of
+    /// layers (the heap index at byte 0x20 of the constants, the layers' at
+    /// fixed offsets of 304-byte records), so every word of the buffers the
+    /// bake's tables hold that names a heap slot with a texture view is
+    /// taken as an input: a superset of what it reads. Each such texture
+    /// wholly in memory is made and uploaded now into the list ahead of the
+    /// draw, as a table read makes it, not in the texture pass's turn (grey
+    /// or a kept older texture until then, and what the bake drew stayed in
+    /// the character's skin). One not all mapped is left as it is and
+    /// counted. `VICTORY_BAKE_INPUTS=0`: not done; `VICTORY_BAKE_CENSUS=1`:
+    /// a line per bake.
+    fn bake_inputs(&self, list: &HostList, p: &HostPipeline) {
+        static ON: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
+        let (on, census) = *ON.get_or_init(|| {
+            (
+                std::env::var_os("VICTORY_BAKE_INPUTS").is_none_or(|v| v != "0"),
+                std::env::var_os("VICTORY_BAKE_CENSUS").is_some_and(|v| v == "1"),
+            )
+        });
+        if !on && !census {
+            return;
+        }
+        let Some(heap) = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())
+        else {
+            return;
+        };
+        let Some(host) = heap.host() else {
+            return;
+        };
+        // The words of the buffers the bake's tables hold.
+        let mut words: Vec<u32> = Vec::new();
+        for stage in &p.stages {
+            let t = stage.translated();
+            for u in t.used.iter().filter(|u| u.root == RootType::Table) {
+                let Some(&Root::Table(table)) = self.roots_ref(false).get(usize::from(u.slot)) else {
+                    continue;
+                };
+                let Some(view) = crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4) else {
+                    continue;
+                };
+                let Some((_, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+                    continue;
+                };
+                let len = len.min(64 << 10) & !3;
+                if len == 0 || address % 4 != 0 || crate::texture::mapped_bytes(address as *const u8, len as usize) < len {
+                    continue;
+                }
+                // SAFETY: title memory, all of it mapped (just asked).
+                let at = unsafe { std::slice::from_raw_parts(address as *const u32, (len / 4) as usize) };
+                words.extend_from_slice(at);
+            }
+        }
+        words.retain(|&w| w > 0 && w < host.count());
+        words.sort_unstable();
+        words.dedup();
+        words.truncate(4096);
+        // Textures: whole, partly mapped, unmapped, GPU-filled; made now.
+        let mut n = [0u32; 5];
+        let mut missing: Vec<String> = Vec::new();
+        for &index in &words {
+            let Some(handle) = heap.handle(index) else {
+                continue;
+            };
+            let Some(view) = crate::descriptor::view(handle) else {
+                continue;
+            };
+            let class = match &view {
+                View::Placed(false, resource, desc) if resource[0] != 1 => {
+                    let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                    let len = crate::resource::placed_bytes_from(resource, crate::resource::first_mip(desc)).unwrap_or(1);
+                    let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
+                    if mapped >= len {
+                        0
+                    } else if mapped > 0 {
+                        missing.push(format!("{index} placed {mapped}/{len}"));
+                        1
+                    } else {
+                        missing.push(format!("{index} placed unmapped"));
+                        2
+                    }
+                }
+                View::Shader(object, _) if crate::resource::buffer_bytes(*object as This).is_none() => {
+                    if !crate::resource::title_fills(*object as This) {
+                        3
+                    } else {
+                        match crate::resource::texture_memory(*object as This) {
+                            Some((at, desc)) => {
+                                // SAFETY: 56 bytes in the description's layout.
+                                let desc = unsafe { std::ptr::from_ref(&desc).cast::<[u32; 14]>().read_unaligned() };
+                                let len = crate::resource::placed_bytes(&desc).unwrap_or(1);
+                                let mapped = crate::texture::mapped_bytes(at, len as usize);
+                                if mapped >= len {
+                                    0
+                                } else if mapped > 0 {
+                                    missing.push(format!("{index} object {mapped}/{len}"));
+                                    1
+                                } else {
+                                    missing.push(format!("{index} object unmapped"));
+                                    2
+                                }
+                            }
+                            None => 0,
+                        }
+                    }
+                }
+                _ => continue,
+            };
+            n[class] += 1;
+            if on
+                && class == 0
+                && let Some(view) = host.mirror_tabled(index, handle)
+            {
+                readable(list, ResourceType::Srv, &view);
+                host.texture_slot_tabled(index, true);
+                n[4] += 1;
+            }
+        }
+        if census {
+            let names: Vec<&str> = p.stages.iter().map(|s| s.shader.hash.as_str()).collect();
+            tracing::info!(
+                frame = crate::frame::current(),
+                shaders = ?names,
+                candidates = words.len(),
+                whole = n[0],
+                partly = n[1],
+                unmapped = n[2],
+                gpu_filled = n[3],
+                made_now = n[4],
+                missing = ?missing,
+                "bake inputs"
+            );
+        }
+    }
+
     /// Runs the pass that uploads textures picked by index
     /// ([`State::heap_textures`]) where nothing has asked for it yet
     /// ([`early_budgets`]): once a frame for a few milliseconds, at the
@@ -1724,8 +1929,7 @@ impl State {
         if compute || (early_ms == 0 && bake_ms == 0) {
             return;
         }
-        let bake = bake_ms > 0
-            && p.stages.iter().any(|s| BAKE_PIXEL_SHADERS.contains(&s.shader.hash.as_str()));
+        let bake = bake_ms > 0 && self.is_bake_draw(p);
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         // The milliseconds this frame's bake draws have taken so far: a
         // frame has several, and together they get `bake_ms`.
@@ -1771,10 +1975,28 @@ impl State {
         }
         let began = std::time::Instant::now();
         PASS_BUDGET.set(Some(budget));
+        BAKING.set(bake);
         self.heap_textures(list, heap, host);
+        BAKING.set(false);
         PASS_BUDGET.set(None);
         if bake {
             BAKED_MS.fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
+            // What a bake may still find not up to date: its inputs are
+            // picked by index (from its constants) out of the whole heap.
+            static CENSUS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *CENSUS.get_or_init(|| std::env::var_os("VICTORY_BAKE_CENSUS").is_some_and(|v| v == "1")) {
+                let (_, [queued, due, waiting, partly, oldest]) = host.texture_slots_due(frame + bake_ahead(), 0);
+                tracing::info!(
+                    frame,
+                    ms = began.elapsed().as_millis() as u64,
+                    queued,
+                    due,
+                    waiting_for_memory = waiting,
+                    partly_mapped = partly,
+                    oldest_frames = oldest,
+                    "after the pass ahead of a bake"
+                );
+            }
         }
     }
 
@@ -1914,7 +2136,11 @@ impl State {
             HEAP_TEXTURES_RECHECKED[1].fetch_add(changed, Ordering::Relaxed);
             HEAP_TEXTURES_RECHECKED[2].store(waiting, Ordering::Relaxed);
         }
-        let (due, census) = host.texture_slots_due(frame, 8192);
+        let (due, census) = if BAKING.get() {
+            host.texture_slots_due(frame + bake_ahead(), 1 << 16)
+        } else {
+            host.texture_slots_due(frame, 8192)
+        };
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
             count.store(now, Ordering::Relaxed);
@@ -2308,6 +2534,74 @@ impl State {
         }
         self.buffers_written();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
+            && crate::ambient::on()
+            && self.ambient(list, p, role)
+        {
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
+        }
+    }
+
+    /// The stand-in for the indirect light after a dispatch of `p`
+    /// (`crate::ambient`, from avatarmanz/VIctory-7900XTX 82ca134 and
+    /// 7da523a). Whether it recorded anything.
+    fn ambient(&self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> bool {
+        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, Role, Views};
+        let Some(t) = p.stages.first().map(|s| s.translated()) else {
+            return false;
+        };
+        let Some(heap) = (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This).host()).flatten()
+        else {
+            return false;
+        };
+        let entry = |kind: ResourceType, (slot, offset): (u8, u32)| {
+            t.used.iter().find(|u| {
+                u.kind == kind && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset)
+            })?;
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
+                return None;
+            };
+            let resource = match crate::descriptor::view(table + u64::from(offset) * 4)? {
+                View::Shader(r, _) | View::Unordered(r, ..) => r,
+                _ => return None,
+            };
+            let start = match self.ambient_tables.iter().find(|m| m.0 == slot) {
+                Some(m) => m.1,
+                None => self.user_value(true, slot, RootType::Table, 0),
+            };
+            let host = crate::resource::host_resource(resource as This)?;
+            // SAFETY: a live resource.
+            let desc = unsafe { host.GetDesc() };
+            Some((desc, heap.gpu_handle((start + offset * 4) / 32)))
+        };
+        let at = match role {
+            Role::Resolve => LIGHT,
+            Role::Radiance => RADIANCE,
+            Role::Air => AIR,
+        };
+        let image = entry(ResourceType::Uav, at);
+        let depth = match role {
+            Role::Resolve => entry(ResourceType::Srv, DEPTH),
+            Role::Radiance | Role::Air => image,
+        };
+        let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
+            once!(?role, "no stand-in for the indirect light: other tables");
+            return false;
+        };
+        // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT.)
+        let format = if role == Role::Resolve { 42 } else { 26 };
+        let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        if of.Format.0 != format || (seen.Width, seen.Height) != (of.Width, of.Height) || volume != (role == Role::Air) {
+            once!(?role, format = of.Format.0, "no stand-in for the indirect light: another image");
+            return false;
+        }
+        crate::ambient::after(list, role, &Views {
+            image,
+            depth,
+            size: [of.Width as u32, of.Height],
+            slices: u32::from(of.DepthOrArraySize),
+        })
     }
 
     /// What a draw or dispatch runs, for the device-removed report

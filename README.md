@@ -57,15 +57,16 @@ an update translates every shader again and is slow; judge the second.
 
 ### Known problems
 
-- The wall right of the window in the first cell is in shadow since quad reads
-  are on (one lamp's shadow-map program; a fix is being checked).
-  `VICTORY_QUAD_HELPERS=0` gives the old picture, with the edge lines.
-- Skin of some characters turns red, black or to noise in cutscenes, and eyes
-  can lose their iris. Suspected: character textures baked from inputs that had
-  not arrived.
-- Interiors that the sun does not reach are too dark: the title's ray-traced
-  light does not run (4 of the structure builder's 53 programs do not
-  translate).
+- Characters in shade and interiors the sun does not reach get their indirect
+  light from a stand-in (`VICTORY_AMBIENT`, 0.8 by default, `0`: off; it
+  estimates the light around from the screen). Without it a face in shade could
+  go black with glowing eyes. What is still missing is the title's own
+  ray-traced bounce (4 of the structure builder's 53 programs do not
+  translate), so there is no coloured bounce, such as the orange on the bunk in
+  the prologue's cell window shot.
+- Skin can still be wrong in cutscenes (red, noise; eyes losing their iris)
+  where that is not the light: character bakes now get their textures made
+  right before they draw, and this is being checked.
 - Clear glass shows a blurred orange smear instead of what is behind it; floors
   can look wet and lose their painted lettering; some runs have a pink cast on
   floors and ceilings.
