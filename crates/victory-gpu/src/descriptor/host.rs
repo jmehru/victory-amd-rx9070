@@ -2768,15 +2768,32 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
 
 /// With `VICTORY_NULL_MAGENTA=1`, a 2D colour texture view that shows
 /// nothing yet shows magenta: on the screen, a texture that is not there is
-/// told from one whose contents are black. False if it is to be null.
-#[cfg(feature = "diagnostics")]
+/// told from one whose contents are black. Without it the view shows mid
+/// grey, and so do one- and two-channel block-compressed views (a flat
+/// normal): a texture that has not arrived is a grey surface, not a black
+/// one (`VICTORY_NULL_GREY=0`: null, it reads zeros). When the cell's
+/// gameplay begins some 4,000 textures wait for five to ten seconds; null,
+/// the room was black and the hair white for that long (run pk3, pictures
+/// pw-101 and pw-105), grey it is the room in flat colours (pg1, pw-057).
+/// False if the view is to be null.
 fn magenta_for(desc: &[u32; 16], at: D3D12_CPU_DESCRIPTOR_HANDLE) -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("VICTORY_NULL_MAGENTA").is_some_and(|v| v == "1")) {
+    static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| {
+        let set = |k: &str| std::env::var_os(k).is_some_and(|v| v == "1");
+        if set("VICTORY_NULL_MAGENTA") {
+            1
+        } else if std::env::var_os("VICTORY_NULL_GREY").is_none_or(|v| v != "0") {
+            2
+        } else {
+            0
+        }
+    });
+    if on == 0 {
         return false;
     }
-    // Block-compressed colour (BC1 to BC3, BC7) and 8-bit RGBA and BGRA.
-    let colour = matches!(desc[0], 27..=29 | 70..=78 | 87..=91 | 97..=99);
+    // Block-compressed colour (BC1 to BC3, BC7) and 8-bit RGBA and BGRA;
+    // for grey also BC4 and BC5.
+    let colour = matches!(desc[0], 27..=29 | 70..=78 | 87..=91 | 97..=99) || on == 2 && matches!(desc[0], 79..=84);
     if desc[1] != D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32 || !colour {
         return false;
     }
@@ -2788,8 +2805,8 @@ fn magenta_for(desc: &[u32; 16], at: D3D12_CPU_DESCRIPTOR_HANDLE) -> bool {
     true
 }
 
-/// One magenta texel, written by the processor.
-#[cfg(feature = "diagnostics")]
+/// One texel, mid grey or (`VICTORY_NULL_MAGENTA=1`) magenta, written by
+/// the processor.
 fn magenta() -> Option<&'static ID3D12Resource> {
     static TEXTURE: std::sync::OnceLock<Option<ID3D12Resource>> = std::sync::OnceLock::new();
     TEXTURE
@@ -2827,7 +2844,8 @@ fn magenta() -> Option<&'static ID3D12Resource> {
                     .ok()?;
                 let texture = texture?;
                 texture.Map(0, None, None).ok()?;
-                let texel = [255u8, 0, 255, 255];
+                let grey = std::env::var_os("VICTORY_NULL_MAGENTA").is_none_or(|v| v != "1");
+                let texel = if grey { [128u8, 128, 128, 255] } else { [255u8, 0, 255, 255] };
                 texture.WriteToSubresource(0, None, texel.as_ptr().cast(), 4, 4).ok()?;
                 texture.Unmap(0, None);
                 Some(texture)
@@ -2861,7 +2879,6 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         // cubes), not always 2D.
         View::Shader(_, Some(desc)) => return null_like(desc, at),
         View::Placed(false, _, desc) => {
-            #[cfg(feature = "diagnostics")]
             if magenta_for(desc, at) {
                 return;
             }
