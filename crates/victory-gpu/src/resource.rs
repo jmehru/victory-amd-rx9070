@@ -1257,6 +1257,38 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
     same.then_some(other)
 }
 
+/// Diagnostics: for a texture made for a view the title placed in memory,
+/// what lies at its address among the textures the host writes (the one
+/// [`alias_of`] would take, or the nearest below), in a few words.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn alias_report(this: This) -> Option<String> {
+    use std::sync::atomic::Ordering::Relaxed;
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    if !r.host.placed.load(Relaxed) {
+        return None;
+    }
+    let shape = |d: &ResourceDesc| {
+        format!(
+            "{}x{} f{} mips {} layers {} flags {:#x} layout {:#x}",
+            d.width, d.height, d.format, d.mip_levels, d.depth_or_array_size, d.flags, d.layout
+        )
+    };
+    let at = r.data() as u64;
+    let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+    let below = targets
+        .range(..=at)
+        .next_back()
+        .map(|(&a, &o)| format!("{} at {a:#x} ({:+#x})", shape(&resource(o as This).desc), at - a));
+    let above = targets
+        .range(at + 1..)
+        .next()
+        .map(|(&a, &o)| format!("{} at {a:#x}", shape(&resource(o as This).desc)));
+    Some(format!("placed {} at {at:#x}; written by the host below: {below:?}; above: {above:?}", shape(&r.desc)))
+}
+
 /// Whether host copies are made on first use. On by default;
 /// `VICTORY_LAZY_TEXTURES=0` makes each when the title creates its texture,
 /// as before.

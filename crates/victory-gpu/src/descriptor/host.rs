@@ -99,17 +99,24 @@ pub(crate) struct HostHeap {
 /// Title memory by the placed texture views that describe it: per span of
 /// memory (its start, its end) the resource description of the texture
 /// there and the title slots holding a view of it. A span is the memory of
-/// the mips a view shows ([`crate::resource::placed_bytes_from`]). Spans of
-/// two textures never overlap: a console title need not clear a descriptor
-/// when it streams a texture out, so a view written over memory that older
-/// views describe otherwise (another start, or another length and another
-/// description: another texture) is all that says the older ones are stale.
+/// the mips a view shows ([`crate::resource::placed_bytes_from`]). A console
+/// title need not clear a descriptor when it streams a texture out, so a
+/// view written over memory that older views describe otherwise is all that
+/// says the older ones are stale ([`Rule`]).
 /// Views of one span with different descriptions (the formats of one
 /// family, say) are one texture's, and so are views of one description at
 /// one start that show more and fewer of its mips.
+/// Spans of live textures may overlap: a texture's smallest levels lie at
+/// the start of its memory, and the title, holding only those, puts the
+/// next texture where the larger ones would be while its views still show
+/// every level (two 1024x1024 BC1 textures 0x45000 apart, each of 0xab000,
+/// both read by the same frame's character draws: run df3). What is there of
+/// a texture ends where the next one starts.
 /// No host heap is needed, so it is tested without one.
 #[derive(Default)]
 pub(crate) struct Spans {
+    /// When a newer view makes an older one stale.
+    rule: Rule,
     spans: std::collections::BTreeMap<(u64, u64), ([u32; 14], std::collections::BTreeSet<u32>)>,
     by_slot: std::collections::HashMap<u32, (u64, u64)>,
     /// The bytes a placed texture takes, by resource description and first
@@ -142,9 +149,18 @@ impl Spans {
     }
 
     /// The spans that say otherwise than that a texture with the resource
-    /// description `desc` lies in `[start, end)`.
+    /// description `desc` lies in `[start, end)`: under [`Rule::Start`],
+    /// those that start in the block of its smallest levels (or it in
+    /// theirs); else all that overlap it.
     fn against(&self, start: u64, end: u64, desc: &[u32; 14]) -> Vec<(u64, u64)> {
-        let mut spans = self.overlapping(start, end);
+        let mut spans = match self.rule {
+            Rule::Start => self
+                .spans
+                .range((start.saturating_sub(HEAD - 1), 0)..(start.saturating_add(HEAD), 0))
+                .map(|(&span, _)| span)
+                .collect(),
+            Rule::Overlap | Rule::Never => self.overlapping(start, end),
+        };
         spans.retain(|span| {
             let same = span.0 == start && (span.1 == end || self.spans.get(span).is_some_and(|s| s.0 == *desc));
             !same
@@ -167,10 +183,29 @@ impl Spans {
         }
         let mut stale = Vec::new();
         for span in self.against(start, end, desc) {
-            if !newer {
+            if !newer || self.rule == Rule::Never {
                 return stale;
             }
-            if let Some((_, slots)) = self.spans.remove(&span) {
+            if let Some((_old, slots)) = self.spans.remove(&span) {
+                // Diagnostics (`VICTORY_TRACE_STALE=1`): what made which
+                // slots stale, at most 80,000 lines (none for views of
+                // address 0, which the title writes before a texture has
+                // its memory).
+                #[cfg(feature = "diagnostics")]
+                if trace_stale() && start != 0 && span.0 != 0 {
+                    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 80_000 {
+                        let shape = |d: &[u32; 14]| format!("{}x{} f{} mips {} dim {}", d[4], d[6], d[8], d[7] >> 16, d[0]);
+                        tracing::info!(
+                            "stale: slot {index} wrote {start:#x}..{end:#x} ({}) over {:#x}..{:#x} ({}) of slots {:?}",
+                            shape(desc),
+                            span.0,
+                            span.1,
+                            shape(&_old),
+                            slots
+                        );
+                    }
+                }
                 for slot in slots {
                     self.by_slot.remove(&slot);
                     stale.push(slot);
@@ -218,6 +253,42 @@ impl Spans {
             .flat_map(|span| span.1.iter().copied())
             .collect()
     }
+}
+
+/// When a view the title writes makes an older view of other memory stale
+/// (fxceless 310c6eb, lost in this tree's merges 0c7fb26 and f0f2a33 of it,
+/// which kept 4436f8f's spans by the mips a view shows).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Rule {
+    /// When it starts where the older one starts: at the same address with
+    /// another length and description, or within the older one's first
+    /// [`HEAD`] bytes (or the older within its own). No two textures share
+    /// the block of their smallest levels. A view that only reaches into the
+    /// address range of an older texture's larger levels says nothing.
+    #[default]
+    Start,
+    /// Whenever their spans overlap (`VICTORY_STALE_TEXTURES=overlap`, the
+    /// rule until now: each view the title wrote took the textures packed
+    /// beside it out of the queue and made their slots null, characters'
+    /// faces grey until the sweep put them back: runs df1-df3).
+    Overlap,
+    /// Never; a view that clashes under [`Rule::Overlap`] is left out of the
+    /// spans instead (`VICTORY_STALE_TEXTURES=0`).
+    Never,
+}
+
+/// The first bytes of a placed texture that are its own under
+/// [`Rule::Start`]: the 4 KiB block its smallest levels share.
+const HEAD: u64 = 4096;
+
+/// [`Rule`] by `VICTORY_STALE_TEXTURES`.
+fn stale_rule() -> Rule {
+    static RULE: std::sync::OnceLock<Rule> = std::sync::OnceLock::new();
+    *RULE.get_or_init(|| match std::env::var("VICTORY_STALE_TEXTURES").as_deref() {
+        Ok("0") => Rule::Never,
+        Ok("overlap") => Rule::Overlap,
+        _ => Rule::Start,
+    })
 }
 
 /// Whose the memory of a texture view is, by [`Spans`].
@@ -268,6 +339,12 @@ static SPANNED: [std::sync::atomic::AtomicU64; 2] = [
 /// ranges; and made slots whose memory was found unmapped (made null).
 pub(crate) static STALE: [std::sync::atomic::AtomicU64; 5] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+#[cfg(feature = "diagnostics")]
+fn trace_stale() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TRACE_STALE").is_some_and(|v| v == "1"))
+}
 
 /// Whether a view written over memory that older views describe otherwise
 /// makes those stale; `VICTORY_STALE_TEXTURES=0` leaves them as they are.
@@ -879,7 +956,7 @@ impl HostHeap {
             tabled: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
-            placed: Mutex::default(),
+            placed: Mutex::new(Spans { rule: stale_rule(), ..Default::default() }),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -1407,6 +1484,13 @@ impl HostHeap {
         if made.get(index as usize).is_none_or(|&key| key == 0) {
             return false;
         }
+        #[cfg(feature = "diagnostics")]
+        if trace_stale() {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5_000 {
+                tracing::info!("gone: slot {index} made null, its memory not mapped");
+            }
+        }
         self.unmake(&mut made, index);
         self.textures.lock().unwrap_or_else(|e| e.into_inner()).rechecks.remove(&index);
         STALE[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1589,6 +1673,17 @@ impl HostHeap {
                 }
             }
         };
+        #[cfg(feature = "diagnostics")]
+        if !stale.is_empty()
+            && trace_stale()
+            && let Some(View::Placed(false, _, desc)) = view
+            && (desc[10] != 0 || desc[11] != 0)
+        {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 40_000 {
+                tracing::info!("stale by: slot {index} view {:x?}", &desc[..]);
+            }
+        }
         if !stale.is_empty() {
             STALE[0].fetch_add(stale.len() as u64, std::sync::atomic::Ordering::Relaxed);
             let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
@@ -1963,6 +2058,13 @@ impl HostHeap {
             // let go of the host copies they held.
             for stale in self.note_buffer(index, Some(&view), for_draw) {
                 if stale != index {
+                    #[cfg(feature = "diagnostics")]
+                    if trace_stale() && made.get(stale as usize).is_some_and(|&k| k != 0) {
+                        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 40_000 {
+                            tracing::info!("stale unmade: slot {stale} (shown) by a write of slot {index}");
+                        }
+                    }
                     self.unmake(&mut made, stale);
                 }
             }
@@ -2040,6 +2142,12 @@ impl HostHeap {
     /// The view host slot `index` was made from, in a few words, with the
     /// title and host addresses of a buffer view (diagnostics). "null" for
     /// a slot never made or left null.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn made_view(&self, index: u32) -> Option<View> {
+        let key = *self.made().get(index as usize)?;
+        (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten()
+    }
+
     #[cfg(feature = "diagnostics")]
     pub(crate) fn describe_slot(&self, index: u32) -> Option<String> {
         let key = *self.made().get(index as usize)?;
@@ -3350,7 +3458,7 @@ mod tests {
     /// makes those stale; views of the same span are one texture's.
     #[test]
     fn a_newer_view_of_other_memory_makes_the_older_stale() {
-        let mut spans = Spans::default();
+        let mut spans = Spans { rule: Rule::Overlap, ..Default::default() };
         // Three textures side by side, the first in two slots.
         assert!(spans.note(1, 0x1000, 0x3000, &shape(0x1000, 0x3000), true).is_empty());
         assert!(spans.note(2, 0x1000, 0x3000, &shape(0x1000, 0x3000), true).is_empty());
@@ -3391,7 +3499,7 @@ mod tests {
         // there, and a 1024x512 BC1 texture 8 KiB on.
         let texture = [3, 0, 0, 0, 512, 0, 512, 0x8_0001, 99, 1, 0, 0x105, 0, 0];
         let next = [3, 0, 0, 0, 1024, 0, 512, 0x8_0001, 71, 1, 0, 0x105, 0, 0];
-        let mut spans = Spans::default();
+        let mut spans = Spans { rule: Rule::Overlap, ..Default::default() };
         let at = 0xb_5c04_0000u64;
         let end = |spans: &mut Spans, desc: &[u32; 14], at: u64, first| at + spans.bytes(desc, first).unwrap();
         let a = end(&mut spans, &texture, at, 3);
@@ -3412,6 +3520,38 @@ mod tests {
         assert_eq!(spans.note(1, at, more, &texture, true), [2]);
         assert_eq!(spans.claim(3, at, small, &texture), (Claim::Own, None));
         assert_eq!(spans.claim(2, a, b, &next), (Claim::Other, Some((at, more))));
+    }
+
+    /// Textures packed by what is there of them, as the title has them
+    /// (run df3): views showing every level of two 1024x1024 BC1 textures
+    /// 0x45000 apart, each 0xab000 at full size, and a 256x256 one inside the
+    /// second's larger levels. All stay; only a view that starts in the block
+    /// of another's smallest levels makes that one stale.
+    #[test]
+    fn textures_packed_by_what_is_there_of_them_stay() {
+        let bc1 = [3, 0, 0, 0, 1024, 0, 1024, 0x9_0001, 71, 1, 0, 0x105, 0x30_0000, 0];
+        let small = [3, 0, 0, 0, 256, 0, 256, 0x7_0001, 71, 1, 0, 0x105, 0x30_0000, 0];
+        let mut spans = Spans::default();
+        assert_eq!(spans.rule, Rule::Start);
+        let full = spans.bytes(&bc1, 0).unwrap();
+        assert_eq!(full, 0xab000);
+        let (a, b, c) = (0x6_887c_0000u64, 0x6_8880_5000u64, 0x6_8884_0000u64);
+        assert!(spans.note(1, a, a + full, &bc1, true).is_empty());
+        assert!(spans.note(2, b, b + full, &bc1, true).is_empty());
+        let s = spans.bytes(&small, 0).unwrap();
+        assert!(spans.note(3, c, c + s, &small, true).is_empty());
+        assert_eq!(spans.claim(1, a, a + full, &bc1), (Claim::Own, None));
+        assert_eq!(spans.claim(2, b, b + full, &bc1), (Claim::Own, None));
+        // Another texture where the first one starts: that one is stale.
+        assert_eq!(spans.note(4, a, a + s, &small, true), [1]);
+        // One starting within the second's first 4 KiB: stale too.
+        assert_eq!(spans.note(5, b + 0x800, b + 0x800 + s, &small, true), [2]);
+        // Memory mapped anew there finds the texture that starts there.
+        assert_eq!(spans.slots_in(c, c + 1), [3]);
+        // Under the old rule the first write over a neighbour takes it.
+        let mut old = Spans { rule: Rule::Overlap, ..Default::default() };
+        assert!(old.note(1, a, a + full, &bc1, true).is_empty());
+        assert_eq!(old.note(2, b, b + full, &bc1, true), [1]);
     }
 
     /// A resource description of its own for every span.
