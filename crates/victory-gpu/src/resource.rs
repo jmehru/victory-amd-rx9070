@@ -1877,7 +1877,7 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
 }
 
 /// Card memory for the host copies of textures the title fills, in blocks
-/// made ahead (`VICTORY_TEXTURE_BLOCKS=0`: each on its own): a texture is placed in a
+/// made ahead (`VICTORY_TEXTURE_BLOCKS=1`; off, see below): a texture is placed in a
 /// piece of a block, and a piece let go is taken by the next texture of the
 /// same bytes. The idea is avatarmanz/VIctory-7900XTX's ("textures are cut
 /// from blocks"), written for this tree.
@@ -1915,7 +1915,15 @@ mod blocks {
 
     fn on() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_BLOCKS").is_none_or(|v| v != "0"))
+        *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_BLOCKS").is_some_and(|v| v != "0"))
+    }
+
+    /// `VICTORY_TEXTURE_BLOCKS=fresh`: a piece let go is not taken again (a
+    /// test: every texture then starts as zeros, as one made on its own
+    /// does), up to 6 GiB of blocks.
+    fn fresh() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_BLOCKS").is_some_and(|v| v == "fresh"))
     }
 
     /// A texture of `desc` (the host's layout) placed in a block, in `state`;
@@ -1938,6 +1946,9 @@ mod blocks {
             Some(piece) => piece,
             None => {
                 if b.top + bytes > BLOCK {
+                    if fresh() && b.heaps.len() >= 96 {
+                        return None;
+                    }
                     let mut heap: Option<ID3D12Heap> = None;
                     // SAFETY: plain creation of a heap for textures that are
                     // neither targets nor depth.
@@ -1990,6 +2001,7 @@ mod blocks {
         let Some(b) = blocks.as_mut() else { return };
         if let Some((block, offset, bytes)) = b.placed.remove(&(texture.as_raw() as usize))
             && crate::host::references(texture) == 1
+            && !fresh()
         {
             b.free.entry(bytes).or_default().push((block, offset));
         }
