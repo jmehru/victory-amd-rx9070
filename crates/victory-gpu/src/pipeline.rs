@@ -422,6 +422,12 @@ pub(crate) fn making() -> u64 {
     make::waiting()
 }
 
+/// What was dropped for a pipeline not made yet, for the log.
+#[cfg(windows)]
+pub(crate) fn not_ready_line() -> Option<String> {
+    make::not_ready_line()
+}
+
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
 /// (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]

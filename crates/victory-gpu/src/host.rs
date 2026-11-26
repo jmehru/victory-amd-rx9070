@@ -7280,13 +7280,18 @@ impl Meter {
                 let then = FRAMES_THEN.swap(now, Ordering::Relaxed);
                 card_times_line((now - then) as f64);
             }
+            if let Some(line) = crate::pipeline::not_ready_line() {
+                tracing::info!("{line}");
+            }
             tracing::info!(
-                "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made), {} writes of a view of another texture (kept the old texture, VICTORY_KEEP_VIEWS=1: null), {} such made null at once; since the start {} slots made null because a newer view describes their memory and {} because their memory was found unmapped",
+                "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made), {} writes of a view of another texture (kept the old texture, VICTORY_KEEP_VIEWS=1: null), {} such made null at once; since the start {} slots made null because a newer view describes their memory and {} because their memory was found unmapped; {} times a slot that still showed a texture was left for a later pass (VICTORY_TEXTURE_STAGE_SHOWN_MS); {} reads through a table of a slot uploaded only in part, which stayed in the queue",
                 crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed),
                 crate::descriptor::host::REPLACED[0].load(Ordering::Relaxed),
                 crate::descriptor::host::REPLACED[1].load(Ordering::Relaxed),
                 crate::descriptor::host::STALE[0].load(Ordering::Relaxed),
-                crate::descriptor::host::STALE[4].load(Ordering::Relaxed)
+                crate::descriptor::host::STALE[4].load(Ordering::Relaxed),
+                crate::draw::HEAP_TEXTURES_PUT_OFF.load(Ordering::Relaxed),
+                crate::descriptor::host::PARTLY_KEPT.load(Ordering::Relaxed)
             );
             {
                 let [same, changed, waiting] =

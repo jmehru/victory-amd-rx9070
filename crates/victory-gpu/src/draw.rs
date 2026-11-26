@@ -508,6 +508,10 @@ pub(crate) static HEAP_BUFFER_VISITS: [AtomicU64; 2] = [const { AtomicU64::new(0
 pub(crate) static HEAP_TEXTURES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_TEXTURE_BYTES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_TEXTURES_WAITING: AtomicU64 = AtomicU64::new(0);
+/// Slots left for a later pass because they still show a texture and the
+/// pass had used its time for such, since the start.
+pub(crate) static HEAP_TEXTURES_PUT_OFF: AtomicU64 = AtomicU64::new(0);
+
 /// Passes that made no texture because the card had no room
 /// (`crate::resource::room`), for the memory line.
 pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
@@ -1906,7 +1910,7 @@ impl State {
             HEAP_TEXTURES_RECHECKED[1].fetch_add(changed, Ordering::Relaxed);
             HEAP_TEXTURES_RECHECKED[2].store(waiting, Ordering::Relaxed);
         }
-        let (due, census) = host.texture_slots_due(frame, 4096);
+        let (due, census) = host.texture_slots_due(frame, 8192);
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
             count.store(now, Ordering::Relaxed);
@@ -1969,10 +1973,28 @@ impl State {
             }
             None => (span, per_frame),
         };
+        // A slot that still shows the texture it showed (the title wrote
+        // it with a sharper copy, `HostHeap::mirror`) can wait: past this
+        // much of the pass only slots that show nothing are served
+        // (`VICTORY_TEXTURE_STAGE_SHOWN_MS`, 8; as much as the span: all
+        // alike, as before). While the camera turns the title streams some
+        // 1,700 textures a second and the pass took its 40 ms in every
+        // frame, which made those frames 82 to 93 ms where the scene at
+        // rest takes 53 (run pm1).
+        static SHOWN_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let shown_span = std::time::Duration::from_millis(*SHOWN_MS.get_or_init(|| {
+            std::env::var("VICTORY_TEXTURE_STAGE_SHOWN_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8)
+        }));
+        let shown_span = if early.is_some() { span } else { shown_span.min(span) };
         let began = std::time::Instant::now();
         for (index, write) in due {
-            if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
+            let elapsed = began.elapsed();
+            if SPENT.load(Ordering::Relaxed) >= bytes_at_most || elapsed > span {
                 break;
+            }
+            if elapsed > shown_span && host.texture_slot_shows(index) {
+                HEAP_TEXTURES_PUT_OFF.fetch_add(1, Ordering::Relaxed);
+                continue;
             }
             // A placed texture whose memory is not mapped (not streamed in
             // yet, or streamed out again: the heap keeps tens of thousands

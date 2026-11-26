@@ -1359,6 +1359,12 @@ impl HostHeap {
         }
     }
 
+    /// Whether host slot `index` shows a view now (one made before the
+    /// title wrote the slot again, if its new view is not made yet).
+    pub(crate) fn texture_slot_shows(&self, index: u32) -> bool {
+        self.made_now.get(index as usize).is_some_and(|key| key.load(std::sync::atomic::Ordering::Acquire) != 0)
+    }
+
     /// The memory of the texture title slot `index` views is not mapped
     /// (any more): a host slot made from it becomes null again, so that
     /// the host copy can be let go (`crate::resource::let_go_idle`; a slot
@@ -1421,7 +1427,16 @@ impl HostHeap {
             stamp.store(now | TABLED_READ, Relaxed);
             if tabled_out() {
                 let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-                if textures.slots.remove(&index).is_some() {
+                // Not one uploaded with only part of its memory mapped: it
+                // stays in the queue until all of it was there once. Taken
+                // out here, nothing made it due again when the rest was
+                // mapped, and its largest mips kept the zeros of the first
+                // upload for the run (slot 32759 of the cell, a 512x512
+                // texture the skin draws read: 212,992 of 352,256 bytes
+                // mapped at its first look).
+                if textures.slots.get(&index).is_some_and(|w| w.mapped != 0) {
+                    PARTLY_KEPT.fetch_add(1, Relaxed);
+                } else if textures.slots.remove(&index).is_some() {
                     TABLED_WRITES[1].fetch_add(1, Relaxed);
                 }
             }
@@ -2713,6 +2728,11 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         }
     }
 }
+
+/// Reads through a table of a slot whose texture was uploaded with part of
+/// its memory mapped: the slot stayed in the queue of textures picked by
+/// index; since the start.
+pub(crate) static PARTLY_KEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Writes of a slot with another view of the placed texture it showed,
 /// since the start: the slot kept showing the old view.

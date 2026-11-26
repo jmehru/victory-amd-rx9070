@@ -239,7 +239,8 @@ pub(crate) fn waiting() -> u64 {
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
-    if p.left_out.is_some() {
+    if let Some(why) = p.left_out {
+        not_ready(p, why);
         return None;
     }
     // A still-pending pipeline was requested by the title too. Prewarm it
@@ -250,9 +251,110 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if p.made.get().is_none() {
         start(p, REQUESTED);
         wait(p, crate::frame::current());
+        if p.made.get().is_none() {
+            not_ready(p, if slow(p) { "too long at the driver to wait for" } else { "not made yet" });
+        }
     }
-    p.made.get()?.as_ref()
+    let made = p.made.get()?.as_ref();
+    if made.is_none() {
+        not_ready(p, "refused by the host or not translated");
+    }
+    made
 }
+
+/// Draws and dispatches that found their pipeline not made (and were
+/// dropped), by pipeline, since the last [`not_ready_line`]: the first
+/// frame, how many, and whether the driver had been at it too long to be
+/// waited for ([`slow`]).
+static NOT_READY: Mutex<Vec<(String, bool, u64, u64, &'static str)>> = Mutex::new(Vec::new());
+
+fn not_ready(p: &Pending, why: &'static str) {
+    // Cheap for what is dropped in every frame: found by its hashes.
+    {
+        let mut all = NOT_READY.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(e) = all.iter_mut().find(|e| e.4 == why && same_hashes(&e.0, &p.shaders)) {
+            e.3 += 1;
+            return;
+        }
+    }
+    let name = p
+        .shaders
+        .iter()
+        .map(|s| {
+            // A compute program's name is in its container ("CS_...").
+            let named = s
+                .container
+                .windows(3)
+                .position(|w| w == b"CS_")
+                .map(|at| {
+                    s.container[at..]
+                        .iter()
+                        .take_while(|b| b.is_ascii_alphanumeric() || **b == b'_')
+                        .take(60)
+                        .map(|&b| b as char)
+                        .collect::<String>()
+                })
+                .filter(|_| s.stage == "compute");
+            match named {
+                Some(name) => format!("{} {name}", s.hash),
+                None => format!("{} {}", s.stage, s.hash),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("+");
+    let mut all = NOT_READY.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(e) = all.iter_mut().find(|e| e.0 == name && e.4 == why) {
+        e.3 += 1;
+    } else if all.len() < 4096 {
+        all.push((name, p.computes(), crate::frame::current(), 1, why));
+    }
+}
+
+/// Whether `name` (as [`not_ready`] writes it) names exactly `shaders`.
+fn same_hashes(name: &str, shaders: &[Arc<Shader>]) -> bool {
+    let mut parts = name.split('+');
+    shaders.iter().all(|s| parts.next().is_some_and(|part| part.contains(s.hash.as_str()))) && parts.next().is_none()
+}
+
+/// For the log, every few seconds: what was dropped because its pipeline
+/// was not made yet, the compute pipelines by name (a pass the title runs
+/// once is lost that way), and what the frames have waited past the plain
+/// budget of all `VICTORY_PIPELINE_GATE_S` allows. `None`: nothing dropped.
+pub(crate) fn not_ready_line() -> Option<String> {
+    let mut all = std::mem::take(&mut *NOT_READY.lock().unwrap_or_else(|e| e.into_inner()));
+    if all.is_empty() {
+        return None;
+    }
+    // The most dropped first.
+    all.sort_by_key(|e| std::cmp::Reverse(e.3));
+    let mut whys: Vec<&'static str> = Vec::new();
+    for e in &all {
+        if !whys.contains(&e.4) {
+            whys.push(e.4);
+        }
+    }
+    let mut text = format!(
+        "draws and dispatches dropped for want of a host pipeline since the last such line (waited past the plain budget so far: {} ms for compute pipelines, {} ms for the others, VICTORY_PIPELINE_GATE_S bounds each; {} queued)",
+        LOADINGS[1].load(Ordering::Relaxed),
+        LOADINGS[0].load(Ordering::Relaxed),
+        waiting()
+    );
+    for why in whys {
+        let of: Vec<_> = all.iter().filter(|e| e.4 == why).collect();
+        let count = |compute: bool| of.iter().filter(|e| e.1 == compute).fold((0, 0), |(n, sum), e| (n + 1, sum + e.3));
+        let ((computes, dispatches), (others, draws)) = (count(true), count(false));
+        let names: Vec<String> = of.iter().take(16).map(|e| format!("{} x{} from frame {}", e.0, e.3, e.2)).collect();
+        text.push_str(&format!(
+            " | {why}: {dispatches} dispatches of {computes} compute pipelines, {draws} draws of {others} others; the most dropped: {}",
+            names.join("; ")
+        ));
+    }
+    Some(text)
+}
+
+/// What was waited past the budget since the start, in milliseconds; the
+/// second is the compute pipelines'.
+static LOADINGS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
 /// that is making it); whether it has a host pipeline.
@@ -302,9 +404,6 @@ fn wait(p: &Pending, frame: u64) {
     if budget.is_zero() || slow(p) {
         return;
     }
-    // What was waited past the budget since the start, in milliseconds; the
-    // second of each is the compute pipelines'.
-    static LOADINGS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
     let compute = p.computes();
     let past_total = &LOADINGS[usize::from(compute)];
     let loading = loading_left(Duration::from_millis(past_total.load(Ordering::Relaxed)));
@@ -314,6 +413,9 @@ fn wait(p: &Pending, frame: u64) {
     static SPENTS: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
     let frame_spent = &SPENTS[usize::from(compute)];
     let shared = shared_budget();
+    if together() {
+        return wait_together(p, frame, budget, compute);
+    }
     let left = {
         let mut spent = frame_spent.lock().unwrap_or_else(|e| e.into_inner());
         if spent.0 != frame {
@@ -360,6 +462,82 @@ fn wait(p: &Pending, frame: u64) {
         crate::copystat::C::PipelineWaitUs,
         started.elapsed().as_micros() as u64,
     );
+}
+
+/// Whether the threads that wait for pipelines in a frame wait together:
+/// the frame's budget is the time during which any thread waits, and every
+/// thread may wait while some of it is left (`VICTORY_PIPELINE_WAIT_TOGETHER=0`:
+/// the first thread to wait takes all that is left, as before).
+///
+/// Taken by the first, the other recording threads found nothing left and
+/// dropped what they recorded meanwhile: in a run that found no pipeline
+/// made (run cc2) the first world frames dropped 3,269 dispatches of 371
+/// compute pipelines and 3,996 draws of 482 others, with 3.5 and 3.1 s
+/// waited in all of the 120 s each kind may take while a world loads.
+fn together() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_TOGETHER").is_none_or(|v| v != "0"))
+}
+
+/// A frame's waiting, for [`together`]: the frame, the time waited in it
+/// with no thread waiting now, the threads waiting, since when one has
+/// been, and what of the frame's waiting past the plain budget is counted.
+struct Together {
+    frame: u64,
+    spent: Duration,
+    waiters: u32,
+    since: Option<Instant>,
+    past: Duration,
+}
+
+/// [`wait`] with the frame's budget as the time any thread waits.
+fn wait_together(p: &Pending, frame: u64, budget: Duration, compute: bool) {
+    static FRAMES: [Mutex<Together>; 2] =
+        [const { Mutex::new(Together { frame: u64::MAX, spent: Duration::ZERO, waiters: 0, since: None, past: Duration::ZERO }) }; 2];
+    let state = &FRAMES[usize::from(compute)];
+    // What is waited of the frame so far, counting the wait under way.
+    let so_far = |t: &Together| t.spent + t.since.map_or(Duration::ZERO, |since| since.elapsed());
+    {
+        let mut t = state.lock().unwrap_or_else(|e| e.into_inner());
+        if t.frame != frame {
+            // (Threads still waiting for the frame before count on.)
+            (t.frame, t.spent, t.past) = (frame, Duration::ZERO, Duration::ZERO);
+            if t.waiters != 0 {
+                t.since = Some(Instant::now());
+            }
+        }
+        if so_far(&t) >= budget {
+            return;
+        }
+        if t.waiters == 0 {
+            t.since = Some(Instant::now());
+        }
+        t.waiters += 1;
+    }
+    let (lock, done) = &DONE;
+    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while p.made.get().is_none() && !slow(p) {
+        let rest = {
+            let t = state.lock().unwrap_or_else(|e| e.into_inner());
+            if t.frame != frame { Duration::ZERO } else { budget.saturating_sub(so_far(&t)) }
+        };
+        if rest.is_zero() {
+            break;
+        }
+        // Woken now and then to see whether it has become a slow one.
+        held = done.wait_timeout(held, rest.min(Duration::from_millis(250))).unwrap_or_else(|e| e.into_inner()).0;
+    }
+    drop(held);
+    let mut t = state.lock().unwrap_or_else(|e| e.into_inner());
+    t.waiters = t.waiters.saturating_sub(1);
+    if t.waiters == 0
+        && let Some(since) = t.since.take()
+    {
+        t.spent += since.elapsed();
+        let past = t.spent.saturating_sub(wait_budget());
+        LOADINGS[usize::from(compute)].fetch_add(past.saturating_sub(t.past).as_millis() as u64, Ordering::Relaxed);
+        t.past = past;
+    }
 }
 
 const NOT_QUEUED: u8 = 0;
