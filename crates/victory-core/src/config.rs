@@ -22,6 +22,9 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// Other titles used to exercise platform-level code.
     pub test_titles: Vec<PathBuf>,
+    /// The folder of AMD's FidelityFX SDK binaries (`signedbin`) whose PC
+    /// upscaler answers the title's FidelityFX calls; `None`: not used.
+    pub ffx_dir: Option<PathBuf>,
     /// The config file that was read, if any.
     pub source: Option<PathBuf>,
 }
@@ -41,6 +44,7 @@ struct FilePaths {
     data_dir: Option<PathBuf>,
     #[serde(default)]
     test_titles: Vec<PathBuf>,
+    ffx_dir: Option<PathBuf>,
 }
 
 impl Config {
@@ -91,11 +95,17 @@ impl Config {
         let data_dir = env_path("VICTORY_DATA_DIR")
             .or(file.data_dir)
             .map_or_else(|| default_dir("data"), Ok)?;
+        // Set and empty turns it off, whatever the file says.
+        let ffx_dir = match env("VICTORY_FFX_DIR") {
+            Some(v) => (!v.is_empty()).then(|| PathBuf::from(v)),
+            None => file.ffx_dir,
+        };
         Ok(Config {
             game_dir: env_path("VICTORY_GAME_DIR").or(file.game_dir),
             cache_dir,
             data_dir,
             test_titles,
+            ffx_dir,
             source,
         })
     }
@@ -152,6 +162,21 @@ mod tests {
         let cfg = Config::resolve(file, None, env).unwrap();
         assert_eq!(cfg.game_dir.unwrap(), PathBuf::from("from-env"));
         assert_eq!(cfg.cache_dir, PathBuf::from("cache-from-file"));
+    }
+
+    #[test]
+    fn the_upscaler_folder_is_the_environments_then_the_files_and_empty_is_off() {
+        let file = || FilePaths { ffx_dir: Some("from-file".into()), ..Default::default() };
+        let with = |v: Option<&'static str>| {
+            Config::resolve(file(), None, move |k: &str| if k == "VICTORY_FFX_DIR" { v.map(OsString::from) } else { None })
+                .unwrap()
+                .ffx_dir
+        };
+        assert_eq!(with(None), Some(PathBuf::from("from-file")));
+        assert_eq!(with(Some("from-env")), Some(PathBuf::from("from-env")));
+        assert_eq!(with(Some("")), None);
+        let none = Config::resolve(FilePaths::default(), None, |_| None).unwrap();
+        assert_eq!(none.ffx_dir, None);
     }
 
     #[test]

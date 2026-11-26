@@ -226,3 +226,10 @@ pub(crate) fn module() -> crate::HleModule {
         ],
     }
 }
+
+/// Names the folder of AMD's FidelityFX binaries for the PC upscaler
+/// (`victory_gpu::ffx::set_dir`): from the environment or `victory.toml`,
+/// before the title runs.
+pub fn set_dir(dir: Option<std::path::PathBuf>) {
+    victory_gpu::ffx::set_dir(dir);
+}
