@@ -90,6 +90,7 @@ fn build() -> &'static [u8; 32] {
             "VICTORY_NAN_GUARD",
             "VICTORY_DENORM",
             "VICTORY_QUAD_HELPERS",
+            "VICTORY_QUAD_PRESENT",
         ] {
             hash.update(name.as_bytes());
             hash.update(b"=");
@@ -105,11 +106,38 @@ fn build() -> &'static [u8; 32] {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    // Local (bisecting the quad reads): `VICTORY_QUAD_LIST=<file>` of
+    // program hashes (16 hex digits, as the log names them) turns quad reads
+    // on for those programs alone; such a program's entry is keyed apart.
+    let picked = quad_list().map(|list| list.contains(&blake3::hash(container).to_hex()[..16]));
+    let translate = move |c: &[u8]| {
+        victory_shader::emit::set_quad_for_this(picked);
+        let r = victory_shader::emit::translate(c).map_err(|e| e.to_string());
+        victory_shader::emit::set_quad_for_this(None);
+        r
+    };
+    let mut key = *build();
+    if picked == Some(true) {
+        key[31] ^= 0x5A;
+    }
     match CACHE.get() {
-        Some(cache) => cached(cache, build(), container, translate),
+        Some(cache) => cached(cache, &key, container, translate),
         None => translate(container),
     }
+}
+
+/// The hashes of `VICTORY_QUAD_LIST`'s file, if it is set.
+fn quad_list() -> Option<&'static std::collections::HashSet<String>> {
+    static LIST: OnceLock<Option<std::collections::HashSet<String>>> = OnceLock::new();
+    LIST.get_or_init(|| {
+        let path = std::env::var_os("VICTORY_QUAD_LIST")?;
+        let text = std::fs::read_to_string(path).ok()?;
+        let set: std::collections::HashSet<String> =
+            text.split(|c: char| !c.is_ascii_hexdigit()).filter(|w| w.len() == 16).map(str::to_owned).collect();
+        tracing::info!(programs = set.len(), "VICTORY_QUAD_LIST: quad reads for these programs alone");
+        Some(set)
+    })
+    .as_ref()
 }
 
 /// The cache entry's converter: the build and the container in, the

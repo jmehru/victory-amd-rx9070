@@ -1065,10 +1065,33 @@ pub fn set_host_pixel_wave(lanes: u32) {
 }
 
 /// Whether a pixel shader's quad-local lane reads go through quad reads
-/// (`Lower::helpers_read`): `VICTORY_QUAD_HELPERS=1`.
+/// (`Lower::helpers_read`); `VICTORY_QUAD_HELPERS=0` turns that off.
 fn quad_helpers() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_QUAD_HELPERS").is_some_and(|v| v == "1"))
+    QUAD_FOR_THIS
+        .with(|c| c.get())
+        .unwrap_or_else(|| *ON.get_or_init(|| std::env::var_os("VICTORY_QUAD_HELPERS").is_none_or(|v| v != "0")))
+}
+
+thread_local! {
+    /// Quad reads on or off for the program this thread translates now,
+    /// over `VICTORY_QUAD_HELPERS` ([`set_quad_for_this`]).
+    static QUAD_FOR_THIS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Local (diagnostics of the quad reads): whether the next translations on
+/// this thread take quad reads, whatever `VICTORY_QUAD_HELPERS` says
+/// (`None`: as it says). The host picks programs by hash
+/// (`VICTORY_QUAD_LIST`).
+pub fn set_quad_for_this(on: Option<bool>) {
+    QUAD_FOR_THIS.with(|c| c.set(on));
+}
+
+/// Whether a quad read gives 0 from a source lane not running here
+/// ([`Lower::quad_read_present`]); `VICTORY_QUAD_PRESENT=0` turns it off.
+fn quad_present() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_QUAD_PRESENT").is_none_or(|v| v != "0"))
 }
 
 fn host_pixel_wave() -> u32 {
@@ -4591,11 +4614,10 @@ impl<'a> Lower<'a> {
     /// that used it took its smallest level, and the triangles' edges showed
     /// as lines on car paint, glass and skin. (Belobug 03629f3.)
     ///
-    /// Off by default (`VICTORY_QUAD_HELPERS=1` turns it on), through
-    /// [`Lower::quad_read`]. The lit wall right of the cell's window went
-    /// black with quad reads, in the form of four `QuadReadLaneAt` and
-    /// selects (runs art4h/art6q of 2026-11-25) and in avatarmanz 1c8dd31's
-    /// form of quad operations chosen from the pattern (face2-1).
+    /// On by default (`VICTORY_QUAD_HELPERS=0`: wave reads), through
+    /// [`Lower::quad_read_present`]: quad reads without the 0 a console
+    /// lane reads from a lane that is not running blacked the cell's right
+    /// wall, spotted wall edges and put green blobs in foliage.
     fn helpers_read(&self, quad: bool) -> bool {
         quad && self.s.pixel && quad_helpers()
     }
@@ -4607,6 +4629,50 @@ impl<'a> Lower<'a> {
     /// value) chosen by the lane's place in its quad. In place of
     /// [`Lower::quad_pick`]'s four reads and selects, which darkened the
     /// cell's right wall.
+    /// [`Lower::quad_read`], with 0 from a source lane that is not running
+    /// here (`VICTORY_QUAD_PRESENT=0`: as read). The console's quad_perm
+    /// (bound_ctrl) and ds_swizzle read 0 from a disabled lane; the host's
+    /// quad reads give whatever that lane's register held. A lane counts
+    /// as running if it is in the wave's ballot here or is a helper (helper
+    /// lanes are in no ballot on the host).
+    fn quad_read_present(&mut self, x: V, lanes: [u8; 4]) -> V {
+        let r = self.quad_read(x, lanes);
+        if lanes == [0, 1, 2, 3] || !quad_present() {
+            return r;
+        }
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let yes = self.s.m.bool(true);
+        let ballot = self.s.op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[yes]);
+        let (lo, hi) = (self.s.m.extract(c, ballot, 0), self.s.m.extract(c, ballot, 1));
+        let lane = self.s.op(c, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+        let [three, not3, k31, k32, one, zero] = [3, !3u32, 31, 32, 1, 0].map(|k| self.s.m.i32(k));
+        let pos = self.s.m.bin(c, Bin::And, lane, three);
+        let mut src_pos = self.s.m.i32(lanes[0].into());
+        for (i, &l) in lanes.iter().enumerate().skip(1) {
+            let ki = self.s.m.i32(i as u32);
+            let is = self.s.m.cmp(c, pred::EQ, pos, ki);
+            let kl = self.s.m.i32(l.into());
+            src_pos = self.s.m.select(c, is, kl, src_pos);
+        }
+        let base = self.s.m.bin(c, Bin::And, lane, not3);
+        let src = self.s.m.bin(c, Bin::Or, base, src_pos);
+        let upper = self.s.m.cmp(c, pred::IUGE, src, k32);
+        let word = self.s.m.select(c, upper, hi, lo);
+        let sh = self.s.m.bin(c, Bin::And, src, k31);
+        let bit = self.s.m.bin(c, Bin::LShr, word, sh);
+        let bit = self.s.m.bin(c, Bin::And, bit, one);
+        let running = self.s.m.cmp(c, pred::NE, bit, zero);
+        let helper = self.s.op(c, "isHelperLane.i1", Attr::ReadOnly, self.s.t.i1, 221, &[]);
+        let mine = self.s.m.select(c, helper, one, zero);
+        let theirs = self.quad_read(mine, lanes);
+        let c = self.cur;
+        let theirs_helper = self.s.m.cmp(c, pred::NE, theirs, zero);
+        let present = self.s.m.bin(c, Bin::Or, running, theirs_helper);
+        self.s.m.select(c, present, r, zero)
+    }
+
     fn quad_read(&mut self, x: V, lanes: [u8; 4]) -> V {
         self.s.flags |= flags::WAVE_OPS;
         let c = self.cur;
@@ -4775,7 +4841,7 @@ impl<'a> Lower<'a> {
                 } else {
                     [0u32, 1, 2, 3].map(|i| ((i & offset | offset >> 5 & 3) ^ offset >> 10 & 3) as u8 & 3)
                 };
-                self.quad_read(x, lanes)
+                self.quad_read_present(x, lanes)
             } else {
                 self.read_lane(x, src)
             };
@@ -7346,7 +7412,7 @@ impl<'a> Lower<'a> {
         {
             // A quad_perm: its pattern read with quad operations
             // (avatarmanz 1c8dd31).
-            self.quad_read(x, [0, 1, 2, 3].map(|i| (ctrl >> (2 * i) & 3) as u8))
+            self.quad_read_present(x, [0, 1, 2, 3].map(|i| (ctrl >> (2 * i) & 3) as u8))
         } else {
             self.read_lane(x, src)
         };
