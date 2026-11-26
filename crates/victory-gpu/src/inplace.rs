@@ -97,6 +97,21 @@ pub fn views_in_place() -> bool {
     level() >= 3
 }
 
+/// Renderer port 1 (`VICTORY_PORT_CONSTANTS=1`, off by default; after
+/// Belobug's rx9070xt branch, 86dc109 and 4b82f6c): `xmem` gives the pages
+/// mapped into the title's 32-bit graphics heap (185 MB: its ring of
+/// constants and the 174 MB buffer its skinning passes write through) their
+/// section's slices in address order, so that the heap is one run of its
+/// section and is used in place here at level 3 (it was "views of scattered
+/// pages", a copy in the card's memory with ~28 MB sent up a frame in ~240
+/// ranges); and constant data a list reads from memory in place at an
+/// address the host cannot bind is copied by the card when the list runs
+/// (`HostList::card_fill`), not read on the CPU at submission.
+pub(crate) fn port_constants() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_PORT_CONSTANTS").is_ok_and(|v| v.trim() == "1"))
+}
+
 struct SectionHeap(Option<ID3D12Heap>, u64);
 
 // SAFETY: Direct3D 12 heaps are free-threaded.

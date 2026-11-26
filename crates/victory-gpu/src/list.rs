@@ -899,7 +899,12 @@ fn copy_on_the_card(list: &crate::host::HostList, to: u64, from: u64, len: u64) 
     let Some(source) = crate::shadow::existing(from, len) else {
         return false;
     };
-    if !(source.carded() || source.writes_pending()) {
+    // Renderer port 1 (`VICTORY_PORT_CONSTANTS=1`): a copy out of title
+    // memory in place, which the list's shaders before it may write, is the
+    // card's too: done on the CPU at submission it read the bytes from
+    // before them (the 174 MB world buffer is in place with the switch).
+    let in_place = crate::inplace::port_constants() && source.in_place();
+    if !(source.carded() || source.writes_pending() || in_place) {
         return false;
     }
     let Some(target) = crate::shadow::find(to, len) else {
@@ -907,6 +912,13 @@ fn copy_on_the_card(list: &crate::host::HostList, to: u64, from: u64, len: u64) 
     };
     // One buffer cannot be both ends of a host copy.
     if target.buffer.as_raw() == source.buffer.as_raw() {
+        if in_place {
+            static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::info!(n, len, from = format_args!("{from:#x}"), to = format_args!("{to:#x}"), "renderer port 1: a title buffer copy within memory in place is done on the CPU at submission");
+            }
+        }
         return false;
     }
     // What the title wrote of either range goes up first; the snapshot of

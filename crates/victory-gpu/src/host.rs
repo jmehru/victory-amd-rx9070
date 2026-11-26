@@ -6144,10 +6144,21 @@ impl HostList {
     /// when the list runs, at a host address on 256 bytes; `None` if the
     /// fill is left to the CPU.
     pub(crate) fn card_fill(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: u64, len: u64) -> Option<u64> {
-        if len == 0 || !shadow.carded() || !card_fill() || shadow.left(address) < len {
+        // Title memory in place, with renderer port 1 (`VICTORY_PORT_CONSTANTS=1`,
+        // `crate::inplace::port_constants`): copied by the card from the title's
+        // own bytes, as from a copy in the card's memory. Read on the CPU at
+        // submission, nothing waits there for what flights in the air write
+        // into memory in place (the title's ring of constants, which its GPU
+        // passes write too).
+        let in_place = shadow.in_place() && crate::inplace::port_constants();
+        if len == 0 || !(shadow.carded() || in_place) || !card_fill() || shadow.left(address) < len {
             return None;
         }
         let host = host()?;
+        // (The card's copying is done by the lists `card_before` makes.)
+        if !shadow.carded() && !(crate::shadow::cards() && host.card_ready()) {
+            return None;
+        }
         let room = len.next_multiple_of(256);
         // What the title wrote there goes up to the card's side first.
         shadow.refresh(self, address, len);
