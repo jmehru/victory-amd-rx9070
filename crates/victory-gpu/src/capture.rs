@@ -89,6 +89,19 @@ fn timed(n: u64) -> bool {
     TIMED[..count].iter().any(|f| f.load(std::sync::atomic::Ordering::Relaxed) == n)
 }
 
+/// Lists frame `n` and the next, as [`time_frames`] does: for diagnostics
+/// that pick the frames to look at as they go (`crate::inplace::port_war`).
+pub(crate) fn list_frame(n: u64) {
+    use std::sync::atomic::Ordering::{AcqRel, Relaxed};
+    for f in [n, n + 1] {
+        let at = TIMED_N.load(Relaxed);
+        if at < TIMED.len() {
+            TIMED[at].store(f, Relaxed);
+            TIMED_N.fetch_add(1, AcqRel);
+        }
+    }
+}
+
 /// At the present of `frame`: lists the next two frames if a time of
 /// [`timed_secs`] was passed since the last present.
 fn time_frames(frame: u64) {

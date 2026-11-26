@@ -1433,6 +1433,7 @@ extern "system" fn clear_dsv(
             crate::resource::DEPTH_UNORDERED[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         let dsv = host.dsv(texture, record.depth_desc().as_ref());
+        crate::inplace::war_depth_clear(record.resource as usize, texture, flags, depth, rects);
         // SAFETY: an open list, a fresh view of a live texture.
         list.tally(1);
         unsafe {

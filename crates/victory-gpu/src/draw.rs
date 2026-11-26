@@ -814,6 +814,8 @@ impl State {
             if crate::resource::depth_and_unordered(record.resource) {
                 crate::resource::DEPTH_UNORDERED[1].fetch_add(1, Ordering::Relaxed);
             }
+            // (Before the capture notes the target: it may list the frame.)
+            crate::inplace::war_depth_set(record.resource as usize, texture);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
             Some(host.dsv(texture, record.depth_desc().as_ref()))
@@ -3573,6 +3575,7 @@ impl State {
     /// A draw with the list's pipeline was recorded (as
     /// [`State::buffers_written`] if its shaders can store to buffers).
     fn drew(&mut self) {
+        crate::inplace::war_depth_drew(self.depth, self.pipeline);
         if self.batch.is_none() {
             return;
         }

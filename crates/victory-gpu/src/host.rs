@@ -2401,6 +2401,9 @@ struct Deferred {
     /// With [`card_times`]: commands of the list that need no pipeline, by
     /// kind ([`TALLIED`]).
     tally: [u32; TALLIED.len()],
+    /// Diagnostics (`crate::inplace::port_war`): ranges of memory in place
+    /// the list's shaders may write (address, bytes).
+    war_writes: Vec<(usize, usize)>,
 }
 
 impl Deferred {
@@ -2708,6 +2711,8 @@ struct Sent {
     back: Vec<Declared>,
     /// Its bottom-of-pipe writes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
+    /// Diagnostics (`crate::inplace::port_war`).
+    war: Option<crate::inplace::WarTaken>,
 }
 
 /// A submission on the card that has not been waited for ([`late`]): its
@@ -2721,6 +2726,8 @@ struct Flight {
     order: Vec<usize>,
     card: Option<CardPlan>,
     back: Vec<Declared>,
+    /// Diagnostics (`crate::inplace::port_war`).
+    war: Option<crate::inplace::WarTaken>,
 }
 
 /// One thing in the line of what waits for the card, in order.
@@ -3336,6 +3343,7 @@ fn late_line(frames: f64) {
     if !late() {
         return;
     }
+    crate::inplace::war_line(frames);
     let s: Vec<f64> = LATE_STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
         "submissions sent ahead per frame: {:.1} in {:.1} settles ({:.1} flights each time), {:.1} ms waiting for the card in them; \
@@ -4539,6 +4547,9 @@ impl Host {
             match item {
                 Late::Run(flight) => {
                     last = flight.number;
+                    if let Some(war) = &flight.war {
+                        crate::inplace::war_check(war);
+                    }
                     for &i in &flight.order {
                         read_backs(flight.lists[i].host());
                     }
@@ -4770,6 +4781,7 @@ impl Host {
                 order,
                 card: sent.card,
                 back: sent.back,
+                war: sent.war,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
             *flying >= late_most()
@@ -4814,6 +4826,7 @@ impl Host {
                 order: Vec::new(),
                 card: sent.card,
                 back: sent.back,
+                war: sent.war,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
         }
@@ -5112,6 +5125,25 @@ impl Host {
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
+        // Diagnostics of renderer port 1 (`VICTORY_PORT_WAR=1`): what the
+        // lists read of memory in place below 4 GiB, as it is now.
+        let war = if late && crate::inplace::port_war() {
+            let mut reads = Vec::new();
+            for list in runs {
+                for step in &list.deferred().copies {
+                    match step {
+                        Step::CardFill(shadow, address, len, ..) if shadow.in_place() => reads.push((*address, *len, 0)),
+                        Step::Refresh(shadow, address, len) if shadow.in_place() => reads.push((*address, *len, 1)),
+                        _ => {}
+                    }
+                }
+            }
+            let writes: Vec<(usize, usize)> = runs.iter().flat_map(|l| l.deferred().war_writes.clone()).collect();
+            let ahead = line().line.iter().filter(|l| matches!(l, Late::Run(_))).count();
+            crate::inplace::war_take(reads, writes, ahead, this_submission)
+        } else {
+            None
+        };
         let prepared = std::time::Instant::now();
         if late {
             *submitted += 1;
@@ -5136,6 +5168,7 @@ impl Host {
                 card,
                 back,
                 writes,
+                war,
             };
             working(was_working);
             return Some((submitted, sent));
@@ -6209,6 +6242,14 @@ impl HostList {
         }
     }
 
+    /// Diagnostics (`crate::inplace::port_war`): the list's shaders may
+    /// write `[address, address + len)` of memory in place.
+    pub(crate) fn war_write(&self, address: usize, len: usize) {
+        if crate::inplace::port_war() {
+            self.deferred().war_writes.push((address, len));
+        }
+    }
+
     /// Shaders of the list write `[address, address + len)` of a buffer's
     /// host copy: copied back into title memory once the list has run.
     pub(crate) fn defer_gpu_write(
@@ -6470,6 +6511,7 @@ impl HostList {
                 crate::profile::copied(len);
                 filling.get_or_insert_with(|| (std::time::Instant::now(), 0)).1 += len as u64;
                 crate::inplace::port_touched(3, src, len);
+                crate::inplace::war_cpu_read(1, src, len);
                 copy_mapped(dst as *mut u8, src as *const u8, len, false);
                 continue;
             }
@@ -6540,6 +6582,8 @@ impl HostList {
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
+                        let (at, len) = staging.memory();
+                        crate::inplace::war_cpu_read(0, at, len);
                         staging.refresh();
                     }
                     continue;
