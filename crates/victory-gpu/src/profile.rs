@@ -30,6 +30,8 @@ unsafe extern "system" {
     fn GetModuleHandleExW(flags: u32, at: u64, module: *mut u64) -> i32;
     fn GetModuleFileNameW(module: u64, name: *mut u16, len: u32) -> u32;
     fn RtlLookupFunctionEntry(pc: u64, base: *mut u64, history: *mut c_void) -> *mut c_void;
+    fn RtlCaptureContext(context: *mut Context);
+    fn AddVectoredExceptionHandler(first: u32, handler: unsafe extern "system" fn(*mut [*mut c_void; 2]) -> i32) -> *mut c_void;
     fn RtlVirtualUnwind(
         kind: u32,
         base: u64,
@@ -317,7 +319,41 @@ pub(crate) fn event_set(event: usize, us: u64) {
 /// The call stack of the thread `handle`, stopped meanwhile, into `stack`
 /// (with room for it: nothing is allocated while a thread is stopped, which
 /// may hold the heap's lock).
+/// The thread that is unwinding another's stack now (0: none), whether that
+/// faulted, and the registers to go on with if it does.
+///
+/// Unwinding reads the stopped thread's stack by its registers, and a thread
+/// of the title's stopped in code of its own may hold anything in them: two
+/// of seven profiled runs ended in an access violation inside the unwinder
+/// (runs boatD and y1). A fault of the sampling thread while it unwinds now
+/// ends that stack where it is: the handler puts the registers back as they
+/// were before the walk began.
+static WALKING: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static FAULTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static mut BEFORE_WALK: Context = Context([0; 1232]);
+/// Stacks cut short by a fault, since the start.
+static CUT_SHORT: AtomicU64 = AtomicU64::new(0);
+
+unsafe extern "system" fn walk_fault(info: *mut [*mut c_void; 2]) -> i32 {
+    const ACCESS_VIOLATION: u32 = 0xC000_0005;
+    // SAFETY: the system passes the exception's record and context; the
+    // record begins with its code.
+    unsafe {
+        if WALKING.load(Ordering::Relaxed) != GetCurrentThreadId() || *(*info)[0].cast::<u32>() != ACCESS_VIOLATION {
+            return 0; // EXCEPTION_CONTINUE_SEARCH
+        }
+        FAULTED.store(true, Ordering::Relaxed);
+        std::ptr::copy_nonoverlapping((&raw const BEFORE_WALK).cast::<u8>(), (*info)[1].cast::<u8>(), size_of::<Context>());
+    }
+    -1 // EXCEPTION_CONTINUE_EXECUTION
+}
+
 unsafe fn stack_of(handle: *mut c_void, context: &mut Context, stack: &mut Vec<u64>) -> bool {
+    static HANDLER: std::sync::Once = std::sync::Once::new();
+    // SAFETY: the handler only looks at its own thread's walk.
+    HANDLER.call_once(|| unsafe {
+        AddVectoredExceptionHandler(1, walk_fault);
+    });
     // SAFETY: the caller's handle; a context of the right size and
     // alignment; unwinding of a stopped thread's copy of its registers.
     unsafe {
@@ -331,6 +367,17 @@ unsafe fn stack_of(handle: *mut c_void, context: &mut Context, stack: &mut Vec<u
             for (k, at) in [0x90usize, 0xA8, 0xB0, 0xD8, 0xE0, 0xE8, 0xF0].into_iter().enumerate() {
                 KEPT[k] = u64::from_ne_bytes(context.0[at..at + 8].try_into().expect("8 bytes"));
             }
+            // From here a fault comes back to just after this call, with
+            // `FAULTED` set (`walk_fault`).
+            FAULTED.store(false, Ordering::Relaxed);
+            RtlCaptureContext(&raw mut BEFORE_WALK);
+            if FAULTED.load(Ordering::Relaxed) {
+                WALKING.store(0, Ordering::Relaxed);
+                CUT_SHORT.fetch_add(1, Ordering::Relaxed);
+                ResumeThread(handle);
+                return true;
+            }
+            WALKING.store(GetCurrentThreadId(), Ordering::Relaxed);
             while stack.len() + 2 < stack.capacity() {
                 let pc = u64::from_ne_bytes(context.0[RIP..RIP + 8].try_into().expect("8 bytes"));
                 if pc == 0 {
@@ -346,6 +393,7 @@ unsafe fn stack_of(handle: *mut c_void, context: &mut Context, stack: &mut Vec<u
                 let (mut data, mut frame) = (std::ptr::null_mut(), 0u64);
                 RtlVirtualUnwind(0, base, pc, entry, context, &mut data, &mut frame, std::ptr::null_mut());
             }
+            WALKING.store(0, Ordering::Relaxed);
         }
         ResumeThread(handle);
     }
