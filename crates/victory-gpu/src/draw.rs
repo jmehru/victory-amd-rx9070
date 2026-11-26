@@ -2702,6 +2702,9 @@ impl State {
         else {
             return String::new();
         };
+        for &target in &self.targets {
+            crate::capture::note_listed_target(target as This);
+        }
         let Some(heap) = self
             .heaps
             .iter()
@@ -2835,8 +2838,18 @@ impl State {
             Some(h) => h.texture_slot_state(index, crate::frame::current()),
             None => "no host heap".into(),
         };
+        // The view the host slot shows, if not the title's: its mips.
+        let shown = heap.host().and_then(|h| h.made_view(index));
+        let shown = match (&shown, &title) {
+            (Some(View::Placed(_, r, d)), Some(View::Placed(_, tr, td))) if r == tr && d == td => "same".to_string(),
+            (Some(View::Placed(false, r, d)), _) if r[0] != 1 => {
+                format!("other {}x{} at {:#x} {}", r[4], r[6], u64::from(d[10]) | u64::from(d[11]) << 32, view_range(&d[..10]))
+            }
+            (Some(_), _) => "other".to_string(),
+            (None, _) => "nothing".to_string(),
+        };
         format!(
-            "\n    ~slot from={from}+{at:#x} slot={index} title=[{}] host=[{host}] queue=[{queue}]",
+            "\n    ~slot from={from}+{at:#x} slot={index} title=[{}] host=[{host}] shown=[{shown}] queue=[{queue}]",
             view_state(title.as_ref())
         )
     }
@@ -4055,6 +4068,28 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // the host (title memory does not have them).
             let aliased = crate::resource::alias_of(*resource as This)
                 .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
+            // Diagnostics (`VICTORY_TRACE_ALIAS=1`): screen-sized views the
+            // title placed and that find no texture the host writes at their
+            // address (they read the title's memory), once per address.
+            #[cfg(feature = "diagnostics")]
+            if !aliased && trace_alias() {
+                if let Some(t) = crate::resource::host_resource(*resource as This) {
+                    // SAFETY: a live resource.
+                    let d = unsafe { t.GetDesc() };
+                    if d.Width >= 320 && d.Height >= 180 && d.Flags.0 & 7 == 0 && d.MipLevels == 1
+                        && !(70..=99).contains(&d.Format.0)
+                        && let Some(report) = crate::resource::alias_report(*resource as This)
+                    {
+                        static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+                        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+                        let key: String = report.split("; written").next().unwrap_or_default().to_string();
+                        if seen.len() < 400 && !seen.contains(&key) {
+                            seen.push(key);
+                            tracing::info!("placed view without a host-written twin: {report}");
+                        }
+                    }
+                }
+            }
             if !aliased
                 && let Some(t) = crate::resource::host_resource(*resource as This)
                 && crate::texture::title_written(t)
@@ -4103,6 +4138,13 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         }
         _ => {}
     }
+}
+
+/// `VICTORY_TRACE_ALIAS=1` (diagnostics): see `readable`.
+#[cfg(feature = "diagnostics")]
+fn trace_alias() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TRACE_ALIAS").is_some_and(|v| v == "1"))
 }
 
 /// The pixel shaders whose draws get their slots listed
@@ -4195,17 +4237,51 @@ fn view_state(view: Option<&View>) -> String {
                     memory_state(address, crate::resource::placed_bytes(r).unwrap_or(0))
                 ),
             };
-            format!("placed texture view_format={} {state}", d[0])
+            format!("placed texture view_format={} {} {state}", d[0], view_mips(r, d))
         }
         Some(View::Shader(r, d)) if crate::resource::texture_memory(*r as This).is_some() => {
             format!(
-                "texture object {r:#x} view_format={} {}",
+                "texture object {r:#x} view_format={} {} {}",
                 d.as_ref().map_or(0, |d| d[0]),
+                d.as_ref().map_or("whole".to_string(), |d| view_range(d)),
                 texture_state(*r as This)
             )
         }
         Some(v) => format!("{v:?}").chars().take(80).collect(),
     }
+}
+
+/// The mips a placed texture view shows (dimension, first mip, levels and
+/// the lowest level it may sample, as the title wrote them) and the first
+/// mip from which all smaller ones have their memory mapped (a texture's
+/// smallest mips lie first in its memory).
+#[cfg(feature = "diagnostics")]
+fn view_mips(resource: &[u32; 14], d: &[u32; 16]) -> String {
+    let address = u64::from(d[10]) | u64::from(d[11]) << 32;
+    let mips = resource[7] >> 16;
+    let mapped_from = (0..mips.max(1))
+        .find(|&m| {
+            let bytes = crate::resource::placed_bytes_from(resource, m).unwrap_or(0);
+            bytes != 0 && crate::texture::mapped_bytes(address as *const u8, bytes as usize) >= bytes
+        })
+        .map_or("none".to_string(), |m| m.to_string());
+    format!("{} mapped_from_mip={mapped_from} console={:x?}", view_range(&d[..10]), &d[12..16])
+}
+
+/// The mips a view description (as words) shows: its dimension, first mip,
+/// levels and lowest level of detail.
+#[cfg(feature = "diagnostics")]
+fn view_range(d: &[u32]) -> String {
+    let (first, levels, clamp) = match d[1] {
+        // 2D: first, levels, plane, clamp; 2D array: first, levels,
+        // first slice, slices, plane, clamp; 3D and cube: first, levels,
+        // clamp.
+        4 => (d[4], d[5], f32::from_bits(d[7])),
+        5 => (d[4], d[5], f32::from_bits(d[9])),
+        8 | 9 => (d[4], d[5], f32::from_bits(d[6])),
+        _ => (0, 0, 0.0),
+    };
+    format!("dim={} first={first} levels={levels:#x} clamp={clamp}", d[1])
 }
 
 /// A view in a few words (diagnostics builds).
