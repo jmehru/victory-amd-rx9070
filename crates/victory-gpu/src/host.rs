@@ -868,6 +868,10 @@ mod tests {
 /// ([`HostList::batch_place`]).
 const BATCHES: u32 = 8;
 
+/// Scratch buffers made since the last frame line: for batches of clamped
+/// records, and for records clamped alone.
+static SCRATCH_MADE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// Batched clamp passes recorded since the last frame line.
 pub(crate) static BATCH_PASSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -6095,6 +6099,7 @@ impl HostList {
             .max(needed)
             .next_multiple_of(64 << 10);
         let buffer = host()?.uav_buffer(alloc)?;
+        SCRATCH_MADE[1].fetch_add(1, Ordering::Relaxed);
         name(&buffer, || format!("indirect arguments {alloc:#x}"));
         let old = slot.replace((buffer.clone(), alloc));
         drop(slot);
@@ -6115,6 +6120,7 @@ impl HostList {
         if buffer == args.0.len() {
             let size = u64::from(BATCHES * JOBS * SLOT);
             let made = host()?.uav_buffer(size)?;
+            SCRATCH_MADE[0].fetch_add(1, Ordering::Relaxed);
             name(&made, || format!("indirect batches {size:#x}"));
             args.0.push(made);
         }
@@ -6923,7 +6929,11 @@ impl Meter {
         crate::queue::behind_line(frames);
         let passes = BATCH_PASSES.swap(0, Ordering::Relaxed);
         if passes > 0 {
-            tracing::info!("argument clamps in batches (VICTORY_INDIRECT_BATCH): {:.1} passes a frame", passes as f64 / frames);
+            let [batches, alone] = [0, 1].map(|i| SCRATCH_MADE[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            tracing::info!(
+                "argument clamps in batches (VICTORY_INDIRECT_BATCH): {:.1} passes a frame; scratch buffers made a frame: {batches:.1} for batches, {alone:.1} for records clamped alone",
+                passes as f64 / frames
+            );
         }
         card_clock_line(frames, ms);
         crate::shadow::back_line(frames);

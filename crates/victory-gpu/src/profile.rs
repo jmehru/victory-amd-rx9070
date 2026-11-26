@@ -185,6 +185,11 @@ pub(crate) fn hashed(len: usize) {
 /// and binds answered whole from what the list had bound last.
 pub(crate) static TABLES: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
+/// Whether a profile is taken.
+pub(crate) fn on() -> bool {
+    file().is_some()
+}
+
 /// Counts `n` more of table work `what` (only while a profile is taken).
 pub(crate) fn tables(what: usize, n: u64) {
     if file().is_some() {
@@ -418,9 +423,10 @@ fn sample(file: &str) {
             let t: [f64; 7] = std::array::from_fn(|i| (tables_now[i] - tabled[i]) as f64 / frames.max(1) as f64);
             tabled = tables_now;
             text.push_str(&format!(
-                "==== per frame: {:.0} binds by the recording threads ({:.0} of them answered from the list's last bind); {:.0} tables to make afresh, \
-                 {:.0} found made in the list, {:.0} made new with {:.0} views; {:.0} entries of the title's own tables looked at\n",
-                t[0], t[6], t[1], t[2], t[3], t[4], t[5]
+                "==== per frame: {:.0} binds by the recording threads; {:.0} tables to make afresh, \
+                 {:.0} found made in the list, {:.0} made new with {:.0} views ({:.0} of those tables held the records of one made in the eight frames before); \
+                 {:.0} entries of the title's own tables looked at\n",
+                t[0], t[1], t[2], t[3], t[4], t[6], t[5]
             ));
             // Between submissions: where the submitting thread stood and the
             // registers it kept there, most seen first; and the events of

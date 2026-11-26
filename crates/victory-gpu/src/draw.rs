@@ -1915,9 +1915,16 @@ impl State {
         // records the frame, and making and staging 192 MB of textures took
         // 1.6-2.2 s of each of the world's first twenty frames (run 20).
         // The rest waits for the next frames, as it does past the bytes.
+        // 40 ms (`VICTORY_TEXTURE_STAGE_MS=250`: as before): while the title
+        // streams (the cutscene a save opens with) the queue holds 900 to
+        // 7,000 slots and the pass took its 250 ms in every frame, which is
+        // what made those frames 260 to 370 ms (run boat3: textures 251 to
+        // 253 ms a frame). With 40 they are 85 to 130 ms and as many MB are
+        // uploaded by the same second of the run (cs1, cs2); the queue's
+        // peaks are longer (8,000 to 10,000 slots against 5,000 to 7,000).
         static SPAN_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let plain_span = std::time::Duration::from_millis(*SPAN_MS.get_or_init(|| {
-            std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(250)
+            std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(40)
         }));
         const SPAN_CATCHING_UP: std::time::Duration = std::time::Duration::from_millis(1500);
         // One catch-up rule (`catching_up`, `VICTORY_TEXTURE_GATE_S`):
@@ -2734,6 +2741,25 @@ impl State {
             self.fresh_tables.insert(key, first);
             crate::profile::tables(3, 1);
             crate::profile::tables(4, u64::from(n));
+            // While a profile is taken: how many of the tables made new held
+            // the very records a table made in one of the eight frames before
+            // held (what keeping tables from frame to frame could find).
+            if crate::profile::on() {
+                static SEEN: std::sync::Mutex<Option<std::collections::HashMap<(u64, u32, u64), u64>>> =
+                    std::sync::Mutex::new(None);
+                let frame = crate::frame::current();
+                let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+                let seen = seen.get_or_insert_with(Default::default);
+                if seen.len() > 200_000 {
+                    seen.retain(|_, at| *at + 8 >= frame);
+                }
+                if let Some(at) = seen.insert(key, frame)
+                    && at != frame
+                    && at + 8 >= frame
+                {
+                    crate::profile::tables(6, 1);
+                }
+            }
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
             // The title's own slots of this table: what the draw reads of
