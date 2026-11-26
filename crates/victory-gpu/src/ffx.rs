@@ -136,11 +136,27 @@ struct Api {
     dispatch: Dispatch,
 }
 
-/// Whether the title's FidelityFX calls come here: `VICTORY_FFX_DIR` or
-/// `VICTORY_FFX_SIMPLE=1` set. Read once: draws ask too.
+/// The folder of AMD's binaries, as the program that runs the title
+/// resolved it ([`set_dir`]: `VICTORY_FFX_DIR`, else `ffx_dir` of
+/// `victory.toml`); without that call, `VICTORY_FFX_DIR` if not empty.
+static DIR: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+
+/// Names the folder of AMD's FidelityFX binaries (`None`: the PC upscaler
+/// is not used). Before the title runs; the first call counts.
+pub fn set_dir(dir: Option<std::path::PathBuf>) {
+    let _ = DIR.set(dir);
+}
+
+fn dir() -> Option<&'static std::path::PathBuf> {
+    DIR.get_or_init(|| std::env::var_os("VICTORY_FFX_DIR").filter(|v| !v.is_empty()).map(Into::into)).as_ref()
+}
+
+/// Whether the title's FidelityFX calls come here: a folder of AMD's
+/// binaries is named ([`set_dir`]) or `VICTORY_FFX_SIMPLE=1` is set. Read
+/// once: draws ask too.
 pub fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_FFX_DIR").is_some() || simple_mode())
+    *ON.get_or_init(|| dir().is_some() || simple_mode())
 }
 
 /// `VICTORY_FFX_SIMPLE=1`: no upscaler, the colour input scaled to the
@@ -165,7 +181,7 @@ const SIMPLE_CONTEXT: usize = 0x5157_0001;
 fn api() -> Option<&'static Api> {
     static API: OnceLock<Option<Api>> = OnceLock::new();
     API.get_or_init(|| {
-        let dir = std::path::PathBuf::from(std::env::var_os("VICTORY_FFX_DIR")?);
+        let dir = dir()?.clone();
         let load = |name: &str| {
             let path: Vec<u16> = dir.join(name).as_os_str().encode_wide_nul();
             // SAFETY: a nul-terminated path.
@@ -173,7 +189,7 @@ fn api() -> Option<&'static Api> {
         };
         let _ = load("amd_fidelityfx_upscaler_dx12.dll");
         let Some(loader) = load("amd_fidelityfx_loader_dx12.dll") else {
-            tracing::error!(?dir, "ffx: amd_fidelityfx_loader_dx12.dll not found; set VICTORY_FFX_DIR to the SDK's signedbin");
+            tracing::error!(?dir, "ffx: amd_fidelityfx_loader_dx12.dll not found; set VICTORY_FFX_DIR (or ffx_dir in victory.toml) to the SDK's signedbin");
             return None;
         };
         let get = |name: &[u8]| {
