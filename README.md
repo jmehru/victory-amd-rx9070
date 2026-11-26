@@ -246,8 +246,12 @@ The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
 data under the cache folder.
 
-Input: XInput pads. With none connected the keyboard is a pad while the
-title's window has focus:
+Input: XInput pads, and a PlayStation pad (DualSense, DualSense Edge or
+DualShock 4, USB or Bluetooth), read over HID with nothing to install: it
+plays the first pad slot no XInput pad holds (Cross A, Circle B, Square X,
+Triangle Y, Options Menu, Create/Share View; `VICTORY_PS_PAD=0` turns it
+off). With no pad connected the keyboard is a pad while the title's window
+has focus:
 
 | Keys | Pad |
 |------|-----|
