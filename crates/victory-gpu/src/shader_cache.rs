@@ -100,6 +100,13 @@ fn build() -> &'static [u8; 32] {
             }
             hash.update(&[0]);
         }
+        // `VICTORY_SHADER_CACHE_SALT=<text>`: a cache of its own for the
+        // text, to see a run that finds nothing translated (a first run
+        // after an update) without touching the cache in use.
+        if let Some(salt) = std::env::var_os("VICTORY_SHADER_CACHE_SALT") {
+            hash.update(b"salt=");
+            hash.update(salt.as_encoded_bytes());
+        }
         *hash.finalize().as_bytes()
     })
 }
