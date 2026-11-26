@@ -252,6 +252,38 @@ pub(crate) fn retire<T: 'static>(object: T) {
         .push((started, Retired(Box::new(object))));
 }
 
+/// What is let go by a thread of its own when it is dropped
+/// (`VICTORY_FAR_DROPS=0`: by the thread that drops it).
+///
+/// The sweep that lets idle host copies of textures go runs before a
+/// submission, on the thread that submits, and at a cut of the boat save's
+/// opening it let so many go that giving their memory back to the system was
+/// 38 ms a frame of that thread, averaged over the half minute around the
+/// cut (profile boatC).
+pub(crate) struct Far<T: Send + 'static>(pub(crate) Option<T>);
+
+impl<T: Send + 'static> Drop for Far<T> {
+    fn drop(&mut self) {
+        let Some(object) = self.0.take() else { return };
+        static ON: OnceLock<bool> = OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_FAR_DROPS").is_none_or(|v| v != "0")) {
+            return;
+        }
+        static GRAVE: OnceLock<std::sync::mpsc::Sender<Box<dyn Send>>> = OnceLock::new();
+        let grave = GRAVE.get_or_init(|| {
+            let (to, from) = std::sync::mpsc::channel::<Box<dyn Send>>();
+            let _ = std::thread::Builder::new().name("victory-drops".into()).spawn(move || {
+                for object in from {
+                    drop(object);
+                }
+            });
+            to
+        });
+        // (If the thread is not there, dropped here.)
+        let _ = grave.send(Box::new(object));
+    }
+}
+
 /// As [`retire`], but kept for `more` submissions past the ones running
 /// now, and never dropped at once. Local (RX 9070): title memory used in
 /// place (`VICTORY_INPLACE=3`) that was let go while submissions were sent

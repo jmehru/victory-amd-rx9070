@@ -1686,7 +1686,7 @@ pub(crate) fn let_go_idle() {
             if first.is_none() {
                 first = Some(at);
             }
-            crate::host::retire(host);
+            crate::host::retire(crate::host::Far(Some(host)));
         }
     }
     if went > 0 {
