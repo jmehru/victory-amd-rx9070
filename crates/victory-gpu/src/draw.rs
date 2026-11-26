@@ -512,6 +512,10 @@ pub(crate) static HEAP_TEXTURES_WAITING: AtomicU64 = AtomicU64::new(0);
 /// pass had used its time for such, since the start.
 pub(crate) static HEAP_TEXTURES_PUT_OFF: AtomicU64 = AtomicU64::new(0);
 
+/// Slots switched to their new texture when the list that uploads it was
+/// submitted, since the start.
+pub(crate) static HEAP_TEXTURES_SWAPPED_LATE: AtomicU64 = AtomicU64::new(0);
+
 /// Passes that made no texture because the card had no room
 /// (`crate::resource::room`), for the memory line.
 pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
@@ -1976,16 +1980,21 @@ impl State {
         // A slot that still shows the texture it showed (the title wrote
         // it with a sharper copy, `HostHeap::mirror`) can wait: past this
         // much of the pass only slots that show nothing are served
-        // (`VICTORY_TEXTURE_STAGE_SHOWN_MS`, 3; as much as the span: all
+        // (`VICTORY_TEXTURE_STAGE_SHOWN_MS`, 8; as much as the span: all
         // alike, as before). While the player walks and turns the title
         // streams some 1,100 textures a second and the pass took its 40 ms
         // in every frame. Seconds 195 to 285 of a run that walks and turns
         // all the while, time per frame and of the pass: 92.0 and 37.6 ms
         // all alike (tn40), 71.6 and 11.3 ms with 8 (tn8), 67.8 and 8.4 ms
-        // with 3 (tn3); some 3,000 slots wait in each.
+        // with 3 (tn3); some 3,000 slots wait in each. Not 3: the title
+        // writes the same slots over and over while the player moves, the
+        // pass then serves a third of them, the newest first, and the
+        // character's own shirt and skin stayed an old texture or the
+        // grey stand-in for as long as she walked (tn3 and tnS, picture
+        // pw-024 of each; right with 8 and with 40).
         static SHOWN_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let shown_span = std::time::Duration::from_millis(*SHOWN_MS.get_or_init(|| {
-            std::env::var("VICTORY_TEXTURE_STAGE_SHOWN_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(3)
+            std::env::var("VICTORY_TEXTURE_STAGE_SHOWN_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8)
         }));
         let shown_span = if early.is_some() { span } else { shown_span.min(span) };
         let began = std::time::Instant::now();
@@ -2078,7 +2087,41 @@ impl State {
                     );
                 }
             }
-            let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
+            // A slot that still shows the texture it showed (the title
+            // wrote it with another, `HostHeap::mirror`) is switched to the
+            // new one when the list that uploads it is submitted, not here:
+            // switched here, the lists that run before this one sampled
+            // the new texture with nothing in it yet, for up to a frame
+            // (the user saw a poster blink at each sharper copy).
+            // `VICTORY_SWAP_LATE=0`: switched here, as before.
+            static SWAP_LATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let handle = heap.handle(index);
+            let late = handle
+                .filter(|_| {
+                    *SWAP_LATE.get_or_init(|| std::env::var_os("VICTORY_SWAP_LATE").is_none_or(|v| v != "0"))
+                        && host.texture_slot_shows(index)
+                })
+                .and_then(|handle| {
+                    let (view, key) = crate::descriptor::host::HostHeap::peek(handle)?;
+                    // (Only for a texture the title placed: the kept kind.)
+                    matches!(view, View::Placed(false, ..)).then_some((view, key, handle))
+                })
+                .filter(|&(_, _, handle)| !host.texture_slot_made_from(index, handle));
+            let view = match &late {
+                Some((view, ..)) => Some(view.clone()),
+                None => handle.and_then(|handle| host.mirror(index, handle, true)),
+            };
+            if let Some((_, key, handle)) = late {
+                // The heap outlives the list's submission: it is the
+                // title's view heap, made once.
+                let heap_at = std::ptr::from_ref(host) as usize;
+                list.defer_host(move || {
+                    // SAFETY: see above.
+                    let host = unsafe { &*(heap_at as *const crate::descriptor::host::HostHeap) };
+                    host.mirror_same(index, handle, key);
+                });
+                HEAP_TEXTURES_SWAPPED_LATE.fetch_add(1, Ordering::Relaxed);
+            }
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
             let resource = match placed.as_ref().or(view.as_ref()) {
                 Some(&View::Shader(resource, _)) => resource as This,
