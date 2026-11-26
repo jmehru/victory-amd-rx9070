@@ -1976,14 +1976,16 @@ impl State {
         // A slot that still shows the texture it showed (the title wrote
         // it with a sharper copy, `HostHeap::mirror`) can wait: past this
         // much of the pass only slots that show nothing are served
-        // (`VICTORY_TEXTURE_STAGE_SHOWN_MS`, 8; as much as the span: all
-        // alike, as before). While the camera turns the title streams some
-        // 1,700 textures a second and the pass took its 40 ms in every
-        // frame, which made those frames 82 to 93 ms where the scene at
-        // rest takes 53 (run pm1).
+        // (`VICTORY_TEXTURE_STAGE_SHOWN_MS`, 3; as much as the span: all
+        // alike, as before). While the player walks and turns the title
+        // streams some 1,100 textures a second and the pass took its 40 ms
+        // in every frame. Seconds 195 to 285 of a run that walks and turns
+        // all the while, time per frame and of the pass: 92.0 and 37.6 ms
+        // all alike (tn40), 71.6 and 11.3 ms with 8 (tn8), 67.8 and 8.4 ms
+        // with 3 (tn3); some 3,000 slots wait in each.
         static SHOWN_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let shown_span = std::time::Duration::from_millis(*SHOWN_MS.get_or_init(|| {
-            std::env::var("VICTORY_TEXTURE_STAGE_SHOWN_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8)
+            std::env::var("VICTORY_TEXTURE_STAGE_SHOWN_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(3)
         }));
         let shown_span = if early.is_some() { span } else { shown_span.min(span) };
         let began = std::time::Instant::now();
