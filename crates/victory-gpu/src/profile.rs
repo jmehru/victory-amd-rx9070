@@ -179,6 +179,19 @@ pub(crate) fn hashed(len: usize) {
     }
 }
 
+/// The recording threads' table work, since the start: binds, tables made
+/// afresh that were asked for, of them found made in the list already, made
+/// new, the views made for those, entries of the title's own tables looked at,
+/// and binds answered whole from what the list had bound last.
+pub(crate) static TABLES: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+/// Counts `n` more of table work `what` (only while a profile is taken).
+pub(crate) fn tables(what: usize, n: u64) {
+    if file().is_some() {
+        TABLES[what].fetch_add(n, Ordering::Relaxed);
+    }
+}
+
 /// Frames presented so far.
 pub(crate) fn frames() -> u64 {
     FRAMES.load(Ordering::Relaxed)
@@ -280,6 +293,7 @@ fn sample(file: &str) {
     let mut recorders: Vec<(u32, *mut c_void)> = Vec::new();
     let mut waits: HashMap<(u64, [u64; 7]), u32> = HashMap::new();
     let mut counted = [0u64; 26];
+    let mut tabled = [0u64; 7];
     loop {
         std::thread::sleep(std::time::Duration::from_millis(1));
         if THREADS[0].load(Ordering::Relaxed) == 0 {
@@ -291,6 +305,7 @@ fn sample(file: &str) {
         }
         if since.is_none() {
             counted = counts();
+            tabled = std::array::from_fn(|i| TABLES[i].load(Ordering::Relaxed));
         }
         let (start, frames) = *since.get_or_insert_with(|| (std::time::Instant::now(), FRAMES.load(Ordering::Relaxed)));
         for slot in 0..2 {
@@ -398,6 +413,14 @@ fn sample(file: &str) {
             text.push_str(&format!(
                 "==== per frame: {:.1} snapshot buffers asked for, {:.1} of them made new with {:.1} MB of room; {:.1} let go by the pool with {:.1} MB\n",
                 per[21], per[22], per[23] / 1e6, per[24], per[25] / 1e6
+            ));
+            let tables_now: [u64; 7] = std::array::from_fn(|i| TABLES[i].load(Ordering::Relaxed));
+            let t: [f64; 7] = std::array::from_fn(|i| (tables_now[i] - tabled[i]) as f64 / frames.max(1) as f64);
+            tabled = tables_now;
+            text.push_str(&format!(
+                "==== per frame: {:.0} binds by the recording threads ({:.0} of them answered from the list's last bind); {:.0} tables to make afresh, \
+                 {:.0} found made in the list, {:.0} made new with {:.0} views; {:.0} entries of the title's own tables looked at\n",
+                t[0], t[6], t[1], t[2], t[3], t[4], t[5]
             ));
             // Between submissions: where the submitting thread stood and the
             // registers it kept there, most seen first; and the events of

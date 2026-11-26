@@ -1019,6 +1019,7 @@ impl State {
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         list.begin_command();
+        crate::profile::tables(0, 1);
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
@@ -2576,6 +2577,7 @@ impl State {
         fresh.dedup();
         for u in used.iter().filter(tables) {
             if !fresh.contains(&u.slot) {
+                crate::profile::tables(5, 1);
                 self.table_entry(list, u, compute);
             }
         }
@@ -2639,7 +2641,9 @@ impl State {
                 }
                 (table, n, h.finish())
             };
+            crate::profile::tables(1, 1);
             if let Some(&first) = self.fresh_tables.get(&key) {
+                crate::profile::tables(2, 1);
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
@@ -2667,6 +2671,8 @@ impl State {
                 continue;
             };
             self.fresh_tables.insert(key, first);
+            crate::profile::tables(3, 1);
+            crate::profile::tables(4, u64::from(n));
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
             // The title's own slots of this table: what the draw reads of
