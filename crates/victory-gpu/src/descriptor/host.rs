@@ -1516,8 +1516,14 @@ impl HostHeap {
         }
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         let was = if stride.is_some() {
-            buffers.insert(index);
-            true
+            // (A slot of a draw's own table is that draw's to bring up to
+            // date, not the pass's over the heap: `HostHeap::mirror_tabled`.)
+            if DRAW_TABLE.get() {
+                false
+            } else {
+                buffers.insert(index);
+                true
+            }
         } else {
             buffers.remove(&index)
         };
@@ -1703,6 +1709,72 @@ impl HostHeap {
         D3D12_CPU_DESCRIPTOR_HANDLE {
             ptr: self.cpu + index as usize * self.step as usize,
         }
+    }
+
+    /// [`HostHeap::mirror`] for a draw, of a slot of a table the draw reads
+    /// as the title's own (`victory_shader::emit::cbv_slots`): the title
+    /// writes such a table anew for every draw, 64,000 slots a frame, and
+    /// the draw brings what it reads of it up to date itself, so the slot
+    /// is not noted for the pass that makes the heap's buffer views ready
+    /// for shaders that pick them by index (run k1: that pass looked at
+    /// 63,913 slots a frame, 60 ms, against 4,400).
+    ///
+    /// And it is made under the slot's own lock, not the heap's: every draw
+    /// finds its table's slots new, and with the heap's lock around each
+    /// making the five recording threads stood 129 thread-ms a frame at it
+    /// (profile k2).
+    pub(crate) fn mirror_tabled(&self, index: u32, handle: u64) -> Option<View> {
+        use std::sync::atomic::Ordering::{Acquire, Release};
+        let whole = |heap: &Self| {
+            DRAW_TABLE.set(true);
+            let view = heap.mirror(index, handle, true);
+            DRAW_TABLE.set(false);
+            view
+        };
+        if index >= self.count || self.sampler || !super::record_shared() {
+            return whole(self);
+        }
+        // SAFETY: the handle is a descriptor slot in title memory.
+        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        let key = u64::from(generation) << 32 | u64::from(i);
+        let (Some(view), Some(slot)) =
+            ((tag == VIEW_TAG).then(|| view_at(i, generation)).flatten(), self.kept.get(index as usize))
+        else {
+            // Not a view (any more): the slot is made to read nothing, as
+            // every other asking does it.
+            return whole(self);
+        };
+        if self.made_now[index as usize].load(Acquire) == key {
+            return Some(view);
+        }
+        let mut kept = slot.lock().unwrap_or_else(|e| e.into_inner());
+        if self.made_now[index as usize].load(Acquire) == key {
+            return Some(view);
+        }
+        DRAW_TABLE.set(true);
+        let stale = self.note_buffer(index, Some(&view), true);
+        DRAW_TABLE.set(false);
+        self.made_now[index as usize].store(0, Release);
+        let made_now = make(&view, self.cpu(index));
+        if made_now.is_none() {
+            null_for(&view, self.cpu(index));
+        }
+        let old = std::mem::replace(&mut *kept, made_now.flatten());
+        drop(kept);
+        if let Some(old) = old {
+            crate::host::retire(old);
+        }
+        {
+            let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            made[index as usize] = key;
+            for stale in stale {
+                if stale != index {
+                    self.unmake(&mut made, stale);
+                }
+            }
+        }
+        self.made_now[index as usize].store(key, Release);
+        Some(view)
     }
 
     /// Makes host slot `index` from the record the title has at `handle`
@@ -1984,6 +2056,11 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
 
 /// The host resource a slot made by [`make`] views, if any.
 type Kept = Option<ID3D12Resource>;
+
+thread_local! {
+    /// While [`HostHeap::mirror_tabled`] makes a slot.
+    static DRAW_TABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 /// A structured buffer view (`first`, `count` elements of `stride` bytes,
 /// `offset` bytes into its host copy) as a raw view of the same bytes:

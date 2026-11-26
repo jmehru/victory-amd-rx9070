@@ -76,6 +76,16 @@ pub const USER_VIEW_BIAS: u32 = 0x103;
 /// that are told the x number alone (the one-dimensional ones).
 pub const USER_GROUP_BASE: u32 = 0x104;
 
+/// `RootType::Other` code of a user-data dword the host computes: the view
+/// heap slot of the constant buffer whose descriptor is at dword `dword` of
+/// the descriptor table of root parameter `slot` ([`super::cbv_slots`]).
+pub const USER_CBV_SLOT: u32 = 0x105;
+/// `RootType::Other` code of a user-data dword nothing reads: the program
+/// reads a constant buffer of the table of root parameter `slot` (255: of
+/// any table) at a place it computes, so the host makes that table afresh
+/// for it, constant buffers and all, as without [`USER_CBV_SLOT`].
+pub const USER_CBV_FRESH: u32 = 0x106;
+
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
