@@ -7180,10 +7180,11 @@ impl Meter {
                 "write faults on guarded title memory per frame: {first:.0} that opened a page{}",
                 if crate::watch::fine() {
 {
-                        let r: [f64; 4] = std::array::from_fn(|i| crate::watch::REPORTED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                        let r: [f64; 5] = std::array::from_fn(|i| crate::watch::REPORTED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                        let w: [f64; 5] = std::array::from_fn(|i| crate::watch::WHOLE[i].swap(0, Ordering::Relaxed) as f64 / frames);
                         format!(
-                            " or its first 4 KiB part, {more:.0} that opened a further part (VICTORY_GUARD_PAGE=4096); pages the guards reported: {:.0} open in part with {:.0} parts, {:.0} open whole, {:.0} written through another view",
-                            r[0], r[1], r[2], r[3]
+                            " or its first 4 KiB part, {more:.0} that opened a further part or the rest (VICTORY_GUARD_PAGE=4096); pages the guards reported: {:.0} open in part with {:.0} parts, {:.0} opened whole by a second fault or as lately, {:.0} written through another view, {:.0} open whole otherwise (never guarded or not known {:.0}, mapping changed {:.0}, a fault at a page shown at several addresses {:.0}, a write of ours or the kernel's {:.0}, was absent {:.0})",
+                            r[0], r[1], r[4], r[3], r[2], w[0], w[1], w[2], w[3], w[4]
                         )
                     }
                 } else {

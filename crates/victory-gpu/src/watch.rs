@@ -105,7 +105,11 @@ pub(crate) static FAULTS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync
 /// line: those open in part by write faults, the parts of those; those open
 /// whole (never guarded, opened by something else, or mapped anew); and
 /// those still read-only that were written through another view.
-pub(crate) static REPORTED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+pub(crate) static REPORTED: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// Of the pages reported open whole: by why (`Guards::cause`; 0: never
+/// guarded, or not known).
+pub(crate) static WHOLE: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 struct Journal {
     /// Numbers the askings; 0 is "never".
@@ -783,6 +787,25 @@ struct Guards {
     /// opened. Such a block is in neither `protected` nor `clean`; its other
     /// parts are still read-only.
     partial: BTreeMap<usize, u16>,
+    /// With [`fine`]: blocks a second write fault opened whole lately: the
+    /// next first fault opens them whole at once ([`adaptive`]); and the
+    /// 64 frames these were noted in.
+    hot: BTreeSet<usize>,
+    hot_frames: u64,
+    /// With [`fine`]: why a block open whole is open (1 its mapping changed,
+    /// 2 a fault at a page shown at several addresses, 3 a write of ours or
+    /// the kernel's, 4 it was absent), and what the opening now is for.
+    cause: BTreeMap<usize, u8>,
+    opening: u8,
+}
+
+/// Whether, by the part ([`fine`]), a second write fault in a block opens
+/// all of it, and a block that went so is opened whole at its next first
+/// fault (`VICTORY_GUARD_ADAPT=0`: every part by a fault of its own).
+/// Part by part a frame had 2,370 write faults against 400 (runs f1-f3).
+fn adaptive() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_ADAPT").is_none_or(|v| v != "0"))
 }
 
 /// How long a block the title has just opened by a write is left open by
@@ -919,6 +942,10 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     placeholders: BTreeMap::new(),
     opened: BTreeMap::new(),
     partial: BTreeMap::new(),
+    hot: BTreeSet::new(),
+    hot_frames: 0,
+    cause: BTreeMap::new(),
+    opening: 0,
     protected: Blocks::new(),
     clean: Blocks::new(),
     absent: Blocks::new(),
@@ -1051,17 +1078,31 @@ fn guard_walk(g: &mut Guards, first: usize, last: usize) -> Vec<usize> {
             if open {
                 guard_stat(5, 1);
                 g.absent.remove(&block);
+                if fine() {
+                    g.cause.insert(block, 4);
+                }
             }
         }
         if open {
             written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
             if fine() {
                 // The parts write faults opened, if that is how it is open.
-                let mask = g.partial.remove(&block).unwrap_or(u16::MAX);
-                let how = if mask != u16::MAX { 0 } else if g.protected.contains(&block) { 3 } else { 2 };
+                let part = g.partial.remove(&block);
+                let mask = part.unwrap_or(u16::MAX);
+                let how = match part {
+                    Some(m) if m != u16::MAX => 0,
+                    Some(_) => 4,
+                    None if g.protected.contains(&block) => 3,
+                    None => 2,
+                };
                 REPORTED[how].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if how == 0 {
                     REPORTED[1].fetch_add(u64::from(mask.count_ones()), std::sync::atomic::Ordering::Relaxed);
+                    g.hot.remove(&block);
+                }
+                if how == 2 {
+                    let why = g.cause.remove(&block).unwrap_or(0) as usize;
+                    WHOLE[why.min(4)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 WALKED.with(|w| w.borrow_mut().push(mask));
             }
@@ -1160,6 +1201,10 @@ fn guard_walk_bits(g: &mut Guards, first: usize, last: usize) -> Vec<usize> {
     let every = placeholder_ask_every();
     let turn = if every > 1 { crate::frame::current() % every } else { 0 };
     let rest = rest();
+    if fine() && crate::frame::current() / 64 != g.hot_frames {
+        g.hot_frames = crate::frame::current() / 64;
+        g.hot.clear();
+    }
     let mut block = first;
     loop {
         // The clean blocks from here on (or the range's end) close a run.
@@ -1202,17 +1247,31 @@ fn guard_walk_bits(g: &mut Guards, first: usize, last: usize) -> Vec<usize> {
             if open {
                 guard_stat(5, 1);
                 g.absent.remove(&block);
+                if fine() {
+                    g.cause.insert(block, 4);
+                }
             }
         }
         if open {
             written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
             if fine() {
                 // The parts write faults opened, if that is how it is open.
-                let mask = g.partial.remove(&block).unwrap_or(u16::MAX);
-                let how = if mask != u16::MAX { 0 } else if g.protected.contains(&block) { 3 } else { 2 };
+                let part = g.partial.remove(&block);
+                let mask = part.unwrap_or(u16::MAX);
+                let how = match part {
+                    Some(m) if m != u16::MAX => 0,
+                    Some(_) => 4,
+                    None if g.protected.contains(&block) => 3,
+                    None => 2,
+                };
                 REPORTED[how].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if how == 0 {
                     REPORTED[1].fetch_add(u64::from(mask.count_ones()), std::sync::atomic::Ordering::Relaxed);
+                    g.hot.remove(&block);
+                }
+                if how == 2 {
+                    let why = g.cause.remove(&block).unwrap_or(0) as usize;
+                    WHOLE[why.min(4)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 WALKED.with(|w| w.borrow_mut().push(mask));
             }
@@ -1458,6 +1517,9 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     for &block in &blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
+        if fine() {
+            g.cause.insert(block, g.opening);
+        }
         let mut old = 0;
         // SAFETY: a block we made read-only.
         unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
@@ -1471,7 +1533,10 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
     // The length is the title's (`fread`'s size times count, saturated).
-    open(&mut guards(), at, at.saturating_add(len));
+    let mut g = guards();
+    g.opening = 3;
+    open(&mut g, at, at.saturating_add(len));
+    g.opening = 0;
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
 }
@@ -1643,6 +1708,9 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     for block in blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
+        if fine() {
+            g.cause.insert(block, 1);
+        }
     }
     // (What is there now was not opened part by part.)
     let partial: Vec<usize> = g.partial.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).map(|(&b, _)| b).collect();
@@ -1751,15 +1819,27 @@ fn install() {
                         g.protected.remove(&block);
                         g.clean.remove(&block);
                     }
-                    *g.partial.entry(block).or_insert(0) |= 1 << part;
                     FAULTS[usize::from(!first)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let mut old = 0;
+                    // A second fault in the block, or one that went whole
+                    // lately: all of it ([`adaptive`]).
+                    if adaptive() && (!first || g.hot.contains(&block)) {
+                        g.partial.insert(block, u16::MAX);
+                        g.hot.insert(block);
+                        // SAFETY: a block we made read-only.
+                        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+                        return EXCEPTION_CONTINUE_EXECUTION;
+                    }
+                    *g.partial.entry(block).or_insert(0) |= 1 << part;
                     // SAFETY: a part of a block we made read-only.
                     unsafe { VirtualProtect((at & !(KERNEL_PAGE - 1)) as *const _, KERNEL_PAGE, PAGE_READWRITE, &mut old) };
                     return EXCEPTION_CONTINUE_EXECUTION;
                 }
             }
-            if open(&mut g, at, at + 1) {
+            g.opening = 2;
+            let opened = open(&mut g, at, at + 1);
+            g.opening = 0;
+            if opened {
                 FAULTS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if !rest().is_zero() {
                     g.note_opened(at / BLOCK);
