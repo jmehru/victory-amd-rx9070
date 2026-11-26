@@ -233,8 +233,8 @@ fn windows() -> bool {
 }
 
 /// Whether indirect executions of one record are clamped in batches
-/// (`crate::indirect::batch`; `VICTORY_INDIRECT_BATCH=1` or `2`; off: each on
-/// its own, or in windows ([`windows`])). A hand port of
+/// (`crate::indirect::batch`; `VICTORY_INDIRECT_BATCH=0`: each on its own, or
+/// in windows ([`windows`]); `2`: see below). A hand port of
 /// avatarmanz/VIctory-7900XTX 0375962.
 ///
 /// A batch is opened by the first execution after a point where arguments
@@ -257,9 +257,9 @@ fn windows() -> bool {
 fn batches() -> u8 {
     static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *ON.get_or_init(|| match std::env::var("VICTORY_INDIRECT_BATCH").as_deref() {
-        Ok("1") => 1,
+        Ok("0") => 0,
         Ok("2") => 2,
-        _ => 0,
+        _ => 1,
     })
 }
 
