@@ -178,6 +178,7 @@ pub(crate) fn land(back: &Back) {
     // Our write into title memory: `copy_mapped` opens the range's guarded
     // blocks first and notes it for the placed textures there
     // (`crate::watch::writing`), as the other writers of title memory do.
+    crate::inplace::port_touched(2, back.at as usize, back.size);
     crate::host::copy_mapped(back.at as *mut u8, tiled.as_ptr(), back.size, true);
     // While a submission's one asking stands the kernel is not asked again:
     // the journal learns the write (as after the title's buffer copies), so

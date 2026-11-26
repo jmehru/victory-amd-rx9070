@@ -6469,6 +6469,7 @@ impl HostList {
                 }
                 crate::profile::copied(len);
                 filling.get_or_insert_with(|| (std::time::Instant::now(), 0)).1 += len as u64;
+                crate::inplace::port_touched(3, src, len);
                 copy_mapped(dst as *mut u8, src as *const u8, len, false);
                 continue;
             }
@@ -6486,6 +6487,7 @@ impl HostList {
                     }
                     batch.title_written();
                     crate::profile::copied(len);
+                    crate::inplace::port_touched(0, dst, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);

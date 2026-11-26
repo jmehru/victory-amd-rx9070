@@ -2395,6 +2395,7 @@ impl Shadow {
                 };
                 let at = at + first;
                 crate::watch::writing(start + at, n);
+                crate::inplace::port_touched(1, start + at, n);
                 crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                 written += n;
             }
@@ -2483,6 +2484,7 @@ impl Shadow {
             return 0;
         }
         crate::watch::writing(start + at, n);
+        crate::inplace::port_touched(1, start + at, n);
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
         n
     }
@@ -3248,6 +3250,7 @@ impl Shadow {
             }
             if differs != 0 {
                 crate::watch::writing(start + at, n);
+                crate::inplace::port_touched(1, start + at, n);
                 crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                 written = n;
             }
@@ -3333,6 +3336,7 @@ impl Shadow {
             return 0;
         }
         crate::watch::writing(start + at, n);
+        crate::inplace::port_touched(1, start + at, n);
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
         n
     }

@@ -112,6 +112,49 @@ pub(crate) fn port_constants() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_PORT_CONSTANTS").is_ok_and(|v| v.trim() == "1"))
 }
 
+/// With [`port_constants`]: the lowest start and highest end of title
+/// memory below 4 GiB placed in place (0, 0: none), for [`port_touched`].
+static PORT_BOUNDS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// What [`port_touched`] counts, by kind.
+const PORT_KINDS: [&str; 4] = [
+    "a title buffer copy on the CPU at submission wrote",
+    "a copy's shader writes copied back wrote",
+    "a texture copied back wrote",
+    "a constant fill on the CPU at submission read",
+];
+static PORT_TOUCHES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Title memory `[start, start + len)` is in place now ([`port_touched`]).
+fn port_placed(start: u64, len: u64) {
+    if !port_constants() || start + len > 1 << 32 {
+        return;
+    }
+    let lo = PORT_BOUNDS[0].load(Ordering::Relaxed);
+    if lo == 0 || start < lo {
+        PORT_BOUNDS[0].store(start, Ordering::Relaxed);
+    }
+    PORT_BOUNDS[1].fetch_max(start + len, Ordering::Relaxed);
+}
+
+/// Diagnostics of renderer port 1: a step of ours of kind `kind`
+/// ([`PORT_KINDS`]) wrote or read `[at, at + len)` of title memory on the
+/// CPU, where memory below 4 GiB is in place (the card reads and writes it
+/// there, in its own order): logged at the first few and every power of two.
+pub(crate) fn port_touched(kind: usize, at: usize, len: usize) {
+    if !port_constants() {
+        return;
+    }
+    let (lo, hi) = (PORT_BOUNDS[0].load(Ordering::Relaxed), PORT_BOUNDS[1].load(Ordering::Relaxed));
+    if hi == 0 || at as u64 >= hi || (at + len) as u64 <= lo {
+        return;
+    }
+    let n = PORT_TOUCHES[kind].fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 4 || n.is_power_of_two() {
+        tracing::info!(n, at = format_args!("{at:#x}"), len, "renderer port 1: {} title memory in place", PORT_KINDS[kind]);
+    }
+}
+
 struct SectionHeap(Option<ID3D12Heap>, u64);
 
 // SAFETY: Direct3D 12 heaps are free-threaded.
@@ -286,6 +329,7 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
             let placed = place_run(section, offset, len);
             match &placed {
                 Some(_) => {
+                    port_placed(start, len);
                     let at = if window { 0 } else { 2 };
                     STATS[at].fetch_add(1, Ordering::Relaxed);
                     STATS[at + 1].fetch_add(len, Ordering::Relaxed);
