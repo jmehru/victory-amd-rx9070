@@ -60,6 +60,20 @@ pub(crate) fn listed(n: u64) -> bool {
 pub(crate) fn op(list: usize, what: impl FnOnce() -> String) {
     use std::io::Write;
     let frame = crate::queue::presented() + 1;
+    // Local: `VICTORY_OPS_GREP=<text>` logs every operation of every frame
+    // whose line holds that text (at most 4000 lines).
+    static GREP: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    if let Some(grep) = GREP.get_or_init(|| std::env::var("VICTORY_OPS_GREP").ok()) {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let what = what();
+        if what.contains(grep.as_str()) && N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4000 {
+            tracing::info!(frame, list = format_args!("{list:#x}"), "op: {what}");
+        }
+        if !listed(frame) {
+            return;
+        }
+        return op_listed(list, frame, what);
+    }
     if !listed(frame) {
         // Before the world: the last lines are kept, and written out when
         // it starts (`before-world-ops.txt`): what the title drew just
@@ -89,11 +103,17 @@ pub(crate) fn op(list: usize, what: impl FnOnce() -> String) {
         }
         return;
     }
+    op_listed(list, frame, what());
+}
+
+/// A listed frame's operation `what`, into its file.
+#[cfg(feature = "diagnostics")]
+fn op_listed(list: usize, frame: u64, what: String) {
+    use std::io::Write;
     let Some(folder) = folder() else {
         return;
     };
     static FILE: std::sync::Mutex<Option<(u64, u64, std::fs::File)>> = std::sync::Mutex::new(None);
-    let what = what();
     let mut file = FILE.lock().unwrap_or_else(|e| e.into_inner());
     if file.as_ref().is_none_or(|f| f.0 != frame) {
         let Ok(made) = std::fs::File::create(folder.join(format!("frame-{frame}-ops.txt"))) else {
