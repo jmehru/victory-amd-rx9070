@@ -48,7 +48,7 @@ Set the FidelityFX SDK's `signedbin` folder as `ffx_dir` under `[paths]` in
 $env:VICTORY_INPLACE = "3"; $env:VICTORY_RELAY = "2"
 $env:VICTORY_INDIRECT_WINDOW = "1"; $env:VICTORY_NO_PREV_CULL = "1"
 $env:VICTORY_TEXTURE_GATE_S = "0"; $env:VICTORY_LATE_RUNS = "16384"
-targeteleaseictory.exe run <game dir>\<the title's exe> --execute --console series-s
+target\release\victory.exe run <game dir>\<the title's exe> --execute --console series-s
 ```
 
 `VICTORY_FRAME_GEN=1` adds FSR frame generation (off by default; the interface
