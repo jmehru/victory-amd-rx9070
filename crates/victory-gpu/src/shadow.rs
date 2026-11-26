@@ -2921,7 +2921,7 @@ impl Shadow {
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
-        let (mut bytes, mut run) = (0, None);
+        let (mut bytes, mut run) = (0, None::<usize>);
         let last = (to - 1) / PAGE;
         for page in from / PAGE..=last {
             let write = match writes.peek() {
@@ -2933,11 +2933,37 @@ impl Shadow {
             };
             let at = &mut copied[page - base];
             if *at == 0 || write > *at {
+                // By the part (`crate::watch::fine`): the parts written since
+                // the copy last took the page, each run of them a copy. A
+                // page all of whose parts were is taken as before.
+                let parts = if crate::watch::fine() { crate::watch::parts_since(page, *at) } else { u16::MAX };
                 // A page only partly in the range is copied in part: it
                 // stays stale for the rest.
                 let (start, end) = (self.start as usize, (self.start + self.len) as usize);
                 if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
                     *at = now;
+                }
+                if parts != u16::MAX {
+                    if let Some(first) = run.take() {
+                        bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                    }
+                    const PART: usize = PAGE / 16;
+                    let mut k = 0;
+                    while k < 16 {
+                        if parts >> k & 1 == 0 {
+                            k += 1;
+                            continue;
+                        }
+                        let first = k;
+                        while k < 16 && parts >> k & 1 != 0 {
+                            k += 1;
+                        }
+                        let (a, e) = ((page * PAGE + first * PART).max(from), (page * PAGE + k * PART).min(to));
+                        if a < e {
+                            bytes += self.copy(a, e);
+                        }
+                    }
+                    continue;
                 }
                 run.get_or_insert(page);
             } else if let Some(first) = run.take() {
@@ -2957,25 +2983,6 @@ impl Shadow {
         let (from, to) = (from.max(start), to.min(end));
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
-        // While a profile is taken: of the 4 KiB parts about to be copied,
-        // how many hold other bytes than the copy has (what tracking writes
-        // by 4 KiB instead of 64 KiB would have to copy).
-        if crate::profile::on() {
-            let mut title = vec![0u8; 4096];
-            let (mut parts, mut differ) = (0u64, 0u64);
-            let mut a = from;
-            while a < to {
-                let n = (4096 - a % 4096).min(to - a);
-                if crate::host::read_into(a as *const u8, &mut title[..n]) {
-                    parts += 1;
-                    // SAFETY: inside the copy's mapping, as `at` is.
-                    let held = unsafe { std::slice::from_raw_parts(self.data.add(a - start).cast_const(), n) };
-                    differ += u64::from(held != &title[..n]);
-                }
-                a += n;
-            }
-            crate::profile::parts(self.card.is_some(), parts, differ);
-        }
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);

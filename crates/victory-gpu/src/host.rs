@@ -7174,6 +7174,23 @@ impl Meter {
                 "lists of the title's closed per frame: {all:.1}, {untouched:.1} of them with nothing recorded into them (VICTORY_SKIP_EMPTY_LISTS=1 leaves those out of their submissions)"
             );
         }
+        {
+            let [first, more] = [0, 1].map(|i| crate::watch::FAULTS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            tracing::info!(
+                "write faults on guarded title memory per frame: {first:.0} that opened a page{}",
+                if crate::watch::fine() {
+{
+                        let r: [f64; 4] = std::array::from_fn(|i| crate::watch::REPORTED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                        format!(
+                            " or its first 4 KiB part, {more:.0} that opened a further part (VICTORY_GUARD_PAGE=4096); pages the guards reported: {:.0} open in part with {:.0} parts, {:.0} open whole, {:.0} written through another view",
+                            r[0], r[1], r[2], r[3]
+                        )
+                    }
+                } else {
+                    String::new()
+                }
+            );
+        }
         let passes = BATCH_PASSES.swap(0, Ordering::Relaxed);
         if passes > 0 {
             let [batches, alone] = [0, 1].map(|i| SCRATCH_MADE[i].swap(0, Ordering::Relaxed) as f64 / frames);
