@@ -2682,6 +2682,10 @@ mod relay_tests {
 /// descriptor slots, upload
 /// memory and scratch chunks are held until then, and a frame's lists held
 /// all at once ran the slots out before (run 45).
+///
+/// 256 with the relay and renderer port 1 (fxceless 06702fe's "more room"
+/// doubles it): 58.8 ms a frame in the cell against 47.9 with 128, the card
+/// 58 % busy against 67 (run pg-alt-late2, `alt:256`, twenty seconds each).
 fn late_most() -> usize {
     static MOST: OnceLock<(usize, Option<usize>)> = OnceLock::new();
     let (plain, alt) = *MOST.get_or_init(|| {

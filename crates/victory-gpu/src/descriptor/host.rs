@@ -76,6 +76,8 @@ pub(crate) struct HostHeap {
     /// table; one a shader picks by a computed index is brought up to date
     /// from here ([`HostHeap::texture_slots_due`]).
     textures: Mutex<TextureQueue>,
+    /// [`TextureQueue::maybe`], read without its lock.
+    queued: std::sync::Arc<[std::sync::atomic::AtomicU64]>,
     /// Per title slot, the frame (plus one; 0: never) in which a draw last
     /// read it through a table, or made a table it lies in (with
     /// [`TABLED_READ`] set if the draw read it). The draw that
@@ -467,9 +469,50 @@ pub(crate) struct TextureQueue {
     /// that will be brought up to date anyway.
     rechecks: std::collections::BTreeMap<u32, Recheck>,
     writes: u64,
+    /// A bit per slot, read without the queue's lock ([`queued_bit`]):
+    /// set whenever the slot goes into `slots` or `rechecks`, cleared by
+    /// [`TextureQueue::remove`]. A clear bit says the slot is in neither,
+    /// so taking it out is nothing to lock for (a table's buffer view,
+    /// thousands a frame); a set one may be stale (other ways out leave it).
+    maybe: Option<std::sync::Arc<[std::sync::atomic::AtomicU64]>>,
+}
+
+/// Whether a slot's taking out of the texture queue looks at
+/// [`TextureQueue::maybe`] first, without the lock (on by default;
+/// `VICTORY_QUEUE_BITS=0`: the lock every time, as before; `alt`: in turn,
+/// `crate::host::alt_phase`).
+fn queued_bits() -> bool {
+    match queued_mode() {
+        0 => false,
+        1 => true,
+        _ => crate::host::alt_phase(),
+    }
+}
+
+/// [`queued_bits`]: 0 off, 1 on, 2 in turn (the bits kept unless 0).
+fn queued_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_QUEUE_BITS").as_deref() {
+        Ok("0") => 0,
+        Ok("alt") => 2,
+        _ => 1,
+    })
+}
+
+/// Whether bit `index` of `bits` is set (out of range: set, to be safe).
+fn queued_bit(bits: &[std::sync::atomic::AtomicU64], index: u32) -> bool {
+    bits.get(index as usize / 64)
+        .is_none_or(|w| w.load(std::sync::atomic::Ordering::Acquire) & (1 << (index % 64)) != 0)
 }
 
 impl TextureQueue {
+    /// Notes slot `index` in the queue or the rechecks ([`TextureQueue::maybe`]).
+    fn mark(&self, index: u32) {
+        if let Some(word) = self.maybe.as_ref().and_then(|bits| bits.get(index as usize / 64)) {
+            word.fetch_or(1 << (index % 64), std::sync::atomic::Ordering::Release);
+        }
+    }
+
     /// A texture view was written into slot `index` in `frame`, due from
     /// frame `due`. `seen`: it was not written, a draw or the pass made
     /// the host slot from a view the queue may hold already, which then
@@ -482,11 +525,15 @@ impl TextureQueue {
         let write = self.writes;
         self.rechecks.remove(&index);
         self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0 });
+        self.mark(index);
     }
 
     fn remove(&mut self, index: u32) {
         self.slots.remove(&index);
         self.rechecks.remove(&index);
+        if let Some(word) = self.maybe.as_ref().and_then(|bits| bits.get(index as usize / 64)) {
+            word.fetch_and(!(1 << (index % 64)), std::sync::atomic::Ordering::Release);
+        }
     }
 
     /// Slot `index` was uploaded whole in `frame` from memory `at`, whose
@@ -496,6 +543,7 @@ impl TextureQueue {
         if !self.slots.contains_key(&index) {
             let due = frame + RECHECK_FRAMES[0];
             self.rechecks.insert(index, Recheck { due, at, print, looks: 0, uploaded: frame });
+            self.mark(index);
         }
     }
 
@@ -529,6 +577,7 @@ impl TextureQueue {
             Some(wait) => {
                 let next = Recheck { due: frame + wait, looks: seen.looks + 1, ..*seen };
                 self.rechecks.insert(index, next);
+                self.mark(index);
             }
             None => {
                 self.rechecks.remove(&index);
@@ -674,6 +723,7 @@ impl TextureQueue {
         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
         self.rechecks.remove(&index);
         self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0 });
+        self.mark(index);
     }
 
     /// Bytes of slot `index`'s memory that were mapped at its last upload
@@ -935,6 +985,8 @@ impl HostHeap {
                 Some((buffer, gpu, data as usize))
             })
             .flatten();
+        let queued: std::sync::Arc<[std::sync::atomic::AtomicU64]> =
+            (0..count.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
         let h = HostHeap {
             heap,
             cpu,
@@ -952,7 +1004,8 @@ impl HostHeap {
             strides,
             buffers: Mutex::default(),
             changed: Mutex::default(),
-            textures: Mutex::default(),
+            textures: Mutex::new(TextureQueue { maybe: (queued_mode() != 0).then(|| queued.clone()), ..Default::default() }),
+            queued,
             tabled: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
@@ -1464,6 +1517,7 @@ impl HostHeap {
                 textures.slots.remove(&index);
                 if let Some(recheck) = before.1 {
                     textures.rechecks.insert(index, recheck);
+                    textures.mark(index);
                 }
             }
         }
@@ -1588,6 +1642,10 @@ impl HostHeap {
         // Made now by a draw of this frame that read it through a table:
         // up to date.
         let read_now = seen && stamp == now | TABLED_READ;
+        // Out of the queue, and not in it: nothing to take the lock for.
+        if !(texture && !read_now) && queued_bits() && !queued_bit(&self.queued, index) {
+            return;
+        }
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         if texture && !read_now {
             let due = if lately && !seen {
@@ -1700,18 +1758,25 @@ impl HostHeap {
             // dword, either value is one the slot had).
             unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0) | kind) };
         }
-        let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+        // The heap-wide lock only where the set is read or changed: not for
+        // a buffer view in a draw's own table, thousands a frame.
+        let mut held = None;
         let was = if stride.is_some() {
             // (A slot of a draw's own table is that draw's to bring up to
             // date, not the pass's over the heap: `HostHeap::mirror_tabled`.)
             if DRAW_TABLE.get() {
                 false
             } else {
+                let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
                 buffers.insert(index);
+                held = Some(buffers);
                 true
             }
         } else {
-            buffers.remove(&index)
+            let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+            let was = buffers.remove(&index);
+            held = Some(buffers);
+            was
         };
         if was {
             self.changed
@@ -1719,6 +1784,7 @@ impl HostHeap {
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(index);
         }
+        drop(held);
         stale
     }
 
@@ -3338,6 +3404,32 @@ mod tests {
         // Nothing inside: as it was, for the host check to refuse.
         assert_eq!(elements_inside(10, 10, 16, 160), 10);
         assert_eq!(elements_inside(0, 7, 4, 1 << 40), 7);
+    }
+
+    /// The bits read without the lock: set for a slot that goes into the
+    /// queue or the rechecks, clear after it is taken out, and never clear
+    /// for a slot in either.
+    #[test]
+    fn queued_bits_follow_the_queue() {
+        let bits: std::sync::Arc<[std::sync::atomic::AtomicU64]> =
+            (0..4).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
+        let mut q = TextureQueue { maybe: Some(bits.clone()), ..Default::default() };
+        assert!(!queued_bit(&bits, 70));
+        q.written(70, 1, 1, false);
+        assert!(queued_bit(&bits, 70) && !queued_bit(&bits, 71));
+        q.remove(70);
+        assert!(!queued_bit(&bits, 70));
+        q.recheck(130, 2, (0x1000, 64), 9);
+        assert!(queued_bit(&bits, 130));
+        q.changed(5, 3, 3);
+        assert!(queued_bit(&bits, 5));
+        for index in [5, 130] {
+            assert!(q.slots.contains_key(&index) || q.rechecks.contains_key(&index));
+            q.remove(index);
+            assert!(!queued_bit(&bits, index));
+        }
+        // Past the bits: taken as set.
+        assert!(queued_bit(&bits, 4 * 64 + 1));
     }
 
     /// A slot uploaded whole is looked at a few times, further and further
