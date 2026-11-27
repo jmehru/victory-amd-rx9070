@@ -8,23 +8,27 @@ RX 9070 (RDNA4, driver 32.0.32029.2010), Ryzen 5 7600 (6 cores), 32 GB RAM.
 Nothing here has been tested on another card. Work goes to the `perf/submit`
 branch first.
 
-### State on that machine (2026-11-26, release build, Series S profile, FSR on)
+### State on that machine (2026-11-27, release build, Series S profile, FSR on)
+
+With `VICTORY_PORT_CONSTANTS=1 VICTORY_CBV_RAW=1` (both still off by default):
 
 | | |
 |---|---|
 | Menus, videos, loading screens | 30 fps |
-| Prologue, the cell, standing still | 50 to 52 ms a frame (19 to 20 fps) |
-| First mission, the boat at rest | about 47 ms (21 fps) |
-| The same with frame generation (`VICTORY_FRAME_GEN=1`) | 17 to 18 real frames shown as 32 to 34 |
-| Series X profile, the boat (one run) | about 60 ms (16 to 17 fps) |
-| Opening cutscene of the boat save | median about 60 ms; a camera cut still drops to a few frames a second |
-| Turning the camera while the title streams | 8 to 10 fps reported by the tester; being worked on |
-| Memory | 18 to 20 GB for the process; 32 GB of RAM is tight |
+| Prologue, the cell, standing still | 44.5 to 45.5 ms a frame (about 22 fps); 51 to 53 ms without the two switches |
+| First mission, the boat at rest | about 40.6 ms (24.6 fps) |
+| The boat under way | 53 to 58 ms (17 to 19 fps) |
+| Walking and turning the camera | 59 to 61 ms |
+| With frame generation (`VICTORY_FRAME_GEN=1`) | 20 to 21 real frames shown as about 38 |
+| Memory | 20 to 23 GB for the process; 32 GB of RAM is tight |
 
-It started at 12.7 to 12.9 fps in the cell the day before. The frame is bound by
-the thread of ours that prepares submissions (about 42 ms of work a frame) and
-by the card (about 37 ms of the title's own draws and dispatches); 30 real
-frames a second are not reached.
+It started at 12.7 to 12.9 fps in the cell two days before. 30 real frames a
+second are not reached. What bounds the frame now is the card running the
+title's own lists: about 30 ms of card time a frame in the cell and with the
+boat at rest, about 45 ms with the boat under way. Compute is half or more of
+it (the classified light gathers, particles, the light atlas), and 5 to 8 ms
+lie between commands. The thread of ours that prepares submissions is at 31 to
+33 ms in the cell.
 
 The picture:
 
@@ -52,7 +56,8 @@ target\release\victory.exe run <game dir>\<the title's exe> --execute --console 
 ```
 
 `VICTORY_FRAME_GEN=1` adds FSR frame generation (off by default; the interface
-is interpolated with the picture, so subtitles may ghost). The first run after
+is interpolated with the picture, so subtitles may ghost). `VICTORY_FULLSCREEN=1`
+or F11 gives a borderless window over the monitor. The first run after
 an update translates every shader again and is slow; judge the second.
 
 ### Known problems
