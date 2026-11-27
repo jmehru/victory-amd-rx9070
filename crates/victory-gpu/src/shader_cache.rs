@@ -70,6 +70,8 @@ fn build() -> &'static [u8; 32] {
             // And where a table's constant buffers are read from (by what
             // is in force, not by the switch's text: it is on when unset).
             u32::from(victory_shader::emit::cbv_slots()),
+            // And whether those are read raw (`VICTORY_CBV_RAW=1`).
+            u32::from(victory_shader::emit::cbv_raw()),
         ] {
             hash.update(&n.to_le_bytes());
         }

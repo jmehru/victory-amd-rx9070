@@ -97,6 +97,467 @@ pub fn views_in_place() -> bool {
     level() >= 3
 }
 
+/// Renderer port 1 (`VICTORY_PORT_CONSTANTS=1`, off by default; after
+/// Belobug's rx9070xt branch, 86dc109 and 4b82f6c): `xmem` gives the pages
+/// mapped into the title's 32-bit graphics heap (185 MB: its ring of
+/// constants and the 174 MB buffer its skinning passes write through) their
+/// section's slices in address order, so that the heap is one run of its
+/// section and is used in place here at level 3 (it was "views of scattered
+/// pages", a copy in the card's memory with ~28 MB sent up a frame in ~240
+/// ranges); and constant data a list reads from memory in place at an
+/// address the host cannot bind is copied by the card when the list runs
+/// (`HostList::card_fill`), not read on the CPU at submission.
+pub(crate) fn port_constants() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_PORT_CONSTANTS").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// With [`port_constants`]: the lowest start and highest end of title
+/// memory below 4 GiB placed in place (0, 0: none), for [`port_touched`].
+static PORT_BOUNDS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// What [`port_touched`] counts, by kind.
+const PORT_KINDS: [&str; 4] = [
+    "a title buffer copy on the CPU at submission wrote",
+    "a copy's shader writes copied back wrote",
+    "a texture copied back wrote",
+    "a constant fill on the CPU at submission read",
+];
+static PORT_TOUCHES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Title memory `[start, start + len)` is in place now ([`port_touched`]).
+fn port_placed(start: u64, len: u64) {
+    if !port_constants() || start + len > 1 << 32 {
+        return;
+    }
+    let lo = PORT_BOUNDS[0].load(Ordering::Relaxed);
+    if lo == 0 || start < lo {
+        PORT_BOUNDS[0].store(start, Ordering::Relaxed);
+    }
+    PORT_BOUNDS[1].fetch_max(start + len, Ordering::Relaxed);
+}
+
+/// Diagnostics of renderer port 1: a step of ours of kind `kind`
+/// ([`PORT_KINDS`]) wrote or read `[at, at + len)` of title memory on the
+/// CPU, where memory below 4 GiB is in place (the card reads and writes it
+/// there, in its own order): logged at the first few and every power of two.
+pub(crate) fn port_touched(kind: usize, at: usize, len: usize) {
+    if !port_constants() {
+        return;
+    }
+    let (lo, hi) = (PORT_BOUNDS[0].load(Ordering::Relaxed), PORT_BOUNDS[1].load(Ordering::Relaxed));
+    if hi == 0 || at as u64 >= hi || (at + len) as u64 <= lo {
+        return;
+    }
+    let n = PORT_TOUCHES[kind].fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 4 || n.is_power_of_two() {
+        tracing::info!(n, at = format_args!("{at:#x}"), len, "renderer port 1: {} title memory in place", PORT_KINDS[kind]);
+    }
+}
+
+/// Diagnostics of renderer port 1 (`VICTORY_PORT_WAR=1`, with
+/// [`port_constants`]): whether title memory in place below 4 GiB that a
+/// submission sent ahead reads changes between the submission and the
+/// landing of its flight (after the card ran it). A host copy would have
+/// given the card the bytes as they were at submission; in place the card
+/// reads them when it runs.
+pub(crate) fn port_war() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| port_constants() && std::env::var_os("VICTORY_PORT_WAR").is_some_and(|v| v == "1"))
+}
+
+/// Whether `[at, at + len)` lies in title memory below 4 GiB in place
+/// ([`PORT_BOUNDS`]).
+pub(crate) fn port_heap(at: usize, len: usize) -> bool {
+    let (lo, hi) = (PORT_BOUNDS[0].load(Ordering::Relaxed), PORT_BOUNDS[1].load(Ordering::Relaxed));
+    hi != 0 && (at as u64) >= lo && (at + len) as u64 <= hi
+}
+
+/// [`port_war`]: ranges of memory in place below 4 GiB that shaders were
+/// declared to write, since the start (joined, in order).
+static WAR_GPU: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+/// [`port_war`]: shaders of a list may write `[at, at + len)` of memory in
+/// place.
+pub(crate) fn war_gpu_write(at: usize, len: usize) {
+    if !port_war() || !port_heap(at, len.max(1)) {
+        return;
+    }
+    let mut ranges = WAR_GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let at_most = ranges.partition_point(|r| r.1 < at);
+    if ranges.get(at_most).is_some_and(|r| r.0 <= at && at + len <= r.1) {
+        return;
+    }
+    ranges.push((at, at + len));
+    ranges.sort_unstable();
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for &(from, to) in ranges.iter() {
+        match out.last_mut() {
+            Some(last) if from <= last.1 => last.1 = last.1.max(to),
+            _ => out.push((from, to)),
+        }
+    }
+    *ranges = out;
+}
+
+fn war_gpu_overlaps(at: usize, len: usize) -> bool {
+    let ranges = WAR_GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let i = ranges.partition_point(|r| r.1 <= at);
+    ranges.get(i).is_some_and(|r| r.0 < at + len)
+}
+
+/// What [`port_war`] took of a submission: per range read (address, bytes,
+/// kind, hash, the bytes themselves if short), when, and how many flights
+/// were in the air.
+pub(crate) struct WarTaken {
+    reads: Vec<(usize, usize, u8, u64, Option<Vec<u8>>)>,
+    at: std::time::Instant,
+    ahead: usize,
+    number: u64,
+    /// The title's frame (`crate::frame::current`) at submission.
+    frame: u64,
+    /// The write-watch asking (the guards') made just before: pages the
+    /// title's CPU writes after it are stamped with a later one.
+    asked: Option<u64>,
+}
+
+/// [`port_war`]: asks the guards which pages of memory in place below
+/// 4 GiB the title's CPU wrote (the guards hold the title's view; the card
+/// reads and writes the memory through a view of ours, unseen by them).
+fn war_ask() -> Option<(u64, Vec<(usize, u64)>)> {
+    let (lo, hi) = (PORT_BOUNDS[0].load(Ordering::Relaxed) as usize, PORT_BOUNDS[1].load(Ordering::Relaxed) as usize);
+    if hi == 0 {
+        return None;
+    }
+    crate::watch::writes(lo, hi, true)
+}
+
+/// [`port_war`]: the ranges of memory in place that the shaders of the
+/// last submissions may write (submission, ranges), newest last.
+static WAR_RECENT: Mutex<std::collections::VecDeque<(u64, Vec<(usize, usize)>)>> = Mutex::new(std::collections::VecDeque::new());
+
+/// A shader write range longer than this is taken as "to the buffer's end"
+/// (a root view's), which says little of where it writes.
+const WAR_WIDE: usize = 1 << 20;
+
+/// How the shader writes of submissions near `number` (64 before it and
+/// all after) meet `[at, at + len)`: 2 a range of at most [`WAR_WIDE`]
+/// bytes does, 1 only wider ones do, 0 none.
+fn war_near_writes(number: u64, at: usize, len: usize) -> u8 {
+    let recent = WAR_RECENT.lock().unwrap_or_else(|e| e.into_inner());
+    let mut found = 0;
+    for (n, ranges) in recent.iter() {
+        if *n + 64 < number {
+            continue;
+        }
+        for &(a, l) in ranges {
+            if a < at + len && at < a + l {
+                if l <= WAR_WIDE {
+                    return 2;
+                }
+                found = 1;
+            }
+        }
+    }
+    found
+}
+
+/// [`port_war`]'s counts since the last line: ranges taken, bytes taken,
+/// then changed by kind (a constant fill, a 64 KiB root view window, a
+/// smaller refresh), changed that shaders were declared to write, bytes
+/// changed, microseconds in the air of changed reads, texture refreshes and
+/// fills of upload memory out of memory in place, ranges too long to take.
+static WAR_STATS: [AtomicU64; 15] = [const { AtomicU64::new(0) }; 15];
+
+/// Longest range [`port_war`] takes, and the most bytes per submission.
+const WAR_LONGEST: usize = 256 << 10;
+const WAR_MOST: usize = 16 << 20;
+
+fn war_hash(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ bytes.len() as u64;
+    let mut chunks = bytes.chunks_exact(8);
+    for c in &mut chunks {
+        h = (h ^ u64::from_le_bytes(c.try_into().unwrap_or_default())).wrapping_mul(0x0100_0000_01b3).rotate_left(29);
+    }
+    for &b in chunks.remainder() {
+        h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
+/// [`port_war`]: takes the ranges of memory in place below 4 GiB that a
+/// submission reads (`reads`: address, bytes, kind 0 a constant fill, 1 a
+/// refresh), as they are now, just before it goes to the card.
+pub(crate) fn war_take(reads: Vec<(usize, usize, u8)>, writes: Vec<(usize, usize)>, ahead: usize, number: u64) -> Option<WarTaken> {
+    {
+        let mut recent = WAR_RECENT.lock().unwrap_or_else(|e| e.into_inner());
+        if !writes.is_empty() {
+            recent.push_back((number, writes));
+        }
+        while recent.len() > 512 {
+            recent.pop_front();
+        }
+    }
+    let mut taken = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut total = 0usize;
+    let mut buf = Vec::new();
+    for (at, len, kind) in reads {
+        if len == 0 || !port_heap(at, len) || !seen.insert((at, len)) {
+            continue;
+        }
+        if len > WAR_LONGEST || total + len > WAR_MOST {
+            WAR_STATS[10].fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        // A refresh of 64 KiB is a root view's window (its length unknown).
+        let kind = if kind == 0 { 0 } else if len == 1 << 16 { 1 } else { 2 };
+        buf.resize(len, 0);
+        if !crate::host::read_into(at as *const u8, &mut buf) {
+            continue;
+        }
+        total += len;
+        let keep = (len <= 4096).then(|| buf.clone());
+        taken.push((at, len, kind, war_hash(&buf), keep));
+    }
+    if taken.is_empty() {
+        return None;
+    }
+    WAR_STATS[0].fetch_add(taken.len() as u64, Ordering::Relaxed);
+    WAR_STATS[1].fetch_add(total as u64, Ordering::Relaxed);
+    let asked = war_ask().map(|(now, _)| now);
+    Some(WarTaken { reads: taken, at: std::time::Instant::now(), ahead, number, frame: crate::frame::current(), asked })
+}
+
+/// [`port_war`]: a texture refreshed or a fill of upload memory read out of
+/// memory in place at submission (0, 1).
+pub(crate) fn war_cpu_read(kind: usize, at: usize, len: usize) {
+    if port_war() && port_heap(at, len.max(1)) {
+        WAR_STATS[8 + kind].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// [`port_war`]: at the landing of the flight `taken` was taken for, after
+/// the card ran it: which of its ranges changed since.
+pub(crate) fn war_check(taken: &WarTaken) {
+    let us = taken.at.elapsed().as_micros() as u64;
+    // Pages the title's CPU wrote since the submission (by the guards).
+    let cpu_pages: Vec<usize> = match (taken.asked, war_ask()) {
+        (Some(before), Some((_, written))) => written.into_iter().filter(|&(_, w)| w > before).map(|(p, _)| p).collect(),
+        _ => Vec::new(),
+    };
+    let page = crate::watch::PAGE;
+    // By the 4 KiB part where the guards know it (`VICTORY_GUARD_PAGE=4096`).
+    let before = taken.asked.unwrap_or(0);
+    let cpu_wrote = |at: usize, len: usize| {
+        let (first, last) = (at / page, (at + len).div_ceil(page));
+        let i = cpu_pages.partition_point(|&p| p < first);
+        cpu_pages[i..].iter().take_while(|&&p| p < last).any(|&p| {
+            let parts = crate::watch::parts_since(p, before);
+            let lo = at.max(p * page) - p * page;
+            let hi = (at + len).min((p + 1) * page) - p * page;
+            let want = (lo / 4096..hi.div_ceil(4096)).fold(0u16, |m, k| m | 1 << k);
+            parts & want != 0
+        })
+    };
+    let mut buf = Vec::new();
+    for (at, len, kind, hash, kept) in &taken.reads {
+        let cpu = cpu_wrote(*at, *len);
+        if cpu {
+            WAR_STATS[13].fetch_add(1, Ordering::Relaxed);
+        }
+        buf.resize(*len, 0);
+        if !crate::host::read_into(*at as *const u8, &mut buf) || war_hash(&buf) == *hash {
+            continue;
+        }
+        if cpu {
+            WAR_STATS[14].fetch_add(1, Ordering::Relaxed);
+        }
+        WAR_STATS[2 + *kind as usize].fetch_add(1, Ordering::Relaxed);
+        let near = war_near_writes(taken.number, *at, *len);
+        let gpu = near > 0 || war_gpu_overlaps(*at, *len);
+        if near == 2 {
+            WAR_STATS[5].fetch_add(1, Ordering::Relaxed);
+        } else if near == 1 {
+            WAR_STATS[11].fetch_add(1, Ordering::Relaxed);
+        } else {
+            WAR_STATS[12].fetch_add(1, Ordering::Relaxed);
+        }
+        let differing = kept.as_ref().map(|k| k.iter().zip(&buf).filter(|(a, b)| a != b).count());
+        WAR_STATS[6].fetch_add(differing.unwrap_or(*len) as u64, Ordering::Relaxed);
+        WAR_STATS[7].fetch_add(us, Ordering::Relaxed);
+        // The first few of each class, then every power of two.
+        static SAID: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+        let class = if cpu { 0 } else { 1 + usize::from(near == 0) };
+        let n = SAID[class].fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= if class == 0 { 20_000 } else { 8 } || n.is_power_of_two() {
+            let first = kept.as_ref().and_then(|k| k.iter().zip(&buf).position(|(a, b)| a != b));
+            let show = |b: &[u8], from: usize| b[from..(from + 16).min(b.len())].iter().map(|x| format!("{x:02x}")).collect::<String>();
+            let (was, now) = match (kept, first) {
+                (Some(k), Some(f)) => (show(k, f & !15), show(&buf, f & !15)),
+                _ => (String::new(), String::new()),
+            };
+            let lo = PORT_BOUNDS[0].load(Ordering::Relaxed) as usize;
+            tracing::info!(
+                n,
+                submission = taken.number,
+                frames_since = crate::frame::current() - taken.frame,
+                kind,
+                at = format_args!("{at:#x}"),
+                offset = format_args!("{:#x}", at - lo),
+                len,
+                ms = us as f64 / 1000.0,
+                ahead = taken.ahead,
+                shaders_write_there = gpu,
+                near_shader_writes = near,
+                title_cpu_wrote = cpu,
+                differing = ?differing,
+                first = ?first,
+                was = %was,
+                now = %now,
+                "renderer port 1: memory in place a flight read changed between its submission and its landing"
+            );
+        }
+    }
+}
+
+/// [`port_war`]: square depth targets (shadow maps) by title resource:
+/// the frame they were last set in, the frame their present run of frames
+/// began, and how many sets it had.
+static WAR_DEPTH: Mutex<Option<std::collections::HashMap<usize, (u64, u64, u64)>>> = Mutex::new(None);
+
+/// Draws into each square depth target since its present run began, and a
+/// sum over their pipelines (an order-free fingerprint of what was drawn).
+static WAR_DRAWS: Mutex<Option<std::collections::HashMap<usize, (u64, u64)>>> = Mutex::new(None);
+
+fn war_shadows_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| port_war() || std::env::var_os("VICTORY_PORT_SHADOWS").is_some_and(|v| v == "1"))
+}
+
+/// With `VICTORY_PORT_SHADOWS=1`: a draw into depth target `resource`
+/// (`pipeline` the title's) was recorded.
+pub(crate) fn war_depth_drew(resource: usize, pipeline: usize) {
+    if resource == 0 || !war_shadows_on() {
+        return;
+    }
+    let mut map = WAR_DRAWS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(entry) = map.as_mut().and_then(|m| m.get_mut(&resource)) {
+        entry.0 += 1;
+        entry.1 = entry.1.wrapping_add((pipeline as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+    }
+}
+
+/// [`port_war`]: a list sets `resource` (`texture` its host copy) as its
+/// depth target. A square one set again after 30 frames or more without
+/// (a shadow map the title keeps, drawn anew) is said, with the frame.
+pub(crate) fn war_depth_set(resource: usize, texture: &ID3D12Resource) {
+    // (`VICTORY_PORT_SHADOWS=1` alone, with the switch on or off.)
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| port_war() || std::env::var_os("VICTORY_PORT_SHADOWS").is_some_and(|v| v == "1")) {
+        return;
+    }
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    if d.Width != u64::from(d.Height) || d.Width < 128 {
+        return;
+    }
+    let frame = crate::frame::current();
+    let mut map = WAR_DEPTH.lock().unwrap_or_else(|e| e.into_inner());
+    let map = map.get_or_insert_with(Default::default);
+    let entry = map.entry(resource).or_insert((0, 0, 0));
+    // The cell's lamps' maps (768): every run of frames; others after 30
+    // frames without.
+    let gap = if d.Width == 768 { 2 } else { 30 };
+    if entry.2 == 0 || frame >= entry.0 + gap {
+        tracing::info!(
+            resource = format_args!("{resource:#x}"),
+            size = d.Width,
+            format = d.Format.0,
+            frame,
+            idle = if entry.2 == 0 { -1 } else { (frame - entry.0) as i64 },
+            last_run_began = entry.1,
+            last_run_ended = entry.0,
+            last_run_sets = entry.2,
+            last_run_draws = ?WAR_DRAWS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&resource)).map(|d| (d.0, format!("{:016x}", d.1))),
+            "renderer port 1 (diagnostics): a square depth target is drawn into after frames without"
+        );
+        WAR_DRAWS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(resource, (0, 0));
+        // Diagnostics builds with a capture folder: the frame is listed, so
+        // that its targets are saved at its present (`VICTORY_DUMP_TARGETS`).
+        #[cfg(feature = "diagnostics")]
+        // `VICTORY_PORT_DUMP=<frame>`: from that frame on, at most 24 times.
+        {
+            static FROM: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            static LISTED: AtomicU64 = AtomicU64::new(0);
+            let from = *FROM.get_or_init(|| std::env::var("VICTORY_PORT_DUMP").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(u64::MAX));
+            if frame >= from && d.Width == 768 && LISTED.fetch_add(1, Ordering::Relaxed) < 24 {
+                crate::capture::list_frame(crate::queue::presented() + 1);
+            }
+        }
+        *entry = (frame, frame, 0);
+    }
+    entry.0 = frame;
+    entry.2 += 1;
+}
+
+/// With `VICTORY_PORT_SHADOWS=1` (or [`port_war`]): a list clears the
+/// depth of `resource`, a 768x768 shadow map (the cell's lamps'): said,
+/// from frame `VICTORY_PORT_SHADOWS_FROM` on, 3,000 times at most.
+pub(crate) fn war_depth_clear(resource: usize, texture: &ID3D12Resource, flags: u32, depth: f32, rects: Option<&[windows::Win32::Foundation::RECT]>) {
+    static ON: std::sync::OnceLock<(bool, u64)> = std::sync::OnceLock::new();
+    let (on, from) = *ON.get_or_init(|| {
+        (
+            port_war() || std::env::var_os("VICTORY_PORT_SHADOWS").is_some_and(|v| v == "1"),
+            std::env::var("VICTORY_PORT_SHADOWS_FROM").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0),
+        )
+    });
+    if !on {
+        return;
+    }
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    let frame = crate::frame::current();
+    if d.Width != 768 || d.Height != 768 || frame < from {
+        return;
+    }
+    static SAID: AtomicU64 = AtomicU64::new(0);
+    if SAID.fetch_add(1, Ordering::Relaxed) < 3000 {
+        let rects: Option<Vec<[i32; 4]>> = rects.map(|r| r.iter().map(|r| [r.left, r.top, r.right, r.bottom]).collect());
+        tracing::info!(resource = format_args!("{resource:#x}"), frame, flags, depth, ?rects, "renderer port 1 (diagnostics): a 768x768 depth target is cleared");
+    }
+}
+
+/// [`port_war`]: its line, per frame, with the frame-rate line.
+pub(crate) fn war_line(frames: f64) {
+    if !port_war() {
+        return;
+    }
+    let s: Vec<u64> = WAR_STATS.iter().map(|s| s.swap(0, Ordering::Relaxed)).collect();
+    let changed = s[2] + s[3] + s[4];
+    tracing::info!(
+        "renderer port 1, memory in place read by flights, per frame: {:.0} ranges ({:.2} MB) taken at submission; changed by their landing {:.1} \
+         (constant fills {:.1}, root view windows {:.1}, other reads {:.1}), where shaders of submissions near it were declared to write {:.1} (only by ranges to a buffer's end {:.1}, nowhere {:.1}), {:.1} KB changed, \
+         {:.1} ms in the air on average; the title's CPU wrote pages of {:.1} ranges read while in the air ({:.1} of them changed); read on the CPU at submission: textures {:.1}, fills {:.1}; {:.1} ranges too long to take",
+        s[0] as f64 / frames,
+        s[1] as f64 / frames / (1 << 20) as f64,
+        changed as f64 / frames,
+        s[2] as f64 / frames,
+        s[3] as f64 / frames,
+        s[4] as f64 / frames,
+        s[5] as f64 / frames,
+        s[11] as f64 / frames,
+        s[12] as f64 / frames,
+        s[6] as f64 / frames / 1024.0,
+        if changed > 0 { s[7] as f64 / changed as f64 / 1000.0 } else { 0.0 },
+        s[13] as f64 / frames,
+        s[14] as f64 / frames,
+        s[8] as f64 / frames,
+        s[9] as f64 / frames,
+        s[10] as f64 / frames,
+    );
+}
+
 struct SectionHeap(Option<ID3D12Heap>, u64);
 
 // SAFETY: Direct3D 12 heaps are free-threaded.
@@ -271,6 +732,7 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
             let placed = place_run(section, offset, len);
             match &placed {
                 Some(_) => {
+                    port_placed(start, len);
                     let at = if window { 0 } else { 2 };
                     STATS[at].fetch_add(1, Ordering::Relaxed);
                     STATS[at + 1].fetch_add(len, Ordering::Relaxed);
@@ -377,6 +839,15 @@ fn say() {
     let last = LAST.load(Ordering::Relaxed);
     if now < last + 10_000 || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
         return;
+    }
+    if war_shadows_on() {
+        let runs = WAR_DEPTH.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default();
+        let draws = WAR_DRAWS.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default();
+        for (resource, (last, began, sets)) in runs {
+            if let Some((n, sum)) = draws.get(&resource) {
+                tracing::info!(resource = format_args!("{resource:#x}"), began, last, sets, draws = n, fingerprint = format_args!("{sum:016x}"), "renderer port 1 (diagnostics): a square depth target's last run of frames");
+            }
+        }
     }
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
     tracing::info!(

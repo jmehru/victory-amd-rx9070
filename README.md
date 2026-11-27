@@ -357,6 +357,13 @@ turns the PC upscaler off.
 `VICTORY_FFX_SIMPLE=1` takes the same calls with no upscaler: a bilinear
 scale with one jitter phase, to tell what FSR adds to a picture.
 
+Fullscreen: F11 or Alt+Enter switches the window between its frame and the
+whole monitor it is on (no frame, the picture's shape kept). To start that
+way set `VICTORY_FULLSCREEN=1` or `fullscreen = true` under `[window]` in
+`victory.toml`. DXGI's own Alt+Enter (exclusive fullscreen) is turned off
+for the window, for the plain swap chain and the frame-generation one
+(`VICTORY_FRAME_GEN=1`).
+
 ## Commands
 
 ```

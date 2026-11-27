@@ -223,6 +223,15 @@ struct Lower<'a> {
     /// ([`Lower::cbv_redirect`]), once asked.
     want_cbv: bool,
     cbv_ok: Option<bool>,
+    /// With [`super::cbv_raw`]: set by [`Lower::handle_as`] around the heap
+    /// index of a plain descriptor load (the only place a slot the host
+    /// names is read raw); set by [`Lower::heap_index`] when it gave such a
+    /// slot; and the handles made so, which are raw views
+    /// ([`Lower::cbuffer_dword`] and the rows of a scalar buffer load read
+    /// them raw).
+    cbv_raw_here: bool,
+    cbv_raw_hit: bool,
+    raw_cbvs: HashSet<V>,
     /// Element strides read from the host's table by heap slot
     /// ([`super::shader::SLOT_STRIDES`]), by block and descriptor load.
     strides: HashMap<(usize, Site, u8), V>,
@@ -1686,6 +1695,9 @@ impl<'a> Lower<'a> {
             handles: HashMap::new(),
             want_cbv: false,
             cbv_ok: None,
+            cbv_raw_here: false,
+            cbv_raw_hit: false,
+            raw_cbvs: HashSet::new(),
             strides: HashMap::new(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
@@ -6062,6 +6074,9 @@ impl<'a> Lower<'a> {
             _ => None,
         };
         let mut rows: HashMap<u32, V> = HashMap::new();
+        // A slot the host names read raw ([`super::cbv_raw`]): a row is four
+        // dwords of a raw view, floats as the raw load gives them.
+        let raw = self.raw_cbvs.contains(&h);
         for k in 0..count {
             let x = match constant {
                 Some(base) => {
@@ -6069,20 +6084,35 @@ impl<'a> Lower<'a> {
                     let row = match rows.get(&(byte >> 4)) {
                         Some(&r) => r,
                         None => {
-                            let ri = self.s.m.i32(byte >> 4);
-                            let r = self.s.op(
-                                c,
-                                "cbufferLoadLegacy.i32",
-                                Attr::ReadOnly,
-                                self.s.t.cbuf_ret,
-                                59,
-                                &[h, ri],
-                            );
+                            let r = if raw {
+                                let at = self.s.m.i32(byte & !15);
+                                let mask = self.s.m.i8(0xF);
+                                let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+                                self.s.op(
+                                    c,
+                                    "rawBufferLoad.f32",
+                                    Attr::ReadOnly,
+                                    self.s.t.res_ret,
+                                    139,
+                                    &[h, at, u, mask, al],
+                                )
+                            } else {
+                                let ri = self.s.m.i32(byte >> 4);
+                                self.s.op(
+                                    c,
+                                    "cbufferLoadLegacy.i32",
+                                    Attr::ReadOnly,
+                                    self.s.t.cbuf_ret,
+                                    59,
+                                    &[h, ri],
+                                )
+                            };
                             rows.insert(byte >> 4, r);
                             r
                         }
                     };
-                    self.s.m.extract(c, row, (byte >> 2) & 3)
+                    let x = self.s.m.extract(c, row, (byte >> 2) & 3);
+                    if raw { self.as_int(x) } else { x }
                 }
                 None => {
                     let off = self.s.m.i32(4 * k);
@@ -6430,6 +6460,17 @@ impl<'a> Lower<'a> {
     /// The dword at a computed byte address of a constant buffer.
     fn cbuffer_dword(&mut self, h: V, a: V) -> V {
         let c = self.cur;
+        if self.raw_cbvs.contains(&h) {
+            // A slot the host names read raw ([`super::cbv_raw`]): the dword
+            // that holds byte `a`, as a row's would be.
+            let not3 = self.s.m.i32(!3);
+            let at = self.s.m.bin(c, Bin::And, a, not3);
+            let mask = self.s.m.i8(1);
+            let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+            let r = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[h, at, u, mask, al]);
+            let x = self.s.m.extract(c, r, 0);
+            return self.as_int(x);
+        }
         let four = self.s.m.i32(4);
         let ri = self.s.m.bin(c, Bin::LShr, a, four);
         let r = self.s.op(
@@ -6782,13 +6823,23 @@ impl<'a> Lower<'a> {
                 if let Some(&h) = self.handles.get(&key) {
                     return Ok(h);
                 }
-                let index = self.heap_index(*load, *first, sampler)?;
+                // (The one place a slot the host names for a constant
+                // buffer is read raw, [`super::cbv_raw`].)
+                self.cbv_raw_here = true;
+                self.cbv_raw_hit = false;
+                let index = self.heap_index(*load, *first, sampler);
+                self.cbv_raw_here = false;
+                let raw = std::mem::take(&mut self.cbv_raw_hit);
+                let index = index?;
                 // A waterfall loop's load at the first lane's offset reads
                 // each lane's own entry (see `resource::Waterfall`).
                 let per_lane = self.x.res.waterfall.loads.contains(load);
                 let h = self
                     .s
-                    .heap_handle(self.cur, index, sampler, per_lane, props);
+                    .heap_handle(self.cur, index, sampler, per_lane, if raw { (11, 0) } else { props });
+                if raw {
+                    self.raw_cbvs.insert(h);
+                }
                 self.handles.insert(key, h);
                 Ok(h)
             }
@@ -7275,7 +7326,13 @@ impl<'a> Lower<'a> {
                         &self.x.p.blocks[load.0].insts[load.1].fields,
                         Fields::Smem { soffset: Operand::Scalar { code: NULL, .. }, .. }
                     );
-                if plain {
+                // Read raw ([`super::cbv_raw`]): the host makes every slot it
+                // names a raw view then, so only a load whose handle is made
+                // raw ([`Lower::handle_as`]) is given one; another (a
+                // descriptor chosen by control flow) takes the table afresh.
+                let raw = super::cbv_raw();
+                if plain && (!raw || self.cbv_raw_here) {
+                    self.cbv_raw_hit = raw;
                     return Ok(self.host_word(RootType::Other(super::shader::USER_CBV_SLOT), rp.slot, dword));
                 }
                 self.host_word(RootType::Other(super::shader::USER_CBV_FRESH), rp.slot, 0);
@@ -12881,6 +12938,54 @@ mod tests {
                 (0x100B, 0),    // buffer_store_dword on UAV @ 0
             ]
         );
+    }
+
+    /// `VICTORY_CBV_RAW=1` (`super::super::cbv_raw`): a table's constant
+    /// buffer at a known place is read from the slot the host names
+    /// (`USER_CBV_SLOT`) through a raw view (11), its dwords by raw loads; off,
+    /// through a constant buffer view (13), as before. One that is not at a
+    /// known place takes the table afresh either way.
+    #[test]
+    fn table_constant_buffers_read_raw_from_the_slot_the_host_names() {
+        use crate::emit::shader::{USER_CBV_FRESH, USER_CBV_SLOT};
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0 (the table)
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0 (the CBV)
+            0xF420_0184,
+            0xFA00_0004, // s_buffer_load_dword s6, s[8:11], 0x4
+            0xF420_01C4,
+            0xFA00_0018, // s_buffer_load_dword s7, s[8:11], 0x18
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0x7E02_0206, // v_mov_b32 v1, s6
+            0x4A02_0207, // v_add_nc_u32 v1, s7, v1
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let used = || {
+            vec![UsedResource {
+                kind: ResourceType::Cbv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            }]
+        };
+        let named = |l: &Lowered, code: u32| l.user_data.iter().any(|u| u.root == RootType::Other(code));
+        for raw in [false, true] {
+            crate::emit::CBV_RAW_HERE.set(Some(raw));
+            let l = lower_with(&words, vec![root(RootType::Table, 0, 0)], used()).unwrap();
+            crate::emit::CBV_RAW_HERE.set(None);
+            validate_dxil(&l.dxil);
+            assert!(named(&l, USER_CBV_SLOT), "raw {raw}");
+            assert!(!named(&l, USER_CBV_FRESH), "raw {raw}");
+            assert_eq!(l.heap_props, vec![if raw { (11, 0) } else { (13, 0x1_0000) }], "raw {raw}");
+        }
     }
 
     #[test]

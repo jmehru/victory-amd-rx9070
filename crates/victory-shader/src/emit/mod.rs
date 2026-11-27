@@ -189,6 +189,42 @@ pub fn cbv_slots() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CBV_SLOTS").is_none_or(|v| v != "0"))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// For a test's thread alone: [`cbv_raw`].
+    pub(crate) static CBV_RAW_HERE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether the constant buffers a program takes from the slots the host
+/// names ([`cbv_slots`]) are read there as raw bytes, through a raw buffer
+/// view, not as constant buffers (`VICTORY_CBV_RAW=1`; off by default).
+///
+/// A constant buffer view starts on 256 bytes and the console's buffers on
+/// 16, so the host showed such a buffer in its slot in place only where it
+/// lay on 256 bytes; every other one was copied for each list that named it:
+/// by the card out of the title's memory (`HostList::card_fill`, some 3,000
+/// copies a frame in the cell with `VICTORY_PORT_CONSTANTS=1`) or on the CPU
+/// at submission. A raw view starts on 16 bytes: the host makes the slot a
+/// raw view of the buffer where it lies (in place or in its host copy), and
+/// nothing is copied. (After Belobug's renderer port 5, `VICTORY_PORT_CBV`,
+/// commit 3920dc2, which reads through raw twins of every slot; here only
+/// the slots the host names, which the host makes for each draw anyway.)
+///
+/// Only a buffer at a place known when translating is read so (the plain
+/// loads [`cbv_slots`] redirects); one picked through control flow takes
+/// its table made afresh, as one at a computed place does.
+///
+/// Part of the translation: the shader cache keys on it (`victory-gpu`'s
+/// does); the host follows the same switch.
+pub fn cbv_raw() -> bool {
+    #[cfg(test)]
+    if let Some(on) = CBV_RAW_HERE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| cbv_slots() && std::env::var("VICTORY_CBV_RAW").is_ok_and(|v| v.trim() == "1"))
+}
+
 /// The clean-up passes that run over a translated program before it is
 /// written (`bitcode::opt`): a set of that module's pass bits. Every pass
 /// is exact, so the switch is for telling a translator fault from a

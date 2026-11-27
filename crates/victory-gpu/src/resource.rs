@@ -3185,8 +3185,10 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     let desc = &key;
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     // How many resources the filler alone would have added (a count for
-    // the log: `placed_filler_twins`).
-    if raw != key {
+    // the log: `placed_filler_twins`, which only diagnostics builds read:
+    // a second global lock and a set insert on every placed texture view a
+    // draw reads, twice, is left out of the others).
+    if cfg!(feature = "diagnostics") && raw != key {
         let mut seen = PLACED_RAW.lock().unwrap_or_else(|e| e.into_inner());
         if seen.insert((address, raw)) {
             let others = seen.range((address, [0; 14])..=(address, [u32::MAX; 14])).filter(|(_, r)| {

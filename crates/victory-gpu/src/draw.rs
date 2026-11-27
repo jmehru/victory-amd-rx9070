@@ -264,6 +264,42 @@ fn windows() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
 }
 
+/// Whether indirect executions whose arguments or count lie in title memory
+/// the card reads in place (renderer port 1, `VICTORY_PORT_CONSTANTS=1`) are
+/// clamped alone, right before they run (`VICTORY_PORT_CONSTANTS_ORDER=1`;
+/// off by default: in batches and windows as any other; `alt`: in turn,
+/// `crate::host::alt_phase`). After AvatarManz 631400f/15c3d0e.
+///
+/// Off here: in the cell nearly every draw (about 3,950 a frame) is an
+/// indirect one with its arguments in place, and each clamped alone is a
+/// pass of its own on the card: the card went from 70 % to 98 % busy and
+/// the frame from 46-49 ms to 70.5 (run pg-alt-list).
+///
+/// A batch or a window clamps records ahead: in a pass recorded where it
+/// was opened, before the commands between it and the execution that reads
+/// the record. For a host copy that is fine, its bytes are the title's of
+/// the submission. Where the card reads the title's memory in place, the
+/// records the title's culling passes write between the two are read
+/// before they are written: the execution draws an earlier frame's
+/// records, or none (palms and trees dropping out in the boat mission's
+/// cutscene there, with port 1 on).
+fn in_place_order() -> bool {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_PORT_CONSTANTS_ORDER").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => crate::host::alt_phase(),
+    }
+}
+
+/// Since the last frame line: indirect executions with arguments or count
+/// in place ([`in_place_order`]), and those clamped alone for it.
+static IN_PLACE_INDIRECT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 /// Whether indirect executions of one record are clamped in batches
 /// (`crate::indirect::batch`; `VICTORY_INDIRECT_BATCH=0`: each on its own, or
 /// in windows ([`windows`]); `2`: see below). A hand port of
@@ -648,6 +684,88 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     Some(gpu)
 }
 
+/// Per second ([`cbv_raw_line`]): constant buffers of the slots the host
+/// names made raw views ([`cbv_raw`]) where they lie: in place, in a host
+/// copy; and copied as before into the list's memory (no buffer of ours
+/// holds them, or not on 16 bytes there); of no bytes; and slots whose
+/// view was not a constant buffer (read as zeros).
+static CBV_RAW: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// `VICTORY_CBV_RAW=1` ([`victory_shader::emit::cbv_raw`]): slot `index`
+/// (a dynamic one) is made a raw view of the constant buffer of `size`
+/// bytes at title `address`, which the draw's shaders read raw. Where a
+/// buffer of ours holds it on 16 bytes (title memory in place, or a host
+/// copy, brought up to date at submission as any range a draw reads), the
+/// view is of the bytes there: nothing copied for the list, no step at
+/// submission (a constant buffer view needs 256 bytes, and the console's
+/// lie on 16: those were copied for each list, by the card out of memory in
+/// place or a copy in its memory, else on the CPU at submission). Else the
+/// bytes are copied into the list's memory as before.
+fn cbv_raw(list: &HostList, host: &crate::descriptor::host::HostHeap, index: u32, address: u64, size: u32) {
+    if size == 0 {
+        // Reads nothing, as a constant buffer view of no bytes does.
+        CBV_RAW[3].fetch_add(1, Ordering::Relaxed);
+        host.null_raw_at(index);
+        return;
+    }
+    let bytes = u64::from(size).next_multiple_of(16);
+    // A title buffer's copy (or the buffer in place); else, as a constant
+    // buffer view on 256 bytes found one, the copy `find` gives (which may
+    // be a window made for it).
+    let held = crate::shadow::existing(address, bytes).or_else(|| {
+        let aligned = u64::from(size).next_multiple_of(256);
+        (aligned <= 65536)
+            .then(|| crate::shadow::find(address, aligned))
+            .flatten()
+            .filter(|shadow| shadow.gpu(address) % 256 == 0 && shadow.left(address) >= aligned)
+    });
+    if let Some(shadow) = held
+        && shadow.offset(address) % 16 == 0
+        && shadow.left(address) >= 16
+    {
+        let len = bytes.min(shadow.left(address) & !3);
+        shadow.refresh(list, address, len);
+        list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
+        host.raw_constant_at(index, &shadow.buffer, shadow.offset(address), len);
+        CBV_RAW[usize::from(!shadow.in_place())].fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    CBV_RAW[2].fetch_add(1, Ordering::Relaxed);
+    match list.scratch_in(bytes) {
+        Some((buffer, at, to)) => {
+            list.defer_fill(to, address as *const u8, size as usize);
+            host.raw_constant_at(index, &buffer, at, bytes);
+        }
+        None => host.null_raw_at(index),
+    }
+}
+
+/// With the frame line: [`CBV_RAW`] per frame over `frames`, and the
+/// constant data copied for lists by the card (`HostList::card_fill`).
+pub(crate) fn cbv_raw_line(frames: f64) {
+    let frames = frames.max(1e-9);
+    let [place, copy, filled, empty, other] = [0, 1, 2, 3, 4].map(|i| CBV_RAW[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    static FILLS: AtomicU64 = AtomicU64::new(0);
+    let fills = crate::host::CARD_FILLS.load(Ordering::Relaxed);
+    let card = fills.saturating_sub(FILLS.swap(fills, Ordering::Relaxed)) as f64 / frames;
+    if place + copy + filled + empty + other > 0.0 {
+        tracing::info!(
+            "constant buffers read raw (VICTORY_CBV_RAW=1) per frame: {place:.0} where they lie in place, {copy:.0} in a host copy, \
+             {filled:.0} copied for the list as before, {empty:.0} of no bytes, {other:.0} not constant buffers (zeros); \
+             {card:.0} copied for lists by the card"
+        );
+    } else {
+        tracing::info!("constant data copied for lists by the card per frame: {card:.0}");
+    }
+    let [all, alone] = [0, 1].map(|i| IN_PLACE_INDIRECT[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    if all > 0.0 {
+        tracing::info!(
+            "renderer port 1: indirect executions with arguments or count in place per frame: {all:.0}, \
+             {alone:.0} of them clamped alone right before they ran (VICTORY_PORT_CONSTANTS_ORDER)"
+        );
+    }
+}
+
 macro_rules! once {
     ($($arg:tt)*) => {{
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -814,6 +932,8 @@ impl State {
             if crate::resource::depth_and_unordered(record.resource) {
                 crate::resource::DEPTH_UNORDERED[1].fetch_add(1, Ordering::Relaxed);
             }
+            // (Before the capture notes the target: it may list the frame.)
+            crate::inplace::war_depth_set(record.resource as usize, texture);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
             Some(host.dsv(texture, record.depth_desc().as_ref()))
@@ -3125,7 +3245,9 @@ impl State {
                             // As a table made afresh takes its constant
                             // buffers (below).
                             let aligned_size = size.next_multiple_of(256);
-                            if aligned_size > 0
+                            if victory_shader::emit::cbv_raw() {
+                                cbv_raw(list, host, index, address, size);
+                            } else if aligned_size > 0
                                 && aligned_size <= 65536
                                 && let Some(shadow) = crate::shadow::find(address, u64::from(aligned_size))
                                 && shadow.gpu(address) % 256 == 0
@@ -3147,6 +3269,19 @@ impl State {
                             index
                         }
                     }
+                }
+                // Not a constant buffer after all, read raw
+                // ([`cbv_raw`]): zeros through a raw view, not the title's
+                // view of another kind read as one.
+                _ if victory_shader::emit::cbv_raw() => {
+                    CBV_RAW[4].fetch_add(1, Ordering::Relaxed);
+                    let Some(index) = host.dynamic(1) else {
+                        made.push((slot, u32::MAX));
+                        continue;
+                    };
+                    self.dynamic.push((std::ptr::from_ref(heap) as usize, index, 1));
+                    host.null_raw_at(index);
+                    index
                 }
                 // Not a constant buffer after all: what the title's slot shows.
                 _ => {
@@ -3573,6 +3708,7 @@ impl State {
     /// A draw with the list's pipeline was recorded (as
     /// [`State::buffers_written`] if its shaders can store to buffers).
     fn drew(&mut self) {
+        crate::inplace::war_depth_drew(self.depth, self.pipeline);
         if self.batch.is_none() {
             return;
         }
@@ -3712,6 +3848,19 @@ impl State {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
         }
+        // Renderer port 1: arguments (or their count) in the title's memory
+        // read in place ([`in_place_order`]): clamped alone, right before
+        // their execution, not ahead in a batch or a window.
+        let in_place = crate::inplace::port_constants()
+            && (args.in_place() || counter.as_ref().is_some_and(|(s, _)| s.in_place()));
+        let alone = in_place && in_place_order();
+        if in_place {
+            IN_PLACE_INDIRECT[0].fetch_add(1, Ordering::Relaxed);
+            IN_PLACE_INDIRECT[1].fetch_add(u64::from(alone), Ordering::Relaxed);
+        }
+        if alone {
+            self.batch = None;
+        }
         // A window of records clamped in one pass (`windows`): for single
         // records without a count buffer, drawn by shaders that store to no
         // buffer. Anything else ends the window: it uses the scratch buffer
@@ -3727,7 +3876,7 @@ impl State {
         };
         // One record without a count: clamped in a batch (`batches`). Not a
         // dispatch run in parts, which the clamp of one writes.
-        let batch = if batches() > 0 && max == 1 && count.is_none() && parts.is_none() {
+        let batch = if !alone && batches() > 0 && max == 1 && count.is_none() && parts.is_none() {
             args.refresh(list, arguments, len);
             self.batched(list, &args, arguments, kind)
         } else {
@@ -3735,6 +3884,7 @@ impl State {
         };
         let batched = batch.is_some();
         let windowed = !batched
+            && !alone
             && windows()
             && kind != DISPATCH
             && max == 1

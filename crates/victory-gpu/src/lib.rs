@@ -29,6 +29,7 @@ mod draw;
 pub mod dxgi;
 #[cfg(windows)]
 pub mod ffx;
+pub mod fullscreen;
 pub mod fence;
 pub mod frame;
 #[cfg_attr(not(windows), allow(dead_code))]

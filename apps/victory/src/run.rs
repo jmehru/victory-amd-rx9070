@@ -22,6 +22,7 @@ pub fn run(
     // The PC upscaler's folder, from the environment or `victory.toml`:
     // named before anything asks whether the upscaler is used.
     victory_hle::modules::ffx::set_dir(cfg.ffx_dir.clone());
+    victory_hle::fullscreen::set(cfg.fullscreen);
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
