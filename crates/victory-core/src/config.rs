@@ -25,6 +25,9 @@ pub struct Config {
     /// The folder of AMD's FidelityFX SDK binaries (`signedbin`) whose PC
     /// upscaler answers the title's FidelityFX calls; `None`: not used.
     pub ffx_dir: Option<PathBuf>,
+    /// Whether the window starts fullscreen (without a frame, on the
+    /// monitor it is on).
+    pub fullscreen: bool,
     /// The config file that was read, if any.
     pub source: Option<PathBuf>,
 }
@@ -34,6 +37,15 @@ pub struct Config {
 struct FileConfig {
     #[serde(default)]
     paths: FilePaths,
+    #[serde(default)]
+    window: FileWindow,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileWindow {
+    #[serde(default)]
+    fullscreen: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -74,7 +86,9 @@ impl Config {
             }
             None => (None, FileConfig::default()),
         };
-        Self::resolve(parsed.paths, source, |k| std::env::var_os(k))
+        let mut cfg = Self::resolve(parsed.paths, source, |k| std::env::var_os(k))?;
+        cfg.fullscreen = fullscreen(parsed.window.fullscreen, std::env::var_os("VICTORY_FULLSCREEN"));
+        Ok(cfg)
     }
 
     fn resolve(
@@ -106,6 +120,7 @@ impl Config {
             data_dir,
             test_titles,
             ffx_dir,
+            fullscreen: false,
             source,
         })
     }
@@ -126,6 +141,15 @@ impl Config {
     /// Returns `<data>/<sub>`, creating it, after checking the asset policy.
     pub fn data_subdir(&self, sub: &str) -> Result<PathBuf> {
         subdir(&self.data_dir, sub)
+    }
+}
+
+/// Whether the window starts fullscreen: `VICTORY_FULLSCREEN` if it is set
+/// and not empty (`0` is no, anything else yes), else the file's key.
+fn fullscreen(file: bool, env: Option<std::ffi::OsString>) -> bool {
+    match env {
+        Some(v) if !v.is_empty() => v != "0",
+        _ => file,
     }
 }
 
@@ -177,6 +201,17 @@ mod tests {
         assert_eq!(with(Some("")), None);
         let none = Config::resolve(FilePaths::default(), None, |_| None).unwrap();
         assert_eq!(none.ffx_dir, None);
+    }
+
+    #[test]
+    fn fullscreen_is_the_environments_then_the_files() {
+        assert!(!fullscreen(false, None));
+        assert!(fullscreen(true, None));
+        assert!(fullscreen(false, Some("1".into())));
+        assert!(!fullscreen(true, Some("0".into())));
+        assert!(fullscreen(true, Some("".into())));
+        let parsed: FileConfig = toml::from_str("[window]\nfullscreen = true\n").unwrap();
+        assert!(parsed.window.fullscreen);
     }
 
     #[test]

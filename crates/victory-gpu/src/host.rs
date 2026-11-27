@@ -7710,6 +7710,11 @@ impl Host {
             Some(hwnd) => hwnd,
             None => window(width, height)?,
         };
+        // Fullscreen if asked for (by the watcher's thread, not this one,
+        // once the first pictures are shown), and F11 and Alt+Enter from
+        // now on: the swap chain keeps the picture's size and the system
+        // scales it.
+        crate::fullscreen::watch(hwnd, width, height);
         self.log_video_memory("right before the swap chain is made");
         // SAFETY: plain object creation for our window.
         unsafe {
@@ -7741,6 +7746,16 @@ impl Host {
                     .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
                     .cast::<IDXGISwapChain3>()?,
             };
+            // DXGI's own Alt+Enter (a switch to exclusive fullscreen) is
+            // not taken: F11 and Alt+Enter switch the window between its
+            // frame and the whole monitor (`crate::fullscreen`), and both at
+            // once froze the picture (klbf-lab's README, RX 9070 XT). On the
+            // factory the swap chain was made with, for the frame-generation
+            // one (made through FidelityFX) as for the plain one.
+            let _ = factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
+            if let Ok(parent) = swap_chain.GetParent::<IDXGIFactory1>() {
+                let _ = parent.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
+            }
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
