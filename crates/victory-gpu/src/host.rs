@@ -6322,6 +6322,39 @@ impl HostList {
         Some((gpu + at, (data + at as usize) as *mut u8))
     }
 
+    /// [`HostList::scratch`] for a view of it: the upload buffer that holds
+    /// the bytes, their offset in it (a multiple of 256) and the CPU
+    /// pointer (a raw view needs the buffer, not an address).
+    pub(crate) fn scratch_in(&self, len: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
+        let host = host()?;
+        let len = len.max(1).next_multiple_of(256);
+        if len > SCRATCH_CHUNK {
+            let (buffer, data) = host.upload_buffer(len)?;
+            name(&buffer, || format!("list scratch {len:#x}"));
+            self.deferred().hold_upload(buffer.clone(), len);
+            return Some((buffer, 0, data));
+        }
+        let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+        while s.current < s.chunks.len() && s.used + len > s.chunks[s.current].1 {
+            (s.current, s.used) = (s.current + 1, 0);
+        }
+        if s.current == s.chunks.len() {
+            let size = if scratch_pool() && s.chunks.is_empty() && len <= SCRATCH_FIRST {
+                SCRATCH_FIRST
+            } else {
+                SCRATCH_CHUNK
+            };
+            let chunk = take_chunk(host, size)?;
+            s.chunks.push((chunk, size));
+            s.used = 0;
+        }
+        let chunk = &s.chunks[s.current].0;
+        let (buffer, data) = (chunk._buffer.clone(), chunk.data);
+        let at = s.used;
+        s.used += len;
+        Some((buffer, at, (data + at as usize) as *mut u8))
+    }
+
     /// The bytes of scratch chunks the list holds now (after a reset:
     /// none while lists share their chunks).
     pub(crate) fn scratch_kept(&self) -> u64 {
@@ -7326,6 +7359,7 @@ impl Meter {
                 );
             }
         }
+        crate::draw::cbv_raw_line(frames);
         // Passes over the heap's buffer views for shaders that pick them by index.
         let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;
         let picked_ms =

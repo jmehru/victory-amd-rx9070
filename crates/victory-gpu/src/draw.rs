@@ -648,6 +648,81 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     Some(gpu)
 }
 
+/// Per second ([`cbv_raw_line`]): constant buffers of the slots the host
+/// names made raw views ([`cbv_raw`]) where they lie: in place, in a host
+/// copy; and copied as before into the list's memory (no buffer of ours
+/// holds them, or not on 16 bytes there); of no bytes; and slots whose
+/// view was not a constant buffer (read as zeros).
+static CBV_RAW: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// `VICTORY_CBV_RAW=1` ([`victory_shader::emit::cbv_raw`]): slot `index`
+/// (a dynamic one) is made a raw view of the constant buffer of `size`
+/// bytes at title `address`, which the draw's shaders read raw. Where a
+/// buffer of ours holds it on 16 bytes (title memory in place, or a host
+/// copy, brought up to date at submission as any range a draw reads), the
+/// view is of the bytes there: nothing copied for the list, no step at
+/// submission (a constant buffer view needs 256 bytes, and the console's
+/// lie on 16: those were copied for each list, by the card out of memory in
+/// place or a copy in its memory, else on the CPU at submission). Else the
+/// bytes are copied into the list's memory as before.
+fn cbv_raw(list: &HostList, host: &crate::descriptor::host::HostHeap, index: u32, address: u64, size: u32) {
+    if size == 0 {
+        // Reads nothing, as a constant buffer view of no bytes does.
+        CBV_RAW[3].fetch_add(1, Ordering::Relaxed);
+        host.null_raw_at(index);
+        return;
+    }
+    let bytes = u64::from(size).next_multiple_of(16);
+    // A title buffer's copy (or the buffer in place); else, as a constant
+    // buffer view on 256 bytes found one, the copy `find` gives (which may
+    // be a window made for it).
+    let held = crate::shadow::existing(address, bytes).or_else(|| {
+        let aligned = u64::from(size).next_multiple_of(256);
+        (aligned <= 65536)
+            .then(|| crate::shadow::find(address, aligned))
+            .flatten()
+            .filter(|shadow| shadow.gpu(address) % 256 == 0 && shadow.left(address) >= aligned)
+    });
+    if let Some(shadow) = held
+        && shadow.offset(address) % 16 == 0
+        && shadow.left(address) >= 16
+    {
+        let len = bytes.min(shadow.left(address) & !3);
+        shadow.refresh(list, address, len);
+        list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
+        host.raw_constant_at(index, &shadow.buffer, shadow.offset(address), len);
+        CBV_RAW[usize::from(!shadow.in_place())].fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    CBV_RAW[2].fetch_add(1, Ordering::Relaxed);
+    match list.scratch_in(bytes) {
+        Some((buffer, at, to)) => {
+            list.defer_fill(to, address as *const u8, size as usize);
+            host.raw_constant_at(index, &buffer, at, bytes);
+        }
+        None => host.null_raw_at(index),
+    }
+}
+
+/// With the frame line: [`CBV_RAW`] per frame over `frames`, and the
+/// constant data copied for lists by the card (`HostList::card_fill`).
+pub(crate) fn cbv_raw_line(frames: f64) {
+    let frames = frames.max(1e-9);
+    let [place, copy, filled, empty, other] = [0, 1, 2, 3, 4].map(|i| CBV_RAW[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    static FILLS: AtomicU64 = AtomicU64::new(0);
+    let fills = crate::host::CARD_FILLS.load(Ordering::Relaxed);
+    let card = fills.saturating_sub(FILLS.swap(fills, Ordering::Relaxed)) as f64 / frames;
+    if place + copy + filled + empty + other > 0.0 {
+        tracing::info!(
+            "constant buffers read raw (VICTORY_CBV_RAW=1) per frame: {place:.0} where they lie in place, {copy:.0} in a host copy, \
+             {filled:.0} copied for the list as before, {empty:.0} of no bytes, {other:.0} not constant buffers (zeros); \
+             {card:.0} copied for lists by the card"
+        );
+    } else {
+        tracing::info!("constant data copied for lists by the card per frame: {card:.0}");
+    }
+}
+
 macro_rules! once {
     ($($arg:tt)*) => {{
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -3127,7 +3202,9 @@ impl State {
                             // As a table made afresh takes its constant
                             // buffers (below).
                             let aligned_size = size.next_multiple_of(256);
-                            if aligned_size > 0
+                            if victory_shader::emit::cbv_raw() {
+                                cbv_raw(list, host, index, address, size);
+                            } else if aligned_size > 0
                                 && aligned_size <= 65536
                                 && let Some(shadow) = crate::shadow::find(address, u64::from(aligned_size))
                                 && shadow.gpu(address) % 256 == 0
@@ -3149,6 +3226,19 @@ impl State {
                             index
                         }
                     }
+                }
+                // Not a constant buffer after all, read raw
+                // ([`cbv_raw`]): zeros through a raw view, not the title's
+                // view of another kind read as one.
+                _ if victory_shader::emit::cbv_raw() => {
+                    CBV_RAW[4].fetch_add(1, Ordering::Relaxed);
+                    let Some(index) = host.dynamic(1) else {
+                        made.push((slot, u32::MAX));
+                        continue;
+                    };
+                    self.dynamic.push((std::ptr::from_ref(heap) as usize, index, 1));
+                    host.null_raw_at(index);
+                    index
                 }
                 // Not a constant buffer after all: what the title's slot shows.
                 _ => {

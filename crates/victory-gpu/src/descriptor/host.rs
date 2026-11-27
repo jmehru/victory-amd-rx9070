@@ -1800,6 +1800,36 @@ impl HostHeap {
         self.keep(index, Some(buffer.clone()));
     }
 
+    /// Makes slot `index` (a dynamic one) a raw buffer view of a constant
+    /// buffer (`victory_shader::emit::cbv_raw`): `len` bytes of `buffer`
+    /// from byte `offset` (a multiple of 16). As [`HostHeap::constant_at`],
+    /// the slot keeps nothing: the list that binds it holds the buffer (a
+    /// title buffer's copy or memory in place it reads, or its own upload
+    /// memory), and a draw's slot is made anew by the next draw that takes
+    /// it, thousands of times a frame.
+    pub(crate) fn raw_constant_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
+        self.keep(index, None);
+        let Some(host) = host() else { return };
+        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    FirstElement: offset / 4,
+                    NumElements: (len / 4).clamp(1, u64::from(u32::MAX)) as u32,
+                    StructureByteStride: 0,
+                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                },
+            },
+        };
+        // SAFETY: a slot of our heap and a live buffer covering the range.
+        unsafe {
+            host.device
+                .CreateShaderResourceView(buffer, Some(&desc), self.cpu(index))
+        };
+    }
+
     /// Makes slot `index` (a dynamic one) a raw buffer view that reads
     /// zeros.
     pub(crate) fn null_raw_at(&self, index: u32) {
