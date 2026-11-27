@@ -264,6 +264,42 @@ fn windows() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
 }
 
+/// Whether indirect executions whose arguments or count lie in title memory
+/// the card reads in place (renderer port 1, `VICTORY_PORT_CONSTANTS=1`) are
+/// clamped alone, right before they run (`VICTORY_PORT_CONSTANTS_ORDER=1`;
+/// off by default: in batches and windows as any other; `alt`: in turn,
+/// `crate::host::alt_phase`). After AvatarManz 631400f/15c3d0e.
+///
+/// Off here: in the cell nearly every draw (about 3,950 a frame) is an
+/// indirect one with its arguments in place, and each clamped alone is a
+/// pass of its own on the card: the card went from 70 % to 98 % busy and
+/// the frame from 46-49 ms to 70.5 (run pg-alt-list).
+///
+/// A batch or a window clamps records ahead: in a pass recorded where it
+/// was opened, before the commands between it and the execution that reads
+/// the record. For a host copy that is fine, its bytes are the title's of
+/// the submission. Where the card reads the title's memory in place, the
+/// records the title's culling passes write between the two are read
+/// before they are written: the execution draws an earlier frame's
+/// records, or none (palms and trees dropping out in the boat mission's
+/// cutscene there, with port 1 on).
+fn in_place_order() -> bool {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_PORT_CONSTANTS_ORDER").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => crate::host::alt_phase(),
+    }
+}
+
+/// Since the last frame line: indirect executions with arguments or count
+/// in place ([`in_place_order`]), and those clamped alone for it.
+static IN_PLACE_INDIRECT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 /// Whether indirect executions of one record are clamped in batches
 /// (`crate::indirect::batch`; `VICTORY_INDIRECT_BATCH=0`: each on its own, or
 /// in windows ([`windows`]); `2`: see below). A hand port of
@@ -720,6 +756,13 @@ pub(crate) fn cbv_raw_line(frames: f64) {
         );
     } else {
         tracing::info!("constant data copied for lists by the card per frame: {card:.0}");
+    }
+    let [all, alone] = [0, 1].map(|i| IN_PLACE_INDIRECT[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    if all > 0.0 {
+        tracing::info!(
+            "renderer port 1: indirect executions with arguments or count in place per frame: {all:.0}, \
+             {alone:.0} of them clamped alone right before they ran (VICTORY_PORT_CONSTANTS_ORDER)"
+        );
     }
 }
 
@@ -3805,6 +3848,19 @@ impl State {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
         }
+        // Renderer port 1: arguments (or their count) in the title's memory
+        // read in place ([`in_place_order`]): clamped alone, right before
+        // their execution, not ahead in a batch or a window.
+        let in_place = crate::inplace::port_constants()
+            && (args.in_place() || counter.as_ref().is_some_and(|(s, _)| s.in_place()));
+        let alone = in_place && in_place_order();
+        if in_place {
+            IN_PLACE_INDIRECT[0].fetch_add(1, Ordering::Relaxed);
+            IN_PLACE_INDIRECT[1].fetch_add(u64::from(alone), Ordering::Relaxed);
+        }
+        if alone {
+            self.batch = None;
+        }
         // A window of records clamped in one pass (`windows`): for single
         // records without a count buffer, drawn by shaders that store to no
         // buffer. Anything else ends the window: it uses the scratch buffer
@@ -3820,7 +3876,7 @@ impl State {
         };
         // One record without a count: clamped in a batch (`batches`). Not a
         // dispatch run in parts, which the clamp of one writes.
-        let batch = if batches() > 0 && max == 1 && count.is_none() && parts.is_none() {
+        let batch = if !alone && batches() > 0 && max == 1 && count.is_none() && parts.is_none() {
             args.refresh(list, arguments, len);
             self.batched(list, &args, arguments, kind)
         } else {
@@ -3828,6 +3884,7 @@ impl State {
         };
         let batched = batch.is_some();
         let windowed = !batched
+            && !alone
             && windows()
             && kind != DISPATCH
             && max == 1
