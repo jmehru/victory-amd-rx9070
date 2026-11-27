@@ -230,8 +230,52 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 /// The most host lists kept idle, and the most upload memory they may keep
 /// between them (a list keeps scratch chunks over a reset only while lists
 /// do not share them, `VICTORY_SCRATCH_POOL=0`).
+///
+/// 512 lists (128 before): lists come back from their flights in bursts,
+/// and past 128 idle the rest were thrown away and others made new a
+/// moment later, 1.3 a frame in the cell (each a few allocations the
+/// graphics kernel makes and frees: 2.4 ms a frame of the submitting
+/// thread in profile pf3p-cell). With 512, 0.06 a frame, preparing 1.1 ms
+/// less, idle lists 56 -> 70 (run pg-alt-list2, twenty seconds each in turn).
 #[cfg(windows)]
-const IDLE_MOST: (usize, u64) = (128, 256 << 20);
+const IDLE_MOST: (usize, u64) = (512, 256 << 20);
+
+/// The most host lists kept idle ([`IDLE_MOST`]'s count; `VICTORY_LIST_IDLE_MOST`,
+/// or `alt:N`: the default and N in turn, `crate::host::alt_phase`).
+#[cfg(windows)]
+fn idle_most() -> usize {
+    static MOST: std::sync::OnceLock<(usize, Option<usize>)> = std::sync::OnceLock::new();
+    let (plain, alt) = *MOST.get_or_init(|| {
+        crate::host::alt_value(&std::env::var("VICTORY_LIST_IDLE_MOST").unwrap_or_default(), IDLE_MOST.0)
+    });
+    match alt {
+        Some(other) if crate::host::alt_phase() => other,
+        _ => plain,
+    }
+}
+
+/// Since the last frame line ([`churn_line`]): host lists made new because
+/// none was idle ([`fresh_list`]), and host lists thrown away after their
+/// run ([`recycle`]) because they did not run, because the idle ones were
+/// as many as kept ([`idle_most`]), because of the upload memory they keep.
+/// Each made and thrown away is driver memory made and freed (the graphics
+/// kernel's `DestroyAllocation2` was 2.4 ms a frame of the submitting
+/// thread in the cell, profile pf3p-cell).
+#[cfg(windows)]
+static CHURN: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// With the frame line: [`CHURN`] per frame over `frames`.
+#[cfg(windows)]
+pub(crate) fn churn_line(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let [made, not_run, full, bytes] = [0, 1, 2, 3].map(|i| CHURN[i].swap(0, Relaxed) as f64 / frames.max(1e-9));
+    let idle = IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len();
+    tracing::info!(
+        "host lists per frame: {made:.1} made new (none idle); thrown away after their run: {not_run:.1} not run, \
+         {full:.1} with {} idle already (VICTORY_LIST_IDLE_MOST), {bytes:.1} for their memory; {idle} idle now",
+        idle_most()
+    );
+}
 
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
@@ -255,7 +299,10 @@ fn fresh_list() -> Option<crate::host::HostList> {
     };
     match idle {
         Some(Idle(list, _)) => Some(list),
-        None => crate::host::host().and_then(|h| h.new_list().ok()),
+        None => {
+            CHURN[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::host::host().and_then(|h| h.new_list().ok())
+        }
     }
 }
 
@@ -272,7 +319,13 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        let most = idle_most();
+        if !ran.contains(&i) {
+            CHURN[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            continue;
+        }
+        if IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= most {
+            CHURN[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             continue;
         }
         // As the title's reset does: what the list kept for its commands
@@ -280,9 +333,11 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         host.reset();
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
+        if idle.0.len() < most && idle.1 + bytes <= IDLE_MOST.1 {
             idle.0.push(Idle(host, bytes));
             idle.1 += bytes;
+        } else {
+            CHURN[if idle.0.len() < most { 3 } else { 2 }].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }

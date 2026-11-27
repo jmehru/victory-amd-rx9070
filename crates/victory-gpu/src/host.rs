@@ -2683,10 +2683,38 @@ mod relay_tests {
 /// memory and scratch chunks are held until then, and a frame's lists held
 /// all at once ran the slots out before (run 45).
 fn late_most() -> usize {
-    static MOST: OnceLock<usize> = OnceLock::new();
-    *MOST.get_or_init(|| {
-        std::env::var("VICTORY_LATE_WAIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(128).max(1)
-    })
+    static MOST: OnceLock<(usize, Option<usize>)> = OnceLock::new();
+    let (plain, alt) = *MOST.get_or_init(|| {
+        let v = std::env::var("VICTORY_LATE_WAIT_LISTS").unwrap_or_default();
+        alt_value(&v, 128)
+    });
+    match alt {
+        Some(other) if alt_phase() => other.max(1),
+        _ => plain.max(1),
+    }
+}
+
+/// A switch's value `v`: a number (or `default` if none), or `alt:N`
+/// ([`alt_phase`]): `default` and `N` in turn.
+pub(crate) fn alt_value(v: &str, default: usize) -> (usize, Option<usize>) {
+    match v.trim().strip_prefix("alt:") {
+        Some(n) => (default, n.trim().parse().ok()),
+        None => (v.trim().parse().unwrap_or(default), None),
+    }
+}
+
+/// For a switch set to `alt` (one at a time): whether it is on now. Twenty
+/// seconds off, twenty on, in turn, from the first ask, each change said
+/// in the log ("A/B phase"), so that one run measures both sides of a
+/// switch at the same place, without the noise between runs.
+pub(crate) fn alt_phase() -> bool {
+    static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+    static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+    let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+    if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+        tracing::info!("A/B phase from now: {}", if on { "ON" } else { "off" });
+    }
+    on
 }
 
 /// Whether a submission with bottom-of-pipe writes may fly
@@ -7360,6 +7388,7 @@ impl Meter {
             }
         }
         crate::draw::cbv_raw_line(frames);
+        crate::list::churn_line(frames);
         // Passes over the heap's buffer views for shaders that pick them by index.
         let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;
         let picked_ms =
