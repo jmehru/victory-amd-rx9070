@@ -67,6 +67,11 @@ fn build() -> &'static [u8; 32] {
             u32::from(victory_shader::emit::group_sync()),
             // And which clean-up passes ran over the translated code.
             victory_shader::emit::shader_opt(),
+            // And where a table's constant buffers are read from (by what
+            // is in force, not by the switch's text: it is on when unset).
+            u32::from(victory_shader::emit::cbv_slots()),
+            // And whether those are read raw (`VICTORY_CBV_RAW=1`).
+            u32::from(victory_shader::emit::cbv_raw()),
         ] {
             hash.update(&n.to_le_bytes());
         }
@@ -86,6 +91,9 @@ fn build() -> &'static [u8; 32] {
             "VICTORY_PS_HALVES",
             "VICTORY_NAN_GUARD",
             "VICTORY_DENORM",
+            "VICTORY_QUAD_HELPERS",
+            "VICTORY_QUAD_PRESENT",
+            "VICTORY_QUAD_DEPTH_ONLY",
         ] {
             hash.update(name.as_bytes());
             hash.update(b"=");
@@ -94,6 +102,13 @@ fn build() -> &'static [u8; 32] {
             }
             hash.update(&[0]);
         }
+        // `VICTORY_SHADER_CACHE_SALT=<text>`: a cache of its own for the
+        // text, to see a run that finds nothing translated (a first run
+        // after an update) without touching the cache in use.
+        if let Some(salt) = std::env::var_os("VICTORY_SHADER_CACHE_SALT") {
+            hash.update(b"salt=");
+            hash.update(salt.as_encoded_bytes());
+        }
         *hash.finalize().as_bytes()
     })
 }
@@ -101,11 +116,38 @@ fn build() -> &'static [u8; 32] {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    // Local (bisecting the quad reads): `VICTORY_QUAD_LIST=<file>` of
+    // program hashes (16 hex digits, as the log names them) turns quad reads
+    // on for those programs alone; such a program's entry is keyed apart.
+    let picked = quad_list().map(|list| list.contains(&blake3::hash(container).to_hex()[..16]));
+    let translate = move |c: &[u8]| {
+        victory_shader::emit::set_quad_for_this(picked);
+        let r = victory_shader::emit::translate(c).map_err(|e| e.to_string());
+        victory_shader::emit::set_quad_for_this(None);
+        r
+    };
+    let mut key = *build();
+    if picked == Some(true) {
+        key[31] ^= 0x5A;
+    }
     match CACHE.get() {
-        Some(cache) => cached(cache, build(), container, translate),
+        Some(cache) => cached(cache, &key, container, translate),
         None => translate(container),
     }
+}
+
+/// The hashes of `VICTORY_QUAD_LIST`'s file, if it is set.
+fn quad_list() -> Option<&'static std::collections::HashSet<String>> {
+    static LIST: OnceLock<Option<std::collections::HashSet<String>>> = OnceLock::new();
+    LIST.get_or_init(|| {
+        let path = std::env::var_os("VICTORY_QUAD_LIST")?;
+        let text = std::fs::read_to_string(path).ok()?;
+        let set: std::collections::HashSet<String> =
+            text.split(|c: char| !c.is_ascii_hexdigit()).filter(|w| w.len() == 16).map(str::to_owned).collect();
+        tracing::info!(programs = set.len(), "VICTORY_QUAD_LIST: quad reads for these programs alone");
+        Some(set)
+    })
+    .as_ref()
 }
 
 /// The cache entry's converter: the build and the container in, the

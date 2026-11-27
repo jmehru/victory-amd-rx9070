@@ -110,11 +110,12 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use lower::{host_max_wave, set_host_max_wave, set_host_pixel_wave};
+pub use lower::{host_max_wave, set_host_max_wave, set_host_pixel_wave, set_quad_for_this};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    SLOT_STRIDES_COUNT, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    USER_CBV_FRESH, USER_CBV_SLOT,
     set_view_heap_limit, view_heap_limit,
 };
 
@@ -166,6 +167,62 @@ pub fn group_sync() -> u8 {
         Some("1") => 1,
         _ => 2,
     })
+}
+
+/// Whether a program takes the constant buffers of its descriptor tables
+/// from view heap slots the host names one by one
+/// ([`shader::USER_CBV_SLOT`]), not from the table (`VICTORY_CBV_SLOTS=0`: from
+/// the table, as before).
+///
+/// The host wants constant buffers on 256 bytes and the console's are on 16,
+/// so the host cannot show a table's constant buffer in the title's own
+/// slot: it made the whole table afresh for every draw, with every other
+/// view in it, though the draws' tables differ in their constant buffer
+/// alone (8,000 tables and 55,000 views a frame, profile p4). With this a
+/// draw reads the other views from the title's table and the host makes one
+/// slot for a constant buffer.
+///
+/// Part of the translation: the shader cache keys on it (`victory-gpu`'s
+/// does).
+pub fn cbv_slots() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CBV_SLOTS").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// For a test's thread alone: [`cbv_raw`].
+    pub(crate) static CBV_RAW_HERE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether the constant buffers a program takes from the slots the host
+/// names ([`cbv_slots`]) are read there as raw bytes, through a raw buffer
+/// view, not as constant buffers (`VICTORY_CBV_RAW=1`; off by default).
+///
+/// A constant buffer view starts on 256 bytes and the console's buffers on
+/// 16, so the host showed such a buffer in its slot in place only where it
+/// lay on 256 bytes; every other one was copied for each list that named it:
+/// by the card out of the title's memory (`HostList::card_fill`, some 3,000
+/// copies a frame in the cell with `VICTORY_PORT_CONSTANTS=1`) or on the CPU
+/// at submission. A raw view starts on 16 bytes: the host makes the slot a
+/// raw view of the buffer where it lies (in place or in its host copy), and
+/// nothing is copied. (After Belobug's renderer port 5, `VICTORY_PORT_CBV`,
+/// commit 3920dc2, which reads through raw twins of every slot; here only
+/// the slots the host names, which the host makes for each draw anyway.)
+///
+/// Only a buffer at a place known when translating is read so (the plain
+/// loads [`cbv_slots`] redirects); one picked through control flow takes
+/// its table made afresh, as one at a computed place does.
+///
+/// Part of the translation: the shader cache keys on it (`victory-gpu`'s
+/// does); the host follows the same switch.
+pub fn cbv_raw() -> bool {
+    #[cfg(test)]
+    if let Some(on) = CBV_RAW_HERE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| cbv_slots() && std::env::var("VICTORY_CBV_RAW").is_ok_and(|v| v.trim() == "1"))
 }
 
 /// The clean-up passes that run over a translated program before it is

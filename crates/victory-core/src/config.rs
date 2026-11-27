@@ -22,6 +22,12 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// Other titles used to exercise platform-level code.
     pub test_titles: Vec<PathBuf>,
+    /// The folder of AMD's FidelityFX SDK binaries (`signedbin`) whose PC
+    /// upscaler answers the title's FidelityFX calls; `None`: not used.
+    pub ffx_dir: Option<PathBuf>,
+    /// Whether the window starts fullscreen (without a frame, on the
+    /// monitor it is on).
+    pub fullscreen: bool,
     /// The config file that was read, if any.
     pub source: Option<PathBuf>,
 }
@@ -31,6 +37,15 @@ pub struct Config {
 struct FileConfig {
     #[serde(default)]
     paths: FilePaths,
+    #[serde(default)]
+    window: FileWindow,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileWindow {
+    #[serde(default)]
+    fullscreen: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -41,6 +56,7 @@ struct FilePaths {
     data_dir: Option<PathBuf>,
     #[serde(default)]
     test_titles: Vec<PathBuf>,
+    ffx_dir: Option<PathBuf>,
 }
 
 impl Config {
@@ -70,7 +86,9 @@ impl Config {
             }
             None => (None, FileConfig::default()),
         };
-        Self::resolve(parsed.paths, source, |k| std::env::var_os(k))
+        let mut cfg = Self::resolve(parsed.paths, source, |k| std::env::var_os(k))?;
+        cfg.fullscreen = fullscreen(parsed.window.fullscreen, std::env::var_os("VICTORY_FULLSCREEN"));
+        Ok(cfg)
     }
 
     fn resolve(
@@ -91,11 +109,18 @@ impl Config {
         let data_dir = env_path("VICTORY_DATA_DIR")
             .or(file.data_dir)
             .map_or_else(|| default_dir("data"), Ok)?;
+        // Set and empty turns it off, whatever the file says.
+        let ffx_dir = match env("VICTORY_FFX_DIR") {
+            Some(v) => (!v.is_empty()).then(|| PathBuf::from(v)),
+            None => file.ffx_dir,
+        };
         Ok(Config {
             game_dir: env_path("VICTORY_GAME_DIR").or(file.game_dir),
             cache_dir,
             data_dir,
             test_titles,
+            ffx_dir,
+            fullscreen: false,
             source,
         })
     }
@@ -116,6 +141,15 @@ impl Config {
     /// Returns `<data>/<sub>`, creating it, after checking the asset policy.
     pub fn data_subdir(&self, sub: &str) -> Result<PathBuf> {
         subdir(&self.data_dir, sub)
+    }
+}
+
+/// Whether the window starts fullscreen: `VICTORY_FULLSCREEN` if it is set
+/// and not empty (`0` is no, anything else yes), else the file's key.
+fn fullscreen(file: bool, env: Option<std::ffi::OsString>) -> bool {
+    match env {
+        Some(v) if !v.is_empty() => v != "0",
+        _ => file,
     }
 }
 
@@ -152,6 +186,32 @@ mod tests {
         let cfg = Config::resolve(file, None, env).unwrap();
         assert_eq!(cfg.game_dir.unwrap(), PathBuf::from("from-env"));
         assert_eq!(cfg.cache_dir, PathBuf::from("cache-from-file"));
+    }
+
+    #[test]
+    fn the_upscaler_folder_is_the_environments_then_the_files_and_empty_is_off() {
+        let file = || FilePaths { ffx_dir: Some("from-file".into()), ..Default::default() };
+        let with = |v: Option<&'static str>| {
+            Config::resolve(file(), None, move |k: &str| if k == "VICTORY_FFX_DIR" { v.map(OsString::from) } else { None })
+                .unwrap()
+                .ffx_dir
+        };
+        assert_eq!(with(None), Some(PathBuf::from("from-file")));
+        assert_eq!(with(Some("from-env")), Some(PathBuf::from("from-env")));
+        assert_eq!(with(Some("")), None);
+        let none = Config::resolve(FilePaths::default(), None, |_| None).unwrap();
+        assert_eq!(none.ffx_dir, None);
+    }
+
+    #[test]
+    fn fullscreen_is_the_environments_then_the_files() {
+        assert!(!fullscreen(false, None));
+        assert!(fullscreen(true, None));
+        assert!(fullscreen(false, Some("1".into())));
+        assert!(!fullscreen(true, Some("0".into())));
+        assert!(fullscreen(true, Some("".into())));
+        let parsed: FileConfig = toml::from_str("[window]\nfullscreen = true\n").unwrap();
+        assert!(parsed.window.fullscreen);
     }
 
     #[test]

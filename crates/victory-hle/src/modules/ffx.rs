@@ -87,6 +87,17 @@ extern "system" fn dispatch(context: *mut *mut c_void, desc: *const Header) -> u
         if header.kind == UPSCALE {
             // SAFETY: an upscale description, by its type.
             let d = unsafe { &*desc.cast::<Upscale>() };
+            // The size the title renders at, whenever it is another (a
+            // title that scales its resolution by the card's time changes
+            // it from frame to frame): the first 256 changes.
+            {
+                static SIZE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                static SAID: AtomicU32 = AtomicU32::new(0);
+                let size = u64::from(d.render[0]) << 32 | u64::from(d.render[1]);
+                if SIZE.swap(size, Ordering::Relaxed) != size && SAID.fetch_add(1, Ordering::Relaxed) < 256 {
+                    tracing::info!(render = ?d.render, upscale = ?d.upscale, "the title's render size is another");
+                }
+            }
             if first {
                 tracing::info!(
                     list = ?d.list,
@@ -214,4 +225,11 @@ pub(crate) fn module() -> crate::HleModule {
             export("ffxDispatch", ffx::ffxDispatch as *const () as usize),
         ],
     }
+}
+
+/// Names the folder of AMD's FidelityFX binaries for the PC upscaler
+/// (`victory_gpu::ffx::set_dir`): from the environment or `victory.toml`,
+/// before the title runs.
+pub fn set_dir(dir: Option<std::path::PathBuf>) {
+    victory_gpu::ffx::set_dir(dir);
 }

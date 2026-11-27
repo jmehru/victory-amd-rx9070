@@ -24,6 +24,14 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// root SRV also tells the host that the buffer views of the whole heap
 /// must be ready when it runs, not only those its tables name.
 pub const SLOT_STRIDES: u8 = 255;
+/// The bits of a [`SLOT_STRIDES`] dword that hold the stride.
+pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
+/// In a [`SLOT_STRIDES`] dword: a typed buffer view of an integer format
+/// (`UINT` or `SINT`), whose 16-bit typed accesses (`_d16`) pass bits.
+/// (avatarmanz 9a6c829, after upstream 4243a96a.)
+pub const VIEW_INTEGER: u32 = 1 << 31;
+/// With [`VIEW_INTEGER`]: a signed (`SINT`) format.
+pub const VIEW_SIGNED: u32 = 1 << 30;
 /// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 
@@ -75,6 +83,16 @@ pub const USER_VIEW_BIAS: u32 = 0x103;
 /// parts, each with the groups before it here. Asked for by compute programs
 /// that are told the x number alone (the one-dimensional ones).
 pub const USER_GROUP_BASE: u32 = 0x104;
+
+/// `RootType::Other` code of a user-data dword the host computes: the view
+/// heap slot of the constant buffer whose descriptor is at dword `dword` of
+/// the descriptor table of root parameter `slot` ([`super::cbv_slots`]).
+pub const USER_CBV_SLOT: u32 = 0x105;
+/// `RootType::Other` code of a user-data dword nothing reads: the program
+/// reads a constant buffer of the table of root parameter `slot` (255: of
+/// any table) at a place it computes, so the host makes that table afresh
+/// for it, constant buffers and all, as without [`USER_CBV_SLOT`].
+pub const USER_CBV_FRESH: u32 = 0x106;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

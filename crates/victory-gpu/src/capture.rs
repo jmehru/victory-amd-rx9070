@@ -47,7 +47,86 @@ pub(crate) fn listed(n: u64) -> bool {
     });
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let after = n.wrapping_sub(first);
-    named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+    named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after)) || timed(n)
+}
+
+/// `VICTORY_CAPTURE_SECS` (comma-separated): seconds since the first
+/// present; the two frames after the present at which each is passed are
+/// listed too ([`listed`]). An item `a-b/s` stands for a, a+s, ... up to b.
+/// Frame numbers of a cutscene differ from run to run (and between builds),
+/// its times much less.
+fn timed_secs() -> &'static [f64] {
+    static SECS: std::sync::OnceLock<Vec<f64>> = std::sync::OnceLock::new();
+    SECS.get_or_init(|| {
+        let mut secs = Vec::new();
+        for item in std::env::var("VICTORY_CAPTURE_SECS").unwrap_or_default().split(',') {
+            let item = item.trim();
+            if let Some((range, step)) = item.split_once('/')
+                && let Some((a, b)) = range.split_once('-')
+                && let (Ok(a), Ok(b), Ok(step)) = (a.parse::<f64>(), b.parse::<f64>(), step.parse::<f64>())
+                && step > 0.0
+            {
+                let mut t = a;
+                while t <= b && secs.len() < 512 {
+                    secs.push(t);
+                    t += step;
+                }
+            } else if let Ok(t) = item.parse::<f64>() {
+                secs.push(t);
+            }
+        }
+        secs.sort_by(f64::total_cmp);
+        secs
+    })
+}
+
+/// Frames listed by [`timed_secs`] so far.
+static TIMED: [std::sync::atomic::AtomicU64; 1024] = [const { std::sync::atomic::AtomicU64::new(u64::MAX) }; 1024];
+static TIMED_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn timed(n: u64) -> bool {
+    let count = TIMED_N.load(std::sync::atomic::Ordering::Acquire).min(TIMED.len());
+    TIMED[..count].iter().any(|f| f.load(std::sync::atomic::Ordering::Relaxed) == n)
+}
+
+/// Lists frame `n` and the next, as [`time_frames`] does: for diagnostics
+/// that pick the frames to look at as they go (`crate::inplace::port_war`).
+pub(crate) fn list_frame(n: u64) {
+    use std::sync::atomic::Ordering::{AcqRel, Relaxed};
+    for f in [n, n + 1] {
+        let at = TIMED_N.load(Relaxed);
+        if at < TIMED.len() {
+            TIMED[at].store(f, Relaxed);
+            TIMED_N.fetch_add(1, AcqRel);
+        }
+    }
+}
+
+/// At the present of `frame`: lists the next two frames if a time of
+/// [`timed_secs`] was passed since the last present.
+fn time_frames(frame: u64) {
+    use std::sync::atomic::Ordering::{AcqRel, Relaxed};
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let secs = timed_secs();
+    if secs.is_empty() {
+        return;
+    }
+    let now = START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64();
+    let next = NEXT.load(Relaxed);
+    if next >= secs.len() || now < secs[next] {
+        return;
+    }
+    let passed = secs.iter().filter(|&&t| t <= now).count();
+    NEXT.store(passed, Relaxed);
+    for f in [frame + 1, frame + 2] {
+        let at = TIMED_N.load(Relaxed);
+        if at < TIMED.len() {
+            TIMED[at].store(f, Relaxed);
+            TIMED_N.fetch_add(1, AcqRel);
+        }
+    }
+    tracing::info!(frame = frame + 1, seconds = now, "frames listed by time (VICTORY_CAPTURE_SECS)");
 }
 
 /// With a capture folder, for the frames [`listed`]: `what` is added to
@@ -60,6 +139,20 @@ pub(crate) fn listed(n: u64) -> bool {
 pub(crate) fn op(list: usize, what: impl FnOnce() -> String) {
     use std::io::Write;
     let frame = crate::queue::presented() + 1;
+    // Local: `VICTORY_OPS_GREP=<text>` logs every operation of every frame
+    // whose line holds that text (at most 4000 lines).
+    static GREP: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    if let Some(grep) = GREP.get_or_init(|| std::env::var("VICTORY_OPS_GREP").ok()) {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let what = what();
+        if what.contains(grep.as_str()) && N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4000 {
+            tracing::info!(frame, list = format_args!("{list:#x}"), "op: {what}");
+        }
+        if !listed(frame) {
+            return;
+        }
+        return op_listed(list, frame, what);
+    }
     if !listed(frame) {
         // Before the world: the last lines are kept, and written out when
         // it starts (`before-world-ops.txt`): what the title drew just
@@ -89,11 +182,17 @@ pub(crate) fn op(list: usize, what: impl FnOnce() -> String) {
         }
         return;
     }
+    op_listed(list, frame, what());
+}
+
+/// A listed frame's operation `what`, into its file.
+#[cfg(feature = "diagnostics")]
+fn op_listed(list: usize, frame: u64, what: String) {
+    use std::io::Write;
     let Some(folder) = folder() else {
         return;
     };
     static FILE: std::sync::Mutex<Option<(u64, u64, std::fs::File)>> = std::sync::Mutex::new(None);
-    let what = what();
     let mut file = FILE.lock().unwrap_or_else(|e| e.into_inner());
     if file.as_ref().is_none_or(|f| f.0 != frame) {
         let Ok(made) = std::fs::File::create(folder.join(format!("frame-{frame}-ops.txt"))) else {
@@ -127,6 +226,7 @@ static WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u
 pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    time_frames(frame);
     let before = LAST.swap(drawn, Relaxed);
     if world_on()
         && drawn.saturating_sub(before) >= 500
@@ -350,8 +450,30 @@ fn dump_on() -> bool {
     *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
 }
 
+/// `VICTORY_DUMP_TARGETS=listed`: only the targets of draws whose pixel
+/// shader `VICTORY_LIST_SLOTS` names ([`note_listed_target`]).
+fn dump_listed_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_DUMP_TARGETS").is_ok_and(|v| v == "listed"))
+}
+
 /// Notes a title texture the frame being built renders to or writes.
 pub(crate) fn note_target(resource: crate::object::This) {
+    if dump_listed_only() {
+        return;
+    }
+    note_target_now(resource);
+}
+
+/// Notes a target of a draw whose pixel shader `VICTORY_LIST_SLOTS` names
+/// (`VICTORY_DUMP_TARGETS=listed`).
+pub(crate) fn note_listed_target(resource: crate::object::This) {
+    if dump_listed_only() {
+        note_target_now(resource);
+    }
+}
+
+fn note_target_now(resource: crate::object::This) {
     if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
         return;
     }

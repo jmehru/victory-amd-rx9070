@@ -15,6 +15,8 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
+#[cfg(windows)]
+mod ambient;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;
@@ -27,6 +29,7 @@ mod draw;
 pub mod dxgi;
 #[cfg(windows)]
 pub mod ffx;
+pub mod fullscreen;
 pub mod fence;
 pub mod frame;
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -44,6 +47,8 @@ pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
 mod primitive;
+#[cfg(windows)]
+mod profile;
 pub mod query;
 pub mod queue;
 pub mod resource;
@@ -71,6 +76,6 @@ pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view,
 #[cfg(windows)]
 pub use watch::{
     title_memory_reading, title_memory_reading_now, title_memory_reading_range,
-    title_memory_remapped, title_memory_remapping,
+    title_memory_placeholder, title_memory_remapped, title_memory_remapping, title_memory_reserved,
     title_memory_remapping_range, writing as kernel_will_write,
 };

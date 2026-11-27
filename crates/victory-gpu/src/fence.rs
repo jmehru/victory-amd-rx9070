@@ -28,8 +28,9 @@ struct Fence {
     /// address.
     value: AtomicU64,
     flags: u32,
-    /// Events to set once the value reaches theirs (handles as integers).
-    waiters: Mutex<Vec<(u64, usize)>>,
+    /// Events to set once the value reaches theirs (handles as integers),
+    /// and when they were asked for.
+    waiters: Mutex<Vec<(u64, usize, std::time::Instant)>>,
 }
 
 fn fence<'a>(this: This) -> &'a Fence {
@@ -83,6 +84,8 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     if fence.value.load(Ordering::Acquire) >= value {
         if !event.is_null() {
+            #[cfg(windows)]
+            crate::profile::event_set(event as usize, 0);
             set_event(event as usize);
         }
         return S_OK;
@@ -94,6 +97,7 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         #[cfg(windows)]
         if crate::host::late() {
             drop(waiters);
+            crate::queue::before_sync();
             crate::host::settle_for_fence();
             if fence.value.load(Ordering::Acquire) >= value {
                 return S_OK;
@@ -106,7 +110,7 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         tracing::warn!(value, "blocking fence wait not implemented");
         return E_NOTIMPL;
     }
-    waiters.push((value, event as usize));
+    waiters.push((value, event as usize, std::time::Instant::now()));
     S_OK
 }
 /// Moves the fence to `value` and sets the events that waited for it.
@@ -114,9 +118,11 @@ pub(crate) fn set(this: This, value: u64) {
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     fence.value.store(value, Ordering::Release);
-    waiters.retain(|&(wanted, event)| {
+    waiters.retain(|&(wanted, event, asked)| {
         let reached = wanted <= value;
         if reached {
+            #[cfg(windows)]
+            crate::profile::event_set(event, asked.elapsed().as_micros() as u64);
             set_event(event);
         }
         !reached

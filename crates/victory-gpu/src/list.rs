@@ -144,6 +144,7 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 #[cfg(windows)]
 fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
     let Some(list) = host_list(this) else { return };
+    crate::profile::recorder_thread();
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // SAFETY: the title passes one of our lists.
@@ -229,8 +230,52 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 /// The most host lists kept idle, and the most upload memory they may keep
 /// between them (a list keeps scratch chunks over a reset only while lists
 /// do not share them, `VICTORY_SCRATCH_POOL=0`).
+///
+/// 512 lists (128 before): lists come back from their flights in bursts,
+/// and past 128 idle the rest were thrown away and others made new a
+/// moment later, 1.3 a frame in the cell (each a few allocations the
+/// graphics kernel makes and frees: 2.4 ms a frame of the submitting
+/// thread in profile pf3p-cell). With 512, 0.06 a frame, preparing 1.1 ms
+/// less, idle lists 56 -> 70 (run pg-alt-list2, twenty seconds each in turn).
 #[cfg(windows)]
-const IDLE_MOST: (usize, u64) = (128, 256 << 20);
+const IDLE_MOST: (usize, u64) = (512, 256 << 20);
+
+/// The most host lists kept idle ([`IDLE_MOST`]'s count; `VICTORY_LIST_IDLE_MOST`,
+/// or `alt:N`: the default and N in turn, `crate::host::alt_phase`).
+#[cfg(windows)]
+fn idle_most() -> usize {
+    static MOST: std::sync::OnceLock<(usize, Option<usize>)> = std::sync::OnceLock::new();
+    let (plain, alt) = *MOST.get_or_init(|| {
+        crate::host::alt_value(&std::env::var("VICTORY_LIST_IDLE_MOST").unwrap_or_default(), IDLE_MOST.0)
+    });
+    match alt {
+        Some(other) if crate::host::alt_phase() => other,
+        _ => plain,
+    }
+}
+
+/// Since the last frame line ([`churn_line`]): host lists made new because
+/// none was idle ([`fresh_list`]), and host lists thrown away after their
+/// run ([`recycle`]) because they did not run, because the idle ones were
+/// as many as kept ([`idle_most`]), because of the upload memory they keep.
+/// Each made and thrown away is driver memory made and freed (the graphics
+/// kernel's `DestroyAllocation2` was 2.4 ms a frame of the submitting
+/// thread in the cell, profile pf3p-cell).
+#[cfg(windows)]
+static CHURN: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// With the frame line: [`CHURN`] per frame over `frames`.
+#[cfg(windows)]
+pub(crate) fn churn_line(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let [made, not_run, full, bytes] = [0, 1, 2, 3].map(|i| CHURN[i].swap(0, Relaxed) as f64 / frames.max(1e-9));
+    let idle = IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len();
+    tracing::info!(
+        "host lists per frame: {made:.1} made new (none idle); thrown away after their run: {not_run:.1} not run, \
+         {full:.1} with {} idle already (VICTORY_LIST_IDLE_MOST), {bytes:.1} for their memory; {idle} idle now",
+        idle_most()
+    );
+}
 
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
@@ -254,7 +299,10 @@ fn fresh_list() -> Option<crate::host::HostList> {
     };
     match idle {
         Some(Idle(list, _)) => Some(list),
-        None => crate::host::host().and_then(|h| h.new_list().ok()),
+        None => {
+            CHURN[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::host::host().and_then(|h| h.new_list().ok())
+        }
     }
 }
 
@@ -271,7 +319,13 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        let most = idle_most();
+        if !ran.contains(&i) {
+            CHURN[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            continue;
+        }
+        if IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= most {
+            CHURN[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             continue;
         }
         // As the title's reset does: what the list kept for its commands
@@ -279,9 +333,11 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         host.reset();
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
+        if idle.0.len() < most && idle.1 + bytes <= IDLE_MOST.1 {
             idle.0.push(Idle(host, bytes));
             idle.1 += bytes;
+        } else {
+            CHURN[if idle.0.len() < most { 3 } else { 2 }].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }
@@ -750,6 +806,9 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     if let Some(list) = host_list(this)
         && !barriers.is_null()
     {
+        if count > 0 {
+            with_state(this, |_, state| state.synced());
+        }
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
         let mut host: Vec<Barrier> = barriers
@@ -776,6 +835,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
                     host.len(),
                 )
             };
+            list.tally(6);
             // SAFETY: an open list and live resources.
             unsafe { list.list.ResourceBarrier(host) };
         }
@@ -853,6 +913,99 @@ fn buffer_range(buffer: This, offset: u64, len: u64) -> Option<*mut u8> {
     Some(unsafe { data.add(offset as usize) })
 }
 
+/// Whether a title's buffer copy whose source shaders write is done by the
+/// card, between the host copies of the two buffers
+/// (`VICTORY_CARD_COPY=0`: on the CPU at submission, as every other copy).
+///
+/// A buffer copy is done on the CPU when its list is submitted, between
+/// the two buffers' title memory. Where the source is memory that flights
+/// in the air may write (`crate::host::late`), what they wrote is not in
+/// title memory yet, and the submission waited for them to land: in the
+/// first scene one copy a frame, 20,480 bytes out of the 174 MB world
+/// buffer (whose copy is in the card's memory and which every flight
+/// declares written), 7-13 ms of the submitting thread each time, and the
+/// one point of every frame where it could not run ahead of the card.
+///
+/// With the switch such a copy is a host `CopyBufferRegion` in the list,
+/// where the title recorded it: the source's host copy is brought up to
+/// date as for any command that reads it, the destination's is declared
+/// written by the card, and its bytes reach title memory with the rest of
+/// what the list's shaders wrote, before the title is told the list ran.
+#[cfg(windows)]
+fn card_copy() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_COPY").is_none_or(|v| v != "0"))
+}
+
+/// Title buffer copies done on the card ([`card_copy`]), since the start.
+#[cfg(windows)]
+pub(crate) static CARD_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`card_copy`]: records the copy of `len` bytes of title memory from
+/// `from` to `to` as a copy between host copies, if the source's is one
+/// shaders write (in the card's memory, or with writes not copied back
+/// yet); false if the copy is left to the CPU.
+#[cfg(windows)]
+fn copy_on_the_card(list: &crate::host::HostList, to: u64, from: u64, len: u64) -> bool {
+    use windows::core::Interface;
+    if len == 0 || !card_copy() {
+        return false;
+    }
+    let Some(source) = crate::shadow::existing(from, len) else {
+        return false;
+    };
+    // Renderer port 1 (`VICTORY_PORT_CONSTANTS=1`): a copy out of title
+    // memory in place, which the list's shaders before it may write, is the
+    // card's too: done on the CPU at submission it read the bytes from
+    // before them (the 174 MB world buffer is in place with the switch).
+    let in_place = crate::inplace::port_constants() && source.in_place();
+    if !(source.carded() || source.writes_pending() || in_place) {
+        return false;
+    }
+    let Some(target) = crate::shadow::find(to, len) else {
+        return false;
+    };
+    // One buffer cannot be both ends of a host copy.
+    if target.buffer.as_raw() == source.buffer.as_raw() {
+        if in_place {
+            static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::info!(n, len, from = format_args!("{from:#x}"), to = format_args!("{to:#x}"), "renderer port 1: a title buffer copy within memory in place is done on the CPU at submission");
+            }
+        }
+        return false;
+    }
+    // What the title wrote of either range goes up first; the snapshot of
+    // the destination is then title memory's bytes.
+    source.refresh(list, from, len);
+    target.refresh(list, to, len);
+    list.begin_command();
+    list.buffer_state(&source.buffer, crate::host::BUFFER_READ);
+    list.buffer_state(&target.buffer, COPY_DEST);
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| format!("title buffer copy on the card, {len} bytes from {from:#x} to {to:#x}"));
+    // SAFETY: an open list; live buffers the list holds (their states are
+    // noted in it), and the ranges lie in them.
+    list.tally(3);
+    unsafe {
+        list.list.CopyBufferRegion(&target.buffer, target.offset(to), &source.buffer, source.offset(from), len);
+    }
+    list.begin_command();
+    target.gpu_writes(list, to, len);
+    let n = CARD_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::info!(
+            n,
+            len,
+            from = format_args!("{from:#x}"),
+            to = format_args!("{to:#x}"),
+            "a title buffer copy whose source shaders write is done on the card (VICTORY_CARD_COPY=0: on the CPU)"
+        );
+    }
+    true
+}
+
 /// Buffer to buffer: both are host memory, copied at submission.
 extern "system" fn copy_buffer_region(
     this: This,
@@ -866,6 +1019,7 @@ extern "system" fn copy_buffer_region(
     if let Some(list) = host_list(this)
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
+        && !copy_on_the_card(list, to as u64, from as u64, len)
     {
         list.defer_copy(to, from, len as usize);
     }
@@ -915,6 +1069,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
+            list.tally(2);
             unsafe { list.list.CopyResource(to, from) };
         } else if let (Some((to, a)), Some((from, b))) = (
             crate::resource::buffer_bytes(dst),
@@ -1073,6 +1228,7 @@ extern "system" fn copy_texture_region(
             assert!(size_of::<CopyLocation>() == size_of::<D3D12_TEXTURE_COPY_LOCATION>());
         // SAFETY: an open list; both locations in the host's layout, naming
         // live resources; the box is the title's (same layout).
+        list.tally(2);
         unsafe {
             list.list.CopyTextureRegion(
                 (&raw const to_location).cast(),
@@ -1144,6 +1300,7 @@ fn read_back(
     // SAFETY: an open list; both locations in the host's layout (asserted
     // in `copy_texture_region`), naming a live texture and our buffer, which
     // the list keeps until it is reset; the box is the title's.
+    list.tally(7);
     unsafe {
         list.list
             .CopyTextureRegion((&raw const to).cast(), 0, 0, 0, (&raw const from).cast(), host_box)
@@ -1286,6 +1443,7 @@ extern "system" fn clear_rtv(
                     State(RENDER_TARGET as i32),
                 )]);
             }
+            list.tally(0);
             list.list.ClearRenderTargetView(rtv, color, rects);
         }
     }
@@ -1330,7 +1488,9 @@ extern "system" fn clear_dsv(
             crate::resource::DEPTH_UNORDERED[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         let dsv = host.dsv(texture, record.depth_desc().as_ref());
+        crate::inplace::war_depth_clear(record.resource as usize, texture, flags, depth, rects);
         // SAFETY: an open list, a fresh view of a live texture.
+        list.tally(1);
         unsafe {
             list.list
                 .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAGS(flags as i32 & 3), depth, stencil, rects)
@@ -1409,7 +1569,10 @@ extern "system" fn resolve_queries(
     let (what, bytes) = match kind {
         OCCLUSION => (Written::Value(1 << 20), 8),
         BINARY => (Written::Value(1), 8),
-        TIMESTAMP => (Written::GpuTimestamp, 8),
+        TIMESTAMP => {
+            crate::queue::TIMESTAMPS[1].fetch_add(u64::from(count), std::sync::atomic::Ordering::Relaxed);
+            (Written::GpuTimestamp, 8)
+        }
         PIPELINE_STATISTICS => (Written::Value(0), 88),
         _ => (Written::Value(0), 16),
     };
@@ -1450,7 +1613,14 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
 /// bottom of the pipe `(flags, control, address, size)`. Host lists order
 /// their own work and every submission is waited for, so there is nothing
 /// to do.
-extern "system" fn sync(_: This, _flags: u32, _control: u32, _address: u64, _size: u64) {}
+/// (Arguments may be what earlier shaders wrote from here on:
+/// `State::synced`.)
+extern "system" fn sync(this: This, _flags: u32, _control: u32, _address: u64, _size: u64) {
+    #[cfg(windows)]
+    with_state(this, |_, state| state.synced());
+    #[cfg(not(windows))]
+    let _ = this;
+}
 
 /// Reset with console flags `(allocator, pipeline, flags)`; the flags only
 /// tune the console's command memory.
@@ -1988,15 +2158,17 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     #[cfg(all(windows, feature = "diagnostics"))]
     if count > 0 {
         crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
-        if crate::copystat::barrier_test() & 1 != 0 {
-            return;
-        }
+    }
+    #[cfg(windows)]
+    if count > 0 && crate::indirect::barrier_test() & 1 != 0 {
+        return;
     }
     #[cfg(windows)]
     if count > 0
         && let Some(list) = host_list(this)
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+        with_state(this, |_, state| state.synced());
         // SAFETY: the same layout; no resource named.
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
@@ -2017,7 +2189,10 @@ extern "system" fn write64(this: This, address: u64, value: u64, _flush: u32, fl
     const GPU_TIMESTAMP: u32 = 1;
     const SYSTEM_TIMESTAMP: u32 = 2;
     let what = match flags {
-        GPU_TIMESTAMP => Written::GpuTimestamp,
+        GPU_TIMESTAMP => {
+            crate::queue::TIMESTAMPS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Written::GpuTimestamp
+        }
         SYSTEM_TIMESTAMP => Written::SystemTimestamp,
         _ => Written::Value(value),
     };

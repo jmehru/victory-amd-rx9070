@@ -14,6 +14,18 @@ game_dir = 'D:\victory-data\game'
 # Default: %LOCALAPPDATA%\victory\data.   env: VICTORY_DATA_DIR
 # data_dir = 'D:\victory-data\data'
 
+# The folder `Kits\FidelityFX\signedbin` of AMD's public FidelityFX SDK (2.x):
+# with it the title's FidelityFX upscale (Series S) is answered by the PC
+# upscaler (FSR) instead of a bilinear stretch. Absent: not used.
+# env: VICTORY_FFX_DIR (set and empty turns it off)
+# ffx_dir = 'D:\victory-data\FidelityFX-SDK\Kits\FidelityFX\signedbin'
+
 # Other Xbox Series titles used to test platform-level code.
 # env: VICTORY_TEST_TITLES (separated by ';')
 test_titles = []
+
+[window]
+# Start fullscreen: the window without a frame over the monitor it is on,
+# the picture's shape kept (black bars on a monitor of another shape).
+# F11 and Alt+Enter switch while the title runs.   env: VICTORY_FULLSCREEN (1 or 0)
+# fullscreen = true

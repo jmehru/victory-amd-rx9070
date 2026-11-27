@@ -56,6 +56,8 @@ pub(crate) fn wanted(resource: This) -> bool {
 /// A texture's copy into a read-back buffer, recorded into a list, and where
 /// its texels go once the list has run.
 pub(crate) struct Back {
+    /// The buffer's bytes.
+    bytes: u64,
     buffer: ID3D12Resource,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
@@ -92,7 +94,16 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, resource: This, texture: 
             Some(&mut total),
         )
     };
-    let buffer = host.read_back_buffer(total)?;
+    let free = if crate::texture::buffers_pooled() {
+        let mut free = FREE.lock().unwrap_or_else(|e| e.into_inner());
+        free.iter().position(|(bytes, _)| *bytes == total).map(|at| free.swap_remove(at).1)
+    } else {
+        None
+    };
+    let buffer = match free {
+        Some(buffer) => buffer,
+        None => host.read_back_buffer(total)?,
+    };
     for (i, footprint) in footprints.iter().enumerate() {
         let to = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: a borrowed pointer the location never releases.
@@ -112,7 +123,23 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, resource: This, texture: 
     if COPIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
         tracing::info!(width = desc.Width, height = desc.Height, format = desc.Format.0, swizzle = layout.desc.swizzle.0, at = format_args!("{at:#x}"), "a texture shaders wrote is copied back into title memory, the first (VICTORY_TEXTURE_BACK)");
     }
-    Some(Back { buffer, footprints, rows, mips, layout, at, size })
+    Some(Back { buffer, bytes: total, footprints, rows, mips, layout, at, size })
+}
+
+/// Read-back buffers let go (their bytes, the buffer): taken again for a
+/// texture of the same bytes (`crate::texture::buffers_pooled`).
+static FREE: std::sync::Mutex<Vec<(u64, ID3D12Resource)>> = std::sync::Mutex::new(Vec::new());
+
+impl Drop for Back {
+    fn drop(&mut self) {
+        // The list that copied into it has run and is reset.
+        if crate::texture::buffers_pooled() {
+            let mut free = FREE.lock().unwrap_or_else(|e| e.into_inner());
+            if free.len() < 64 {
+                free.push((self.bytes, self.buffer.clone()));
+            }
+        }
+    }
 }
 
 /// Textures copied back since the start.
@@ -151,6 +178,7 @@ pub(crate) fn land(back: &Back) {
     // Our write into title memory: `copy_mapped` opens the range's guarded
     // blocks first and notes it for the placed textures there
     // (`crate::watch::writing`), as the other writers of title memory do.
+    crate::inplace::port_touched(2, back.at as usize, back.size);
     crate::host::copy_mapped(back.at as *mut u8, tiled.as_ptr(), back.size, true);
     // While a submission's one asking stands the kernel is not asked again:
     // the journal learns the write (as after the title's buffer copies), so

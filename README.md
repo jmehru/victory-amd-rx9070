@@ -4,34 +4,114 @@
 
 This branch is [myokex/victory-amd](https://github.com/myokex/victory-amd) at
 `070df42` with changes found while running on one machine: Windows 11, Radeon
-RX 9070 (RDNA4, driver 32.0.32029.2010), Ryzen 5 7600, 32 GB RAM. Nothing here
-has been tested on another card.
+RX 9070 (RDNA4, driver 32.0.32029.2010), Ryzen 5 7600 (6 cores), 32 GB RAM.
+Nothing here has been tested on another card. Work goes to the `perf/submit`
+branch first.
 
-State on that machine (2026-11-25, release build): the prologue is drawn with its
-walls and characters and the player moves. In the first room, standing still:
-12.7 to 12.9 frames per second in the Series S profile (about 85 ms a frame);
-about 9 in the Series X profile. Five runs of 6 to 10 minutes with the relay ended
-without a device loss. Cutscenes that bring in many textures run at 0 to 3
-frames per second. Noise and stray lines show on some textures. Ray-traced light
-does not run.
+### State on that machine (2026-11-27, release build, Series S profile, FSR on)
 
-How it is run here:
+With `VICTORY_PORT_CONSTANTS=1 VICTORY_CBV_RAW=1` (both still off by default):
+
+| | |
+|---|---|
+| Menus, videos, loading screens | 30 fps |
+| Prologue, the cell, standing still | 44.5 to 45.5 ms a frame (about 22 fps); 51 to 53 ms without the two switches |
+| First mission, the boat at rest | about 40.6 ms (24.6 fps) |
+| The boat under way | 53 to 58 ms (17 to 19 fps) |
+| Walking and turning the camera | 59 to 61 ms |
+| With frame generation (`VICTORY_FRAME_GEN=1`) | 20 to 21 real frames shown as about 38 |
+| Memory | 20 to 23 GB for the process; 32 GB of RAM is tight |
+
+It started at 12.7 to 12.9 fps in the cell two days before. 30 real frames a
+second are not reached. What bounds the frame now is the card running the
+title's own lists: about 30 ms of card time a frame in the cell and with the
+boat at rest, about 45 ms with the boat under way. Compute is half or more of
+it (the classified light gathers, particles, the light atlas), and 5 to 8 ms
+lie between commands. The thread of ours that prepares submissions is at 31 to
+33 ms in the cell.
+
+The picture:
+
+- Faces are formed right and their expressions move (two faults in the
+  translation of the title's face network, see below).
+- With the PC upscaler (FSR) the Series S picture is clean; without it the
+  title's dithered effects stay as speckle.
+- Triangle-edge lines on walls and panels are gone (quad reads in pixel
+  shaders).
+- A texture the title replaces keeps showing its old copy until the new one is
+  uploaded, and a view with nothing to show yet reads mid grey instead of black.
+- In a run with an empty cache, pipelines that are still being made are waited
+  for by all recording threads together, so characters keep their heads.
+
+### How it is run here
+
+Set the FidelityFX SDK's `signedbin` folder as `ffx_dir` under `[paths]` in
+`victory.toml` (see `victory.example.toml`), then:
 
 ```powershell
 $env:VICTORY_INPLACE = "3"; $env:VICTORY_RELAY = "2"
 $env:VICTORY_INDIRECT_WINDOW = "1"; $env:VICTORY_NO_PREV_CULL = "1"
+$env:VICTORY_TEXTURE_GATE_S = "0"; $env:VICTORY_LATE_RUNS = "16384"
 target\release\victory.exe run <game dir>\<the title's exe> --execute --console series-s
 ```
 
-What it adds, each explained where it is in the code or in its commit:
+`VICTORY_FRAME_GEN=1` adds FSR frame generation (off by default; the interface
+is interpolated with the picture, so subtitles may ghost). `VICTORY_FULLSCREEN=1`
+or F11 gives a borderless window over the monitor. The first run after
+an update translates every shader again and is slow; judge the second.
 
-- Four compute programs that crash the RDNA4 driver's compiler
+### Known problems
+
+- Characters in shade and interiors the sun does not reach get their indirect
+  light from a stand-in (`VICTORY_AMBIENT`, 0.8 by default, `0`: off; it
+  estimates the light around from the screen). Without it a face in shade could
+  go black with glowing eyes. What is still missing is the title's own
+  ray-traced bounce (4 of the structure builder's 53 programs do not
+  translate), so there is no coloured bounce, such as the orange on the bunk in
+  the prologue's cell window shot.
+- Skin can still be wrong in cutscenes (red, noise; eyes losing their iris)
+  where that is not the light: character bakes now get their textures made
+  right before they draw, and this is being checked.
+- Clear glass shows a blurred orange smear instead of what is behind it; floors
+  can look wet and lose their painted lettering; some runs have a pink cast on
+  floors and ceilings.
+- The scripted runs used for testing only leave the first cell when the stick
+  is moved; that is the title waiting for the player, not a hang.
+- Three unit tests of the shader crate fail (heap handles in `glc` programs).
+
+### What it adds
+
+Each is explained where it is in the code or in its commit.
+
+Speed:
+- Both per-frame settles removed; constant buffers of tables in slots of their
+  own instead of a table made afresh for every draw (`VICTORY_CBV_SLOTS`);
+  guards as bit sets; argument clamps in batches (`VICTORY_INDIRECT_BATCH`);
+  shared recorder locks; lists with nothing recorded left out of their
+  submissions; the texture pass capped at 40 ms a frame; staging buffers pooled.
+- A sampling profiler (`VICTORY_PROFILE=<file>`) and per-pass card times
+  (`VICTORY_CARD_TIMES=1`).
+- Built and measured without a gain here, so off: submissions prepared by a
+  thread of ours (`VICTORY_ASYNC_SUBMIT`), guards by the 4 KiB part
+  (`VICTORY_GUARD_PAGE=4096`), textures placed in blocks made ahead
+  (`VICTORY_TEXTURE_BLOCKS`).
+
+Picture:
+- The face network: a wave sum of 16-bit floats where some lanes have left is
+  added as the console adds it, and 16-bit typed accesses through integer views
+  keep their bits, also for views in tables.
+- Quad reads in pixel shaders give what the console gives for lanes that are
+  not running.
+- `ffx_dir` in `victory.toml`; FSR frame generation.
+
+RDNA4:
+- Four compute programs that crash the driver's compiler
   (`amdxc64.dll+0x861b9f`) are left out.
 - `VICTORY_NO_PREV_CULL=1` leaves out the two meshlet-culling programs
   (`fc5e66f8f873d3bb`, `0452fc2d2e2fc4c3`) in which the device was lost whenever
-  submissions were sent ahead (victory-fork issue #3). With them in and the relay
-  on, the device was lost within minutes here; what leaving them out costs the
-  picture has not been looked at.
+  submissions were sent ahead (victory-fork issue #3).
+
+Earlier:
 - Title view memory and big buffers used in place (`VICTORY_INPLACE=3`), from
   gmehru's `wip/radeon-8060s`.
 - With `VICTORY_INDIRECT_WINDOW=1`, up to eight windows of indirect records stand
@@ -39,8 +119,20 @@ What it adds, each explained where it is in the code or in its commit:
 - JoshuuDev's fix for raw DirectStorage reads under the guard over all views.
 - From victory-fork's pull requests, as their authors wrote them: #92, #188 (with
   #32), #253, #452, #38, #144, #239, #175, #240, #255, #670, #467, #221, #384.
-- Switches for looking into things: `VICTORY_WINDOW_WHY`, `VICTORY_SETTLE_WHY`,
-  `VICTORY_SPIN_US`, `VICTORY_INPLACE_BIG`.
+
+### Taken from other forks
+
+Commits taken from elsewhere name the commit and its author.
+
+- [avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX):
+  batched clamps, the submit thread, the face-network fixes, the quad-read
+  forms, the guard rest.
+- [PastiiJay/klbf-lab-beta](https://github.com/PastiiJay/klbf-lab-beta) (branch `klbf-amd`): FSR frame
+  generation.
+- [fxceless/victory-fork](https://github.com/fxceless/victory-fork),
+  [Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)
+  and upstream [VIctory](https://github.com/Marvisak/VIctory): fixes as named
+  in their commits here.
 
 Developed with [Claude Code](https://claude.com/claude-code).
 
@@ -264,8 +356,18 @@ Point `VICTORY_FFX_DIR` at `Kits\FidelityFX\signedbin` of AMD's public
 [FidelityFX SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK)
 (2.x) to answer its FidelityFX calls with the PC upscaler for D3D12 instead
 (experimental; from PastiiJay/klbf-lab-beta).
+`ffx_dir` under `[paths]` in `victory.toml` names the same folder without an
+environment variable; `VICTORY_FFX_DIR` wins over it, and set to nothing it
+turns the PC upscaler off.
 `VICTORY_FFX_SIMPLE=1` takes the same calls with no upscaler: a bilinear
 scale with one jitter phase, to tell what FSR adds to a picture.
+
+Fullscreen: F11 or Alt+Enter switches the window between its frame and the
+whole monitor it is on (no frame, the picture's shape kept). To start that
+way set `VICTORY_FULLSCREEN=1` or `fullscreen = true` under `[window]` in
+`victory.toml`. DXGI's own Alt+Enter (exclusive fullscreen) is turned off
+for the window, for the plain swap chain and the frame-generation one
+(`VICTORY_FRAME_GEN=1`).
 
 ## Commands
 

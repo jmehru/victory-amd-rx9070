@@ -16,7 +16,7 @@
 //! runs only once and whose pipeline takes longer is lost.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -37,6 +37,8 @@ pub(crate) struct Pending {
     left_out: Option<&'static str>,
     /// When a worker began it ([`slow`]).
     begun: OnceLock<Instant>,
+    /// A thread has taken it to make: others wait for `made` ([`Pending::make`]).
+    claimed: AtomicBool,
 }
 
 /// Why a pipeline with these shaders is not made, if it is not.
@@ -136,6 +138,7 @@ impl Pending {
             graphics,
             left_out,
             begun: OnceLock::new(),
+            claimed: AtomicBool::new(false),
             queue_state: AtomicU8::new(NOT_QUEUED),
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
@@ -145,11 +148,294 @@ impl Pending {
 
     fn make(&self) {
         let _ = self.begun.set(Instant::now());
-        self.made
-            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        // Not through `OnceLock::get_or_init`: a worker the driver's compiler
+        // crashed under stays inside the call for good (see [`guard_start`]),
+        // and anyone else asking, the guard's `lost` too, would wait for it
+        // forever. One thread makes it; the others wait for its answer, or
+        // for the guard's.
+        if self.made.get().is_none() {
+            if self.claimed.swap(true, Ordering::AcqRel) {
+                let (lock, done) = &DONE;
+                let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+                while self.made.get().is_none() {
+                    held = done.wait(held).unwrap_or_else(|e| e.into_inner());
+                }
+                return;
+            }
+            let made = if is_bad_key(&self.key) {
+                SKIPPED_BAD.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(key = self.key, shaders = ?self.shaders, "not made: the driver's compiler crashed on it before (warm-bad.txt)");
+                None
+            } else {
+                HostPipeline::new(&self.shaders, self.graphics.as_deref())
+            };
+            let _ = self.made.set(made);
+        }
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
+    }
+}
+
+// The driver-compiler crash guard: Belobug e942896 (beloooo), brought over
+// onto this tree's workers. The four programs `left_out` names stay left out
+// as before; this catches the crashes on other pipelines.
+
+/// Pipelines not made for being on the list of those the driver's compiler
+/// crashed on.
+static SKIPPED_BAD: AtomicU64 = AtomicU64::new(0);
+
+/// The keys of the pipelines the driver's compiler crashed on
+/// (`warm-bad.txt` beside the pipeline library, one key to a line, then
+/// anything; `#` begins a comment), loaded on first use. `VICTORY_WARM_BAD=0`
+/// leaves the file unread.
+static BAD_KEYS: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+
+fn bad_keys<R>(f: impl FnOnce(&mut std::collections::HashSet<String>) -> R) -> R {
+    let mut keys = BAD_KEYS.lock().unwrap_or_else(|e| e.into_inner());
+    let keys = keys.get_or_insert_with(|| {
+        if std::env::var_os("VICTORY_WARM_BAD").is_some_and(|v| v == "0") {
+            return Default::default();
+        }
+        let listed = super::library::folder()
+            .and_then(|d| std::fs::read_to_string(d.join(BAD_FILE)).ok())
+            .unwrap_or_default();
+        let keys: std::collections::HashSet<String> = listed
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .filter_map(|l| l.split_whitespace().next())
+            .map(str::to_owned)
+            .collect();
+        if !keys.is_empty() {
+            tracing::info!(pipelines = keys.len(), "pipelines the driver's compiler crashed on in earlier runs, left out ({BAD_FILE})");
+        }
+        keys
+    });
+    f(keys)
+}
+
+const BAD_FILE: &str = "warm-bad.txt";
+
+fn is_bad_key(key: &str) -> bool {
+    bad_keys(|keys| keys.contains(key))
+}
+
+/// Whether the driver's compiler crashing on a worker is caught
+/// (`VICTORY_COMPILER_GUARD=0`: not).
+fn guard_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COMPILER_GUARD").is_none_or(|v| v != "0"))
+}
+
+/// Worker threads the guard can tell apart, over the run.
+const MAX_SLOTS: usize = 128;
+/// Per worker slot: its compile crashed (set in the handler), and where.
+static CRASHED: [AtomicBool; MAX_SLOTS] = [const { AtomicBool::new(false) }; MAX_SLOTS];
+static FAULT_ADDR: [AtomicU64; MAX_SLOTS] = [const { AtomicU64::new(0) }; MAX_SLOTS];
+static FAULT_RIP: [AtomicU64; MAX_SLOTS] = [const { AtomicU64::new(0) }; MAX_SLOTS];
+static NEXT_SLOT: AtomicUsize = AtomicUsize::new(0);
+/// The event the handler signals (a Win32 handle).
+static CRASH_EVENT: AtomicUsize = AtomicUsize::new(0);
+/// What each slot's worker is making. Never locked by the handler.
+static ACTIVE_JOBS: Mutex<Vec<Option<Arc<Pending>>>> = Mutex::new(Vec::new());
+/// Workers the compiler crashed under (each is asleep for good).
+static LOST: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// This worker's slot (`usize::MAX`: none).
+    static WORKER_SLOT: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+    /// Whether this thread is inside the making of a pipeline.
+    static COMPILING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A worker's making of `p`: noted for the guard while it lasts.
+struct Compile {
+    slot: usize,
+}
+
+impl Compile {
+    fn begin(slot: usize, p: &Arc<Pending>) -> Compile {
+        if slot < MAX_SLOTS && guard_on() && CRASH_EVENT.load(Ordering::Acquire) != 0 {
+            let mut jobs = ACTIVE_JOBS.lock().unwrap_or_else(|e| e.into_inner());
+            if jobs.len() < MAX_SLOTS {
+                jobs.resize(MAX_SLOTS, None);
+            }
+            jobs[slot] = Some(p.clone());
+            COMPILING.set(true);
+        }
+        Compile { slot }
+    }
+}
+
+impl Drop for Compile {
+    fn drop(&mut self) {
+        if COMPILING.replace(false) && self.slot < MAX_SLOTS {
+            let mut jobs = ACTIVE_JOBS.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(job) = jobs.get_mut(self.slot) {
+                *job = None;
+            }
+        }
+    }
+}
+
+/// Installs the handler for the driver's compiler crashing on a worker
+/// (AMD's does on RDNA4, and not on the same pipelines in every run: a read
+/// of the first pages from inside `amdxc64.dll`) and the thread that deals
+/// with what it left. The handler does the least there is: it notes where,
+/// signals, and leaves the worker asleep for good. No allocation, no lock,
+/// no file: the crash may have been under any of them. The watcher puts the
+/// pipeline on the list of those left out (`warm-bad.txt`), answers it as
+/// not made, gives the worker's place in the counts back and starts another
+/// worker.
+fn guard_start() {
+    use windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler;
+    use windows_sys::Win32::System::Threading::CreateEventW;
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    if !guard_on() {
+        return;
+    }
+    ONCE.call_once(|| {
+        // SAFETY: an unnamed auto-reset event, no security attributes.
+        let event = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+        if event.is_null() {
+            tracing::warn!("no event for the driver's compiler crashes: they are not caught");
+            return;
+        }
+        let handle = event as usize;
+        let spawned = std::thread::Builder::new()
+            .name("victory-pipeline-watch".into())
+            .spawn(move || watch(handle));
+        if let Err(e) = spawned {
+            tracing::warn!(error = %e, "no thread for the driver's compiler crashes: they are not caught");
+            return;
+        }
+        CRASH_EVENT.store(event as usize, Ordering::Release);
+        // SAFETY: a handler that lives as long as the process.
+        unsafe {
+            AddVectoredExceptionHandler(1, Some(compiler_crashed));
+        }
+        tracing::info!("the driver's compiler crashing on a pipeline worker is caught (VICTORY_COMPILER_GUARD=0: not)");
+    });
+}
+
+/// The handler: a worker inside the making of a pipeline read or wrote one
+/// of the first pages. See [`guard_start`].
+unsafe extern "system" fn compiler_crashed(
+    info: *mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
+) -> i32 {
+    use windows_sys::Win32::System::Threading::{SetEvent, Sleep};
+    const ACCESS_VIOLATION: i32 = 0xc000_0005_u32 as i32;
+    const CONTINUE_SEARCH: i32 = 0;
+    // SAFETY: the system passes a live record.
+    let record = unsafe { &*(*info).ExceptionRecord };
+    if record.ExceptionCode != ACCESS_VIOLATION || record.NumberParameters < 2 || record.ExceptionInformation[1] >= 0x10000 {
+        return CONTINUE_SEARCH;
+    }
+    if !COMPILING.try_with(|c| c.get()).unwrap_or(false) {
+        return CONTINUE_SEARCH;
+    }
+    let slot = WORKER_SLOT.try_with(|s| s.get()).unwrap_or(usize::MAX);
+    if slot >= MAX_SLOTS {
+        return CONTINUE_SEARCH;
+    }
+    let _ = COMPILING.try_with(|c| c.set(false));
+    FAULT_ADDR[slot].store(record.ExceptionInformation[1] as u64, Ordering::Relaxed);
+    // SAFETY: the system passes a live context.
+    let context = unsafe { (*info).ContextRecord };
+    if !context.is_null() {
+        // SAFETY: as above.
+        FAULT_RIP[slot].store(unsafe { (*context).Rip }, Ordering::Relaxed);
+    }
+    CRASHED[slot].store(true, Ordering::Release);
+    let event = CRASH_EVENT.load(Ordering::Acquire);
+    if event != 0 {
+        // SAFETY: the event lives as long as the process.
+        unsafe { SetEvent(event as windows_sys::Win32::Foundation::HANDLE) };
+    }
+    loop {
+        // SAFETY: a plain sleep.
+        unsafe { Sleep(u32::MAX - 1) };
+    }
+}
+
+/// The thread that deals with the workers the compiler crashed under.
+fn watch(event: usize) {
+    use windows_sys::Win32::System::Threading::{INFINITE, WaitForSingleObject};
+    loop {
+        // SAFETY: the event lives as long as the process.
+        unsafe { WaitForSingleObject(event as windows_sys::Win32::Foundation::HANDLE, INFINITE) };
+        for slot in 0..MAX_SLOTS {
+            if CRASHED[slot].swap(false, Ordering::AcqRel) {
+                lost(slot);
+            }
+        }
+    }
+}
+
+/// `module+offset` for a code address, for the log.
+fn where_in_code(at: u64) -> String {
+    use windows_sys::Win32::System::LibraryLoader::{
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, GetModuleFileNameW,
+        GetModuleHandleExW,
+    };
+    let mut module = std::ptr::null_mut();
+    // SAFETY: an address looked up, not read; the handle is not counted.
+    let found = unsafe {
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            at as usize as *const u16,
+            &mut module,
+        )
+    };
+    if found == 0 || module.is_null() {
+        return format!("{at:#x}");
+    }
+    let mut name = [0u16; 260];
+    // SAFETY: a buffer of the length given.
+    let n = unsafe { GetModuleFileNameW(module, name.as_mut_ptr(), name.len() as u32) } as usize;
+    let path = String::from_utf16_lossy(&name[..n.min(name.len())]);
+    let file = path.rsplit(['\\', '/']).next().unwrap_or(&path);
+    format!("{file}+{:#x}", at.wrapping_sub(module as u64))
+}
+
+/// The worker at `slot` is gone with the pipeline it was making.
+fn lost(slot: usize) {
+    let job = {
+        let mut jobs = ACTIVE_JOBS.lock().unwrap_or_else(|e| e.into_inner());
+        jobs.get_mut(slot).and_then(Option::take)
+    };
+    let Some(p) = job else {
+        return;
+    };
+    let lost = LOST.fetch_add(1, Ordering::Relaxed) + 1;
+    tracing::error!(
+        key = p.key,
+        shaders = ?p.shaders,
+        at = where_in_code(FAULT_RIP[slot].load(Ordering::Relaxed)),
+        address = format_args!("{:#x}", FAULT_ADDR[slot].load(Ordering::Relaxed)),
+        lost,
+        "the driver's compiler crashed making a pipeline: it is left out, the worker is replaced"
+    );
+    let known = bad_keys(|keys| !keys.insert(p.key.clone()));
+    if !known && let Some(dir) = super::library::folder() {
+        use std::io::Write;
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(BAD_FILE));
+        if let Ok(mut f) = file {
+            let _ = writeln!(f, "{} ended the compiler in a run: {:?}", p.key, p.shaders);
+        }
+    }
+    let _ = p.made.set(None);
+    {
+        let (lock, done) = &DONE;
+        let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+        done.notify_all();
+    }
+    // (The worker's own count after its make, never reached.)
+    if WAITING.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1)) == Ok(1) {
+        drained();
+    }
+    if !spawn_worker() {
+        tracing::warn!("no worker to take the place of the one the compiler crashed under");
     }
 }
 
@@ -239,7 +525,8 @@ pub(crate) fn waiting() -> u64 {
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
-    if p.left_out.is_some() {
+    if let Some(why) = p.left_out {
+        not_ready(p, why);
         return None;
     }
     // A still-pending pipeline was requested by the title too. Prewarm it
@@ -248,10 +535,131 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         super::library::note_used(&p.key);
     }
     if p.made.get().is_none() {
-        start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        if bakes(&p.shaders) {
+            // A one-shot bake is never drawn again: made here, whatever
+            // the frame's budget (cool_fox f4b48ad's scene inputs).
+            p.make();
+        } else {
+            start(p, REQUESTED);
+            wait(p, crate::frame::current());
+        }
+        if p.made.get().is_none() {
+            not_ready(p, if slow(p) { "too long at the driver to wait for" } else { "not made yet" });
+        }
     }
-    p.made.get()?.as_ref()
+    let made = p.made.get()?.as_ref();
+    if made.is_none() {
+        not_ready(p, "refused by the host or not translated");
+    }
+    made
+}
+
+/// Draws and dispatches that found their pipeline not made (and were
+/// dropped), by pipeline, since the last [`not_ready_line`]: the first
+/// frame, how many, and whether the driver had been at it too long to be
+/// waited for ([`slow`]).
+static NOT_READY: Mutex<Vec<(String, bool, u64, u64, &'static str)>> = Mutex::new(Vec::new());
+
+fn not_ready(p: &Pending, why: &'static str) {
+    // Cheap for what is dropped in every frame: found by its hashes.
+    {
+        let mut all = NOT_READY.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(e) = all.iter_mut().find(|e| e.4 == why && same_hashes(&e.0, &p.shaders)) {
+            e.3 += 1;
+            return;
+        }
+    }
+    let name = p
+        .shaders
+        .iter()
+        .map(|s| {
+            // A compute program's name is in its container ("CS_...").
+            let named = s
+                .container
+                .windows(3)
+                .position(|w| w == b"CS_")
+                .map(|at| {
+                    s.container[at..]
+                        .iter()
+                        .take_while(|b| b.is_ascii_alphanumeric() || **b == b'_')
+                        .take(60)
+                        .map(|&b| b as char)
+                        .collect::<String>()
+                })
+                .filter(|_| s.stage == "compute");
+            match named {
+                Some(name) => format!("{} {name}", s.hash),
+                None => format!("{} {}", s.stage, s.hash),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("+");
+    let mut all = NOT_READY.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(e) = all.iter_mut().find(|e| e.0 == name && e.4 == why) {
+        e.3 += 1;
+    } else if all.len() < 4096 {
+        all.push((name, p.computes(), crate::frame::current(), 1, why));
+    }
+}
+
+/// Whether `name` (as [`not_ready`] writes it) names exactly `shaders`.
+fn same_hashes(name: &str, shaders: &[Arc<Shader>]) -> bool {
+    let mut parts = name.split('+');
+    shaders.iter().all(|s| parts.next().is_some_and(|part| part.contains(s.hash.as_str()))) && parts.next().is_none()
+}
+
+/// For the log, every few seconds: what was dropped because its pipeline
+/// was not made yet, the compute pipelines by name (a pass the title runs
+/// once is lost that way), and what the frames have waited past the plain
+/// budget of all `VICTORY_PIPELINE_GATE_S` allows. `None`: nothing dropped.
+pub(crate) fn not_ready_line() -> Option<String> {
+    let mut all = std::mem::take(&mut *NOT_READY.lock().unwrap_or_else(|e| e.into_inner()));
+    if all.is_empty() {
+        return None;
+    }
+    // The most dropped first.
+    all.sort_by_key(|e| std::cmp::Reverse(e.3));
+    let mut whys: Vec<&'static str> = Vec::new();
+    for e in &all {
+        if !whys.contains(&e.4) {
+            whys.push(e.4);
+        }
+    }
+    let mut text = format!(
+        "draws and dispatches dropped for want of a host pipeline since the last such line (waited past the plain budget so far: {} ms for compute pipelines, {} ms for the others, VICTORY_PIPELINE_GATE_S bounds each; {} queued)",
+        LOADINGS[1].load(Ordering::Relaxed),
+        LOADINGS[0].load(Ordering::Relaxed),
+        waiting()
+    );
+    for why in whys {
+        let of: Vec<_> = all.iter().filter(|e| e.4 == why).collect();
+        let count = |compute: bool| of.iter().filter(|e| e.1 == compute).fold((0, 0), |(n, sum), e| (n + 1, sum + e.3));
+        let ((computes, dispatches), (others, draws)) = (count(true), count(false));
+        let names: Vec<String> = of.iter().take(16).map(|e| format!("{} x{} from frame {}", e.0, e.3, e.2)).collect();
+        text.push_str(&format!(
+            " | {why}: {dispatches} dispatches of {computes} compute pipelines, {draws} draws of {others} others; the most dropped: {}",
+            names.join("; ")
+        ));
+    }
+    Some(text)
+}
+
+/// What was waited past the budget since the start, in milliseconds; the
+/// second is the compute pipelines'.
+static LOADINGS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Whether a pipeline is one of the title's texture bakes (ped skin and
+/// decoration compositors, `crate::draw::BAKE_PIXEL_SHADERS` and
+/// `BAKE_GEOMETRY_SHADERS`): drawn once, and what it draws stays in the
+/// character's textures; dropped for want of its pipeline, the skin it
+/// makes is never made. `VICTORY_BAKE_WAIT=0`: as other pipelines.
+fn bakes(shaders: &[Arc<Shader>]) -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BAKE_WAIT").is_none_or(|v| v != "0"))
+        && shaders.iter().any(|s| {
+            let h = s.hash.as_str();
+            crate::draw::BAKE_PIXEL_SHADERS.contains(&h) || crate::draw::BAKE_GEOMETRY_SHADERS.contains(&h)
+        })
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
@@ -277,7 +685,7 @@ pub(crate) fn warm(shaders: Vec<Arc<Shader>>) -> Option<bool> {
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
-    if p.left_out.is_none() && !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
+    if p.left_out.is_none() && !p.shaders.is_empty() && (super::library::wanted_early(&p.key) || bakes(&p.shaders)) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, EARLY);
     }
@@ -302,9 +710,6 @@ fn wait(p: &Pending, frame: u64) {
     if budget.is_zero() || slow(p) {
         return;
     }
-    // What was waited past the budget since the start, in milliseconds; the
-    // second of each is the compute pipelines'.
-    static LOADINGS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
     let compute = p.computes();
     let past_total = &LOADINGS[usize::from(compute)];
     let loading = loading_left(Duration::from_millis(past_total.load(Ordering::Relaxed)));
@@ -314,6 +719,9 @@ fn wait(p: &Pending, frame: u64) {
     static SPENTS: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
     let frame_spent = &SPENTS[usize::from(compute)];
     let shared = shared_budget();
+    if together() {
+        return wait_together(p, frame, budget, compute);
+    }
     let left = {
         let mut spent = frame_spent.lock().unwrap_or_else(|e| e.into_inner());
         if spent.0 != frame {
@@ -360,6 +768,82 @@ fn wait(p: &Pending, frame: u64) {
         crate::copystat::C::PipelineWaitUs,
         started.elapsed().as_micros() as u64,
     );
+}
+
+/// Whether the threads that wait for pipelines in a frame wait together:
+/// the frame's budget is the time during which any thread waits, and every
+/// thread may wait while some of it is left (`VICTORY_PIPELINE_WAIT_TOGETHER=0`:
+/// the first thread to wait takes all that is left, as before).
+///
+/// Taken by the first, the other recording threads found nothing left and
+/// dropped what they recorded meanwhile: in a run that found no pipeline
+/// made (run cc2) the first world frames dropped 3,269 dispatches of 371
+/// compute pipelines and 3,996 draws of 482 others, with 3.5 and 3.1 s
+/// waited in all of the 120 s each kind may take while a world loads.
+fn together() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_TOGETHER").is_none_or(|v| v != "0"))
+}
+
+/// A frame's waiting, for [`together`]: the frame, the time waited in it
+/// with no thread waiting now, the threads waiting, since when one has
+/// been, and what of the frame's waiting past the plain budget is counted.
+struct Together {
+    frame: u64,
+    spent: Duration,
+    waiters: u32,
+    since: Option<Instant>,
+    past: Duration,
+}
+
+/// [`wait`] with the frame's budget as the time any thread waits.
+fn wait_together(p: &Pending, frame: u64, budget: Duration, compute: bool) {
+    static FRAMES: [Mutex<Together>; 2] =
+        [const { Mutex::new(Together { frame: u64::MAX, spent: Duration::ZERO, waiters: 0, since: None, past: Duration::ZERO }) }; 2];
+    let state = &FRAMES[usize::from(compute)];
+    // What is waited of the frame so far, counting the wait under way.
+    let so_far = |t: &Together| t.spent + t.since.map_or(Duration::ZERO, |since| since.elapsed());
+    {
+        let mut t = state.lock().unwrap_or_else(|e| e.into_inner());
+        if t.frame != frame {
+            // (Threads still waiting for the frame before count on.)
+            (t.frame, t.spent, t.past) = (frame, Duration::ZERO, Duration::ZERO);
+            if t.waiters != 0 {
+                t.since = Some(Instant::now());
+            }
+        }
+        if so_far(&t) >= budget {
+            return;
+        }
+        if t.waiters == 0 {
+            t.since = Some(Instant::now());
+        }
+        t.waiters += 1;
+    }
+    let (lock, done) = &DONE;
+    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while p.made.get().is_none() && !slow(p) {
+        let rest = {
+            let t = state.lock().unwrap_or_else(|e| e.into_inner());
+            if t.frame != frame { Duration::ZERO } else { budget.saturating_sub(so_far(&t)) }
+        };
+        if rest.is_zero() {
+            break;
+        }
+        // Woken now and then to see whether it has become a slow one.
+        held = done.wait_timeout(held, rest.min(Duration::from_millis(250))).unwrap_or_else(|e| e.into_inner()).0;
+    }
+    drop(held);
+    let mut t = state.lock().unwrap_or_else(|e| e.into_inner());
+    t.waiters = t.waiters.saturating_sub(1);
+    if t.waiters == 0
+        && let Some(since) = t.since.take()
+    {
+        t.spent += since.elapsed();
+        let past = t.spent.saturating_sub(wait_budget());
+        LOADINGS[usize::from(compute)].fetch_add(past.saturating_sub(t.past).as_millis() as u64, Ordering::Relaxed);
+        t.past = past;
+    }
 }
 
 const NOT_QUEUED: u8 = 0;
@@ -453,33 +937,50 @@ fn workers() -> bool {
     *RUNNING.get_or_init(|| {
         let mut running = false;
         let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
-        for i in 0..workers {
-            let spawned = std::thread::Builder::new()
-                .name(format!("victory-pipelines-{i}"))
-                .spawn(|| {
-                    // Below the title's own threads (loading, recording).
-                    // SAFETY: a plain call on our own thread.
-                    unsafe {
-                        use windows::Win32::System::Threading::*;
-                        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-                    }
-                    loop {
-                        next().make();
-                        if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
-                            drained();
-                        } else {
-                            super::library::save(false);
-                        }
-                    }
-                });
-            if let Err(e) = spawned {
-                tracing::warn!(error = %e, "no pipeline worker");
-            } else {
+        guard_start();
+        for _ in 0..workers {
+            if spawn_worker() {
                 running = true;
             }
         }
         running
     })
+}
+
+/// Starts one worker; whether it started.
+fn spawn_worker() -> bool {
+    let slot = NEXT_SLOT.fetch_add(1, Ordering::Relaxed);
+    let spawned = std::thread::Builder::new()
+        .name(format!("victory-pipelines-{slot}"))
+        .spawn(move || {
+            WORKER_SLOT.set(slot);
+            // Below the title's own threads (loading, recording).
+            // SAFETY: a plain call on our own thread.
+            unsafe {
+                use windows::Win32::System::Threading::*;
+                let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+            }
+            loop {
+                let p = next();
+                {
+                    // (If the compiler crashes in here this thread never
+                    // returns: the guard's `lost` does what follows for it.)
+                    let _compile = Compile::begin(slot, &p);
+                    p.make();
+                }
+                if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
+                    drained();
+                } else {
+                    super::library::save(false);
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!(error = %e, "no pipeline worker");
+        false
+    } else {
+        true
+    }
 }
 
 /// The most pipelines waiting at once since the workers last ran out.
@@ -516,6 +1017,78 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    /// A pipeline the compiler crashed on is not made again: no compile.
+    #[test]
+    fn a_pipeline_on_the_bad_list_is_not_compiled() {
+        let mut p = Pending::new(Vec::new(), None);
+        p.key = "bad-pipeline-test".to_owned();
+        bad_keys(|keys| keys.insert(p.key.clone()));
+        let before = SKIPPED_BAD.load(Ordering::Relaxed);
+        p.make();
+        assert!(matches!(p.made.get(), Some(None)));
+        assert!(SKIPPED_BAD.load(Ordering::Relaxed) > before);
+    }
+
+    /// A second asker waits for the thread making it, and gets the answer
+    /// that thread (or the guard, for it) gives.
+    #[test]
+    fn a_second_asker_waits_for_the_maker() {
+        let p = Arc::new(Pending::new(Vec::new(), None));
+        p.claimed.store(true, Ordering::Relaxed);
+        let asker = {
+            let p = p.clone();
+            std::thread::spawn(move || p.make())
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!asker.is_finished());
+        let _ = p.made.set(None);
+        {
+            let (lock, done) = &DONE;
+            let _held = lock.lock().unwrap();
+            done.notify_all();
+        }
+        let started = Instant::now();
+        while !asker.is_finished() && started.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(asker.is_finished());
+    }
+
+    /// A worker that reads the first page while it makes a pipeline (as
+    /// AMD's compiler does when it crashes) is caught: the pipeline is
+    /// answered as not made and put on the list of those left out, and the
+    /// process goes on.
+    #[test]
+    fn a_crash_while_making_is_caught_and_the_pipeline_left_out() {
+        guard_start();
+        assert_ne!(CRASH_EVENT.load(Ordering::Acquire), 0);
+        let mut p = Pending::new(Vec::new(), None);
+        p.key = "crashing-pipeline-test".to_owned();
+        let p = Arc::new(p);
+        let lost_before = LOST.load(Ordering::Relaxed);
+        // As a worker's queued pipeline counts.
+        WAITING.fetch_add(1, Ordering::Relaxed);
+        let slot = NEXT_SLOT.fetch_add(1, Ordering::Relaxed);
+        {
+            let p = p.clone();
+            std::thread::spawn(move || {
+                WORKER_SLOT.set(slot);
+                let _compile = Compile::begin(slot, &p);
+                // SAFETY: a read of the first page, which faults; the
+                // guard's handler keeps this thread asleep for good.
+                unsafe { std::arch::asm!("mov {0}, qword ptr [{1}]", out(reg) _, in(reg) 8usize, options(nostack, readonly)) };
+            });
+        }
+        let started = Instant::now();
+        while p.made.get().is_none() && started.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(matches!(p.made.get(), Some(None)));
+        assert!(LOST.load(Ordering::Relaxed) > lost_before);
+        assert!(is_bad_key(&p.key));
+        assert_eq!(FAULT_ADDR[slot].load(Ordering::Relaxed), 8);
     }
 
     #[test]

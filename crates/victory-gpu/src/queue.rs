@@ -7,6 +7,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUEUE, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 
+#[cfg(windows)]
+mod behind;
+
 const QUEUE_IIDS: [Iid; 4] = [
     guid(
         0x0ec870a6,
@@ -307,6 +310,11 @@ fn hold(this: This, what: impl FnOnce() -> Held) -> bool {
 /// one.
 #[cfg(windows)]
 pub(crate) fn release_held(all: bool) {
+    if behind::on() {
+        // What queues stand at is looked at by the thread that runs them.
+        behind::wake();
+        return;
+    }
     // One caller at a time, so a queue's submissions keep their order.
     static RELEASING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     if lock(&WAITING).is_empty() {
@@ -423,6 +431,30 @@ pub(crate) fn release_held(all: bool) {
     }
 }
 
+/// Before a submission of ours that is waited for, or a wait for flights by
+/// a thread of the title's: what the title gave its queues before goes to the
+/// card first ([`behind`]).
+#[cfg(windows)]
+pub(crate) fn before_sync() {
+    if behind::on() {
+        behind::drain();
+    }
+}
+
+/// Submissions the title made that the host has not begun ([`behind`]).
+#[cfg(windows)]
+pub(crate) fn queued() -> u64 {
+    behind::queued()
+}
+
+/// For the frame-rate line.
+#[cfg(windows)]
+pub(crate) fn behind_line(frames: f64) {
+    if behind::on() {
+        behind::line(frames);
+    }
+}
+
 /// Whether a queue may pass `wait`: memory holds the value, or, with
 /// submissions sent to the card without a wait (`crate::host::late`), it
 /// will once those in the air have run.
@@ -521,6 +553,10 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        if behind::on() && !this.is_null() {
+            behind::submit(this, lists);
+            return;
+        }
         if cuts() && !this.is_null() {
             submit_cut(this, lists);
             return;
@@ -614,6 +650,11 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
+    #[cfg(windows)]
+    if behind::on() && !this.is_null() {
+        behind::signal(this, fence, value);
+        return S_OK;
+    }
     // A queue that waits signals after what it holds.
     #[cfg(windows)]
     if hold(this, || Held::Signal(fence as usize, value)) {
@@ -651,6 +692,10 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
         }
         #[cfg(feature = "diagnostics")]
         crate::capture::op(this as usize, || format!("WAIT queue kind {} for fence {fence:?} value {value} (now {now})", queue(this).kind));
+        if behind::on() && waits() {
+            behind::wait(this, fence, value);
+            return S_OK;
+        }
         let behind = {
             let mut held = lock(&queue(this).held);
             let behind = !held.is_empty() || now < value;
@@ -696,6 +741,10 @@ extern "system" fn timestamp_frequency(_: This, out: *mut u64) -> HRESULT {
 }
 const TIMESTAMP_FREQUENCY: u64 = 100_000_000;
 
+/// GPU timestamps written since the last frame line: asked for at the bottom
+/// of the pipe, and resolved from queries.
+pub(crate) static TIMESTAMPS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 /// What a list's bottom-of-pipe write stores when the list has run.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Written {
@@ -715,7 +764,16 @@ impl Written {
             Written::GpuTimestamp => {
                 static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
                 let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
-                (elapsed.as_nanos() / (1_000_000_000 / u128::from(TIMESTAMP_FREQUENCY))) as u64
+                // An experiment (`VICTORY_GPU_CLOCK_SCALE=<factor>`): the
+                // clock runs that much faster or slower for the title, so
+                // every span of card time it measures is that many times
+                // what it was. It tells whether the title goes by them.
+                static SCALE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+                let scale = *SCALE.get_or_init(|| {
+                    std::env::var("VICTORY_GPU_CLOCK_SCALE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1.0)
+                });
+                let ticks = (elapsed.as_nanos() / (1_000_000_000 / u128::from(TIMESTAMP_FREQUENCY))) as u64;
+                if scale == 1.0 { ticks } else { (ticks as f64 * scale) as u64 }
             }
             Written::SystemTimestamp => system_timestamp(),
         };
@@ -755,17 +813,21 @@ pub(crate) fn presented() -> u64 {
 /// shortcut: one plane, no scaling or placement, the source expected in
 /// the common state.
 extern "system" fn present(
-    _: This,
+    this: This,
     planes: u32,
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
+    #[cfg(not(windows))]
+    let _ = this;
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::copystat::present_begins();
     // Submissions sent to the card and not waited for are settled first,
     // and what that frees runs in its own order, before anything is forced.
     #[cfg(windows)]
-    if crate::host::late() && !crate::host::late_free_present() {
+    if behind::on() {
+        // The present goes into the line of what the queues were given.
+    } else if crate::host::late() && !crate::host::late_free_present() {
         crate::host::settle_for_present();
         release_held(false);
         crate::host::settle_for_present();
@@ -777,7 +839,9 @@ extern "system" fn present(
     // shortcut: what a queue still holds at a present runs now, whatever
     // its fence: a wait is not kept across frames.
     #[cfg(windows)]
-    release_held(forces());
+    if !behind::on() {
+        release_held(forces());
+    }
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
@@ -811,8 +875,46 @@ extern "system" fn present(
     {
         crate::capture::frame_drew(frame, crate::draw::drawn());
         if crate::capture::listed(frame) {
+            before_sync();
             crate::capture::dump_targets(frame);
         }
+    }
+    #[cfg(windows)]
+    if behind::on() && !this.is_null() {
+        const COPY_SOURCE: u32 = 0x800;
+        let texture = if planes > 0
+            // SAFETY: the title passes `planes` plane descriptions.
+            && let Some(plane) = unsafe { plane_parameters.as_ref() }
+            && plane.count > 0
+            && !plane.resources.is_null()
+        {
+            // SAFETY: the plane lists `count` resources.
+            let resource = unsafe { *plane.resources };
+            // The state the lists recorded so far leave it in (the next
+            // frame's, recorded before this is shown, go on from there).
+            crate::resource::host_copy(resource).map(|copy| {
+                let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
+                crate::resource::host_transition(resource, state);
+                (resource as usize, copy, state)
+            })
+        } else {
+            None
+        };
+        let resource = texture.as_ref().map_or(0, |t| t.0);
+        // The second plane (drawn over the first, as below), likewise.
+        const READABLE: u32 = 0x80;
+        let over = texture
+            .as_ref()
+            // SAFETY: the title passes `planes` plane descriptions.
+            .and_then(|t| unsafe { second_plane(planes, plane_parameters, t.0 as This) })
+            .and_then(|r| {
+                let copy = crate::resource::host_copy(r)?;
+                let was = crate::resource::host_transition(r, READABLE).map_or(READABLE, |(_, before)| before);
+                crate::resource::host_transition(r, was);
+                Some((copy, was))
+            });
+        behind::present(this, texture.map(|(_, copy, state)| (copy, state)), over, Shown { frame, resource });
+        return S_OK;
     }
     #[cfg(windows)]
     if planes > 0
@@ -848,11 +950,62 @@ extern "system" fn present(
         blinks(frame, resource, state, shown);
         #[cfg(not(feature = "diagnostics"))]
         let _ = shown;
+    } else {
+        // Nothing shown: said at powers of two, with what the present held.
+        static SKIPPED: AtomicU64 = AtomicU64::new(0);
+        let n = SKIPPED.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            // SAFETY: the title passes `planes` plane descriptions.
+            let first = (planes > 0)
+                .then(|| unsafe { plane_parameters.as_ref() })
+                .flatten()
+                .filter(|p| p.count > 0 && !p.resources.is_null())
+                // SAFETY: the plane lists `count` resources.
+                .map(|p| unsafe { *p.resources });
+            // SAFETY: as above.
+            let second = first.and_then(|f| unsafe { second_plane(planes, plane_parameters, f) });
+            tracing::info!(
+                n,
+                frame,
+                planes,
+                first = ?first,
+                first_on_host = first.is_some_and(|r| crate::resource::host_resource(r).is_some()),
+                second_on_host = second.is_some_and(|r| crate::resource::host_resource(r).is_some()),
+                "a present showed nothing"
+            );
+        }
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
     S_OK
 }
+/// The frame a present shows, and the title's resource it shows.
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+struct Shown {
+    frame: u64,
+    resource: usize,
+}
+
+/// Shows `texture`, in host state `state`, in our window, with `over` drawn
+/// over it (the thread that prepares submissions shows frames this way).
+#[cfg(windows)]
+fn show(
+    texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    state: u32,
+    over: Option<(&windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)>,
+    what: Shown,
+) {
+    let Some(host) = crate::host::host() else {
+        return;
+    };
+    let shown = host.present(texture, state, what.frame, over);
+    #[cfg(feature = "diagnostics")]
+    blinks(what.frame, what.resource as This, state, shown);
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = (shown, what.resource);
+}
+
 /// The bytes from one plane's description to the next in a present.
 const PLANE_STRIDE: usize = 0x48;
 
